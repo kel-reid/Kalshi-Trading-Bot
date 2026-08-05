@@ -148,7 +148,7 @@ class OrderManager:
         payload = {
             "action": action,
             "side": side,
-            "count": count,
+            "count": str(count),
             "type": "limit",
             "ticker": ticker,
             "client_order_id": client_order_id,
