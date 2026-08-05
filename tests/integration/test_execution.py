@@ -22,7 +22,7 @@ async def test_order_lifecycle():
     import certifi
     
     r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 100}, verify=certifi.where())
-    active_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ["open", "active"]]
+    active_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
     
     if not active_markets:
         print("No active markets found on Demo. Test cannot proceed.")
