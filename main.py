@@ -26,18 +26,18 @@ async def main():
     if not ticker:
         print("No TARGET_TICKER in .env, fetching a random active market...")
         r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 1000}, verify=certifi.where())
-        active_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") == "active"]
+        eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
         
-        if not active_markets:
+        if not eligible_markets:
             print("No active markets found on Demo.")
             sys.exit(1)
             
         # Prioritize high-liquidity markets like Basketball on Demo
-        high_liquidity = [m for m in active_markets if "NBA" in m or "NCAA" in m]
+        high_liquidity = [m for m in eligible_markets if "NBA" in m or "NCAA" in m]
         if high_liquidity:
             ticker = random.choice(high_liquidity)
         else:
-            ticker = random.choice(active_markets)
+            ticker = random.choice(eligible_markets)
         
     print(f"Selected Market: {ticker}")
     print("Starting Avellaneda-Stoikov Bot... Press Ctrl+C to Kill.")

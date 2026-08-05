@@ -29,7 +29,7 @@ async def test_websocket_stream():
     from config import BASE_URL
     
     r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 100}, verify=certifi.where())
-    active_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") == "active"]
+    active_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
     
     assert len(active_markets) > 0, "No active markets found on Demo. Test cannot proceed."
         
