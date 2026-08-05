@@ -206,7 +206,11 @@ class TestV2PayloadSchema:
             price=65
         )
 
-        required_fields = ["action", "side", "count", "type", "ticker", "client_order_id", "price"]
+        required_fields = [
+            "action", "side", "count", "type", "ticker",
+            "client_order_id", "price", "time_in_force",
+            "self_trade_prevention_type"
+        ]
         for field in required_fields:
             assert field in captured_payload, f"Required V2 field '{field}' missing from payload"
 
@@ -217,3 +221,5 @@ class TestV2PayloadSchema:
         assert captured_payload["type"] == "limit"
         assert captured_payload["ticker"] == "TEST-TICKER"
         assert captured_payload["price"] == "0.65"
+        assert captured_payload["time_in_force"] == "gtc"
+        assert captured_payload["self_trade_prevention_type"] == "cancel_resting"
