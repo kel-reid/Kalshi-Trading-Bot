@@ -142,7 +142,7 @@ class AvellanedaStoikovBot:
         # R = M - (q * gamma)
         reservation_price = mid_price - (inventory * self.gamma)
         
-        # 4. Calculate Optimal Optimal Bid/Ask
+        # 4. Calculate Optimal Bid/Ask
         optimal_bid = math.floor(reservation_price - (self.min_spread / 2.0))
         optimal_ask = math.ceil(reservation_price + (self.min_spread / 2.0))
         
@@ -154,11 +154,31 @@ class AvellanedaStoikovBot:
         if optimal_bid >= optimal_ask:
             optimal_bid = optimal_ask - 1
             
-        logger.info(
-            f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | Gamma={self.gamma} | "
-            f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
-            f"→ Bid={optimal_bid}c  Ask={optimal_ask}c"
-        )
+        # Active Inventory Mitigation:
+        # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
+        HEDGE_THRESHOLD = 5
+        if inventory >= HEDGE_THRESHOLD:
+            logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory}). Halting BIDs, crossing ASKs to exit.")
+            optimal_bid = None # Do not buy more YES
+            if best_bid:
+                optimal_ask = max(2, min(best_bid[0], 99)) # Match the best bid to fill immediately
+        elif inventory <= -HEDGE_THRESHOLD:
+            logger.warning(f"[HEDGE ACTIVE] Short inventory high ({inventory}). Halting ASKs, crossing BIDs to exit.")
+            optimal_ask = None # Do not sell more YES
+            if best_ask:
+                optimal_bid = max(1, min(best_ask[0], 98)) # Match the best ask to fill immediately
+
+        if optimal_bid is not None and optimal_ask is not None:
+            logger.info(
+                f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | Gamma={self.gamma} | "
+                f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c"
+            )
+        else:
+            logger.info(
+                f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | "
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged)"
+            )
             
         # 5. Execute Output
         await self._update_quotes(optimal_bid, optimal_ask)
@@ -171,21 +191,29 @@ class AvellanedaStoikovBot:
         if new_bid != self.current_bid_price:
             if self.current_bid_id:
                 tasks.append(self.om.cancel_order(self.current_bid_id))
-            logger.info(f">> Placing new BID: {self.order_size} YES @ {new_bid}c")
-            self.current_bid_id = await self.om.place_order(
-                ticker=self.ticker, side="yes", action="buy", count=self.order_size, price=new_bid
-            )
-            self.current_bid_price = new_bid if self.current_bid_id else None
+            if new_bid is not None:
+                logger.info(f">> Placing new BID: {self.order_size} YES @ {new_bid}c")
+                self.current_bid_id = await self.om.place_order(
+                    ticker=self.ticker, side="yes", action="buy", count=self.order_size, price=new_bid
+                )
+                self.current_bid_price = new_bid if self.current_bid_id else None
+            else:
+                self.current_bid_id = None
+                self.current_bid_price = None
 
         # Handle ASK Side (Selling YES contracts)
         if new_ask != self.current_ask_price:
             if self.current_ask_id:
                 tasks.append(self.om.cancel_order(self.current_ask_id))
-            logger.info(f">> Placing new ASK: {self.order_size} YES @ {new_ask}c")
-            self.current_ask_id = await self.om.place_order(
-                ticker=self.ticker, side="yes", action="sell", count=self.order_size, price=new_ask
-            )
-            self.current_ask_price = new_ask if self.current_ask_id else None
+            if new_ask is not None:
+                logger.info(f">> Placing new ASK: {self.order_size} YES @ {new_ask}c")
+                self.current_ask_id = await self.om.place_order(
+                    ticker=self.ticker, side="yes", action="sell", count=self.order_size, price=new_ask
+                )
+                self.current_ask_price = new_ask if self.current_ask_id else None
+            else:
+                self.current_ask_id = None
+                self.current_ask_price = None
             
         # Execute any required cancellations asynchronously
         if tasks:

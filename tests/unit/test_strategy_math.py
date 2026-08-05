@@ -40,7 +40,7 @@ async def test_long_skew_pricing():
     """When inventory is positive (long YES), reservation price and quotes should skew downward."""
     bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
     
-    bot.inv_manager.get_position = MagicMock(return_value=5) # Holds 5 YES contracts
+    bot.inv_manager.get_position = MagicMock(return_value=2) # Holds 2 YES contracts (below threshold of 5)
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))
@@ -49,17 +49,17 @@ async def test_long_skew_pricing():
     
     await bot._tick()
     
-    # Mid = 55.0, Inv = 5, Gamma = 0.5 -> ResPrice = 55.0 - (5 * 0.5) = 52.5
-    # Optimal Bid = floor(52.5 - 2) = 50
-    # Optimal Ask = ceil(52.5 + 2) = 55
-    bot._update_quotes.assert_called_once_with(50, 55)
+    # Mid = 55.0, Inv = 2, Gamma = 0.5 -> ResPrice = 55.0 - (2 * 0.5) = 54.0
+    # Optimal Bid = floor(54.0 - 2) = 52
+    # Optimal Ask = ceil(54.0 + 2) = 56
+    bot._update_quotes.assert_called_once_with(52, 56)
 
 @pytest.mark.asyncio
 async def test_short_skew_pricing():
     """When inventory is negative (short YES / holding NO), reservation price and quotes should skew upward."""
     bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
     
-    bot.inv_manager.get_position = MagicMock(return_value=-5) # Short 5 YES contracts
+    bot.inv_manager.get_position = MagicMock(return_value=-2) # Short 2 YES contracts (below threshold of 5)
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))
@@ -68,31 +68,64 @@ async def test_short_skew_pricing():
     
     await bot._tick()
     
-    # Mid = 55.0, Inv = -5, Gamma = 0.5 -> ResPrice = 55.0 - (-5 * 0.5) = 57.5
-    # Optimal Bid = floor(57.5 - 2) = 55
-    # Optimal Ask = ceil(57.5 + 2) = 60
-    bot._update_quotes.assert_called_once_with(55, 60)
+    # Mid = 55.0, Inv = -2, Gamma = 0.5 -> ResPrice = 55.0 - (-2 * 0.5) = 56.0
+    # Optimal Bid = floor(56.0 - 2) = 54
+    # Optimal Ask = ceil(56.0 + 2) = 58
+    bot._update_quotes.assert_called_once_with(54, 58)
+
+@pytest.mark.asyncio
+async def test_active_hedge_long():
+    """When long inventory meets/exceeds threshold, bot must halt BIDs and cross ASKs."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    
+    bot.inv_manager.get_position = MagicMock(return_value=5) # Meets threshold
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))
+    
+    bot._update_quotes = AsyncMock()
+    
+    await bot._tick()
+    
+    # Bid is None, Ask is matched to best bid (50)
+    bot._update_quotes.assert_called_once_with(None, 50)
+
+@pytest.mark.asyncio
+async def test_active_hedge_short():
+    """When short inventory meets/exceeds threshold, bot must halt ASKs and cross BIDs."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    
+    bot.inv_manager.get_position = MagicMock(return_value=-5) # Meets threshold
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))
+    
+    bot._update_quotes = AsyncMock()
+    
+    await bot._tick()
+    
+    # Bid matches best ask (60), Ask is None
+    bot._update_quotes.assert_called_once_with(60, None)
 
 @pytest.mark.asyncio
 async def test_bounds_clipping():
     """Quotes should be clipped to Kalshi's boundaries (1c to 99c) and not cross each other."""
-    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=1.0, min_spread=10, order_size=1)
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=1.0, min_spread=100, order_size=1)
     
-    # Extreme long position skewing reservation price below zero
-    bot.inv_manager.get_position = MagicMock(return_value=100) 
+    bot.inv_manager.get_position = MagicMock(return_value=0) # 0 position to avoid active hedge
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
-    bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
-    bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(3, 10))
     
     bot._update_quotes = AsyncMock()
     
     await bot._tick()
     
-    # Mid = 55.0, Inv = 100, Gamma = 1.0 -> ResPrice = 55 - 100 = -45.0
-    # Optimal Bid = floor(-45 - 5) = -50 -> clipped to 1
-    # Optimal Ask = ceil(-45 + 5) = -40 -> clipped to 2 (since optimal_ask is min(..., 99) with min boundary 2)
-    # Check if bid/ask cross prevention is applied: optimal_bid < optimal_ask. (1 < 2 is valid)
-    bot._update_quotes.assert_called_once_with(1, 2)
+    # Mid = 2.5, Inv = 0 -> ResPrice = 2.5
+    # Optimal Bid = floor(2.5 - 50) = -48 -> clipped to 1
+    # Optimal Ask = ceil(2.5 + 50) = 53
+    # Prevents crossing and verifies clipping
+    bot._update_quotes.assert_called_once_with(1, 53)
 
 @pytest.mark.asyncio
 async def test_empty_orderbook_handling():

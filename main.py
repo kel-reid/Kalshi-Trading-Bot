@@ -32,8 +32,12 @@ async def main():
             print("No active markets found on Demo.")
             sys.exit(1)
             
-        # Prioritize high-liquidity markets like Basketball on Demo
-        high_liquidity = [m for m in eligible_markets if "NBA" in m or "NCAA" in m]
+        # Prioritize high-liquidity live sports, crypto, and daily financial index markets
+        target_prefixes = ["NBA", "NCAA", "MLB", "NFL", "NHL", "EPL", "UEFA", "SOCCER", "INX", "NASDAQ", "NDX", "BTC", "ETH"]
+        high_liquidity = [
+            m for m in eligible_markets 
+            if any(p in m.upper() for p in target_prefixes)
+        ]
         if high_liquidity:
             ticker = random.choice(high_liquidity)
         else:
