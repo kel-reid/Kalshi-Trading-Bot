@@ -9,8 +9,7 @@ conform to the Kalshi V2 API schema requirements, specifically:
 """
 
 import pytest
-import json
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 from execution.order_manager import OrderManager
 
 
