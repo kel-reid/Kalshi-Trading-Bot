@@ -207,19 +207,77 @@ class TestV2PayloadSchema:
         )
 
         required_fields = [
-            "action", "side", "count", "type", "ticker",
+            "side", "count", "type", "ticker",
             "client_order_id", "price", "time_in_force",
             "self_trade_prevention_type"
         ]
         for field in required_fields:
             assert field in captured_payload, f"Required V2 field '{field}' missing from payload"
 
+        assert "action" not in captured_payload, "Deprecated 'action' field must be omitted from V2 payload"
+
         # Verify correct values
-        assert captured_payload["action"] == "buy"
-        assert captured_payload["side"] == "yes"
+        assert captured_payload["side"] == "bid"
         assert captured_payload["count"] == "3"
         assert captured_payload["type"] == "limit"
         assert captured_payload["ticker"] == "TEST-TICKER"
         assert captured_payload["price"] == "0.65"
-        assert captured_payload["time_in_force"] == "gtc"
-        assert captured_payload["self_trade_prevention_type"] == "cancel_resting"
+        assert captured_payload["time_in_force"] == "good_till_canceled"
+        assert captured_payload["self_trade_prevention_type"] == "taker_at_cross"
+
+    @pytest.mark.asyncio
+    async def test_side_mapping_buy_yes_is_bid(self, order_manager):
+        """Buying YES contracts must map to 'bid'."""
+        captured_payload = {}
+        def mock_post(path, payload):
+            captured_payload.update(payload)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 201
+            mock_resp.json.return_value = {"order": {"order_id": "123", "status": "resting"}}
+            return mock_resp
+        order_manager._post_request = mock_post
+        await order_manager.place_order(ticker="T", side="yes", action="buy", count=1, price=50)
+        assert captured_payload["side"] == "bid"
+
+    @pytest.mark.asyncio
+    async def test_side_mapping_sell_yes_is_ask(self, order_manager):
+        """Selling YES contracts must map to 'ask'."""
+        captured_payload = {}
+        def mock_post(path, payload):
+            captured_payload.update(payload)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 201
+            mock_resp.json.return_value = {"order": {"order_id": "123", "status": "resting"}}
+            return mock_resp
+        order_manager._post_request = mock_post
+        await order_manager.place_order(ticker="T", side="yes", action="sell", count=1, price=50)
+        assert captured_payload["side"] == "ask"
+
+    @pytest.mark.asyncio
+    async def test_side_mapping_buy_no_is_ask(self, order_manager):
+        """Buying NO contracts must map to 'ask' (selling YES)."""
+        captured_payload = {}
+        def mock_post(path, payload):
+            captured_payload.update(payload)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 201
+            mock_resp.json.return_value = {"order": {"order_id": "123", "status": "resting"}}
+            return mock_resp
+        order_manager._post_request = mock_post
+        await order_manager.place_order(ticker="T", side="no", action="buy", count=1, price=50)
+        assert captured_payload["side"] == "ask"
+
+    @pytest.mark.asyncio
+    async def test_side_mapping_sell_no_is_bid(self, order_manager):
+        """Selling NO contracts must map to 'bid' (buying YES)."""
+        captured_payload = {}
+        def mock_post(path, payload):
+            captured_payload.update(payload)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 201
+            mock_resp.json.return_value = {"order": {"order_id": "123", "status": "resting"}}
+            return mock_resp
+        order_manager._post_request = mock_post
+        await order_manager.place_order(ticker="T", side="no", action="sell", count=1, price=50)
+        assert captured_payload["side"] == "bid"
+

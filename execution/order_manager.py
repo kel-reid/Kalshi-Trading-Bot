@@ -145,16 +145,24 @@ class OrderManager:
         """
         client_order_id = str(uuid.uuid4())
         
+        # Map legacy (action, side) parameters to V2 order book (side) parameter
+        # In V2 events/orders, side represents YES contract order book interaction:
+        # - buying YES is a "bid"
+        # - selling YES (or buying NO) is an "ask"
+        if side == "yes":
+            v2_side = "bid" if action == "buy" else "ask"
+        else:
+            v2_side = "ask" if action == "buy" else "bid"
+
         payload = {
-            "action": action,
-            "side": side,
+            "side": v2_side,
             "count": str(count),
             "type": "limit",
             "ticker": ticker,
             "client_order_id": client_order_id,
             "price": f"{price / 100:.2f}",
-            "time_in_force": "gtc",
-            "self_trade_prevention_type": "cancel_resting"
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross"
         }
         
         sign_path = "/trade-api/v2/portfolio/events/orders"
