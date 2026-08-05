@@ -152,7 +152,9 @@ class OrderManager:
             "type": "limit",
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "price": f"{price / 100:.2f}"
+            "price": f"{price / 100:.2f}",
+            "time_in_force": "gtc",
+            "self_trade_prevention_type": "cancel_resting"
         }
         
         sign_path = "/trade-api/v2/portfolio/events/orders"
