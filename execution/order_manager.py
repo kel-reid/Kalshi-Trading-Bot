@@ -149,6 +149,12 @@ class OrderManager:
         # In V2 events/orders, side represents YES contract order book interaction:
         # - buying YES is a "bid"
         # - selling YES (or buying NO) is an "ask"
+        side = side.lower()
+        action = action.lower()
+        if side not in ("yes", "no"):
+            raise ValueError(f"Invalid side: {side!r}. Expected 'yes' or 'no'.")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"Invalid action: {action!r}. Expected 'buy' or 'sell'.")
         if side == "yes":
             v2_side = "bid" if action == "buy" else "ask"
         else:
