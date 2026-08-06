@@ -161,7 +161,8 @@ class AvellanedaStoikovBot:
             logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory}). Halting BIDs, crossing ASKs to exit.")
             optimal_bid = None # Do not buy more YES
             if best_bid:
-                optimal_ask = max(1, min(best_bid[0], 99)) # Match the best bid to fill immediately
+                optimal_ask = max(2, min(best_bid[0], 99)) # Match the best bid to fill immediately
+        elif inventory <= -HEDGE_THRESHOLD:
             logger.warning(f"[HEDGE ACTIVE] Short inventory high ({inventory}). Halting ASKs, crossing BIDs to exit.")
             optimal_ask = None # Do not sell more YES
             if best_ask:
