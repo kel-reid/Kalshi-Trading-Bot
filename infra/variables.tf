@@ -15,7 +15,7 @@ variable "ssh_key_name" {
   description = "Name of the SSH key registered in DigitalOcean to associate with the Droplet"
 
   validation {
-    condition     = length(trim(var.ssh_key_name)) > 0
+    condition     = length(trimspace(var.ssh_key_name)) > 0
     error_message = "ssh_key_name must be a non-empty DigitalOcean SSH key name."
   }
 }
@@ -23,5 +23,4 @@ variable "ssh_key_name" {
 variable "ssh_source_addresses" {
   type        = list(string)
   description = "List of IP addresses allowed to connect to the Droplet via SSH (Port 22)"
-  default     = ["0.0.0.0/0", "::/0"] # Can be overridden in terraform.tfvars with trusted CIDRs
 }

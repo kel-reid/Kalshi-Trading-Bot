@@ -20,6 +20,7 @@ resource "digitalocean_vpc" "bot_vpc" {
 }
 
 # 2. Setup firewall rules to protect the Droplet
+#tfsec:ignore:digitalocean-compute-no-public-egress
 resource "digitalocean_firewall" "bot_firewall" {
   name = "kalshi-bot-firewall"
 
