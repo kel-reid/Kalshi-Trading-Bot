@@ -11,6 +11,8 @@ This project is a fully-functional algorithmic market-making trading bot built f
 
 ## System Architecture
 
+The following diagram illustrates the relationships between the core trading loop, the PostgreSQL database, DigitalOcean cloud resources, and external observability and alerting components:
+
 ```mermaid
 graph TD
     subgraph GrafanaCloud ["Grafana Cloud (Managed Monitoring)"]
@@ -70,7 +72,35 @@ graph TD
     style DBVolume fill:#2c1913,stroke:#5c3520,stroke-width:1px;
 ```
 
+## Deployment & Infrastructure
+
+The server infrastructure and security policies are defined using Terraform and hardened using Docker best practices.
+
+### Infrastructure as Code (Terraform)
+The `infra` directory contains configuration to spin up the DigitalOcean Droplet, VPC, and firewalls:
+*   **VPC Isolation:** The Droplet is placed inside a dedicated private network.
+*   **Egress Filtering:** The firewall strictly blocks all outbound ports except `53` (DNS), `443` (HTTPS/WSS to Kalshi and GitHub), and `123` (NTP).
+*   **Inbound Protection:** SSH (Port 22) is restricted to your trusted IP ranges. The metrics port (`8000`) is closed to the public internet.
+
+### Docker Hardening & Security
+The runtime environment is hardened to ensure a secure production footprint:
+*   **Multi-Stage Build:** The Dockerfile compiles all dependencies in a builder container, leaving the final production image clean of compilers like `gcc`.
+*   **Non-Root User:** The container runs under a dedicated, low-privilege system user named `trader`.
+*   **Healthchecks:** Both PostgreSQL and the trading bot utilize Docker container healthchecks to monitor initialization status and API metrics endpoints automatically.
+*   **Local Port Binding:** The Prometheus metrics port is bound strictly to the local loopback interface (`127.0.0.1:8000:8000`), making it inaccessible over the public IP of the Droplet.
+
+### Database Backups
+The project includes an automated backup pipeline for the PostgreSQL database containing order execution history. 
+
+Backups are saved to `/root/backups/kalshi-bot/` on the host, and local backups older than 7 days are automatically pruned to prevent disk bloat.
+
+### DigitalOcean Backups
+In addition to database-level logical backups, daily full-system snapshots are enabled at the cloud provider level in DigitalOcean for the Droplet. This serves as a disaster recovery safety net to restore the entire operating system, code repository, and configuration files in the event of hardware or virtual machine failure.
+
+
 ## Configuration Parameters
+
+The following parameters customize the bot's trading strategy, risk limits, and database connections. They are loaded dynamically on startup from the `.env` file or the system environment:
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
