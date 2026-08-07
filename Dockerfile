@@ -1,34 +1,57 @@
-FROM python:3.12-slim
+# --- Stage 1: Build dependencies ---
+FROM python:3.12-slim AS builder
 
-# Set working directory
-WORKDIR /app
+WORKDIR /build
 
-# Set environment variables for Python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install system dependencies if required by any lib
+# Install build dependencies (e.g. compiler for native libs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the setup file to install dependencies via pip
-COPY setup.py /app/
+# Copy setup file and source folders so wheel building can resolve local package modules
+COPY setup.py config.py /build/
+COPY strategy /build/strategy
+COPY execution /build/execution
+COPY utils /build/utils
 
-# Upgrade pip and install the app's requirements using an editable install 
-# (This caches the third-party dependencies like websockets, certifi, etc.)
-RUN pip install --upgrade pip
-RUN pip install -e .
+# Build wheels for the package and its dependencies
+RUN pip install --upgrade pip && \
+    pip wheel --no-cache-dir --wheel-dir /build/wheels .
 
-# Copy the actual application files
-COPY . /app/
+# --- Stage 2: Runtime image ---
+FROM python:3.12-slim AS runner
 
-# Officially install the application as a Python package. 
-# This correctly registers the 'strategy' and 'execution' modules using setup.py!
-RUN pip install .
+WORKDIR /app
 
-# Expose port 8000 for Prometheus metrics
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/home/trader/.local/bin:$PATH"
+
+# Create a non-privileged system user/group
+RUN groupadd -g 10001 trader && \
+    useradd -u 10001 -g trader -m -s /bin/bash trader
+
+# Copy wheels from builder and install them (this installs our local package + all third-party dependencies)
+COPY --from=builder /build/wheels /app/wheels
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir --no-index --find-links=/app/wheels /app/wheels/* && \
+    rm -rf /app/wheels
+
+# Copy application files (like main.py) and change ownership to the non-privileged user
+COPY --chown=trader:trader . /app/
+
+# Switch to the non-privileged user
+USER trader
+
+# Expose metrics port
 EXPOSE 8000
 
-# Run the strategy by default
+# Container healthcheck querying the Prometheus metrics endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics', timeout=2)" || exit 1
+
+# Run the strategy
 ENTRYPOINT ["python", "main.py"]
