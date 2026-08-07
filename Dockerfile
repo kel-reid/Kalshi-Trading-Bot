@@ -11,12 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy setup file to resolve requirements
-COPY setup.py /build/
+# Copy setup file and source folders so wheel building can resolve local package modules
+COPY setup.py config.py /build/
+COPY strategy /build/strategy
+COPY execution /build/execution
+COPY utils /build/utils
 
-# Build wheels for dependency caching
+# Build wheels for the package and its dependencies
 RUN pip install --upgrade pip && \
-    pip wheel --no-cache-dir --wheel-dir /build/wheels -e .
+    pip wheel --no-cache-dir --wheel-dir /build/wheels .
 
 # --- Stage 2: Runtime image ---
 FROM python:3.12-slim AS runner
@@ -31,17 +34,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd -g 10001 trader && \
     useradd -u 10001 -g trader -m -s /bin/bash trader
 
-# Copy wheels from builder and install them
+# Copy wheels from builder and install them (this installs our local package + all third-party dependencies)
 COPY --from=builder /build/wheels /app/wheels
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir --no-index --find-links=/app/wheels /app/wheels/* && \
     rm -rf /app/wheels
 
-# Copy application files and change ownership to the non-privileged user
+# Copy application files (like main.py) and change ownership to the non-privileged user
 COPY --chown=trader:trader . /app/
-
-# Install the local application package
-RUN pip install --no-cache-dir .
 
 # Switch to the non-privileged user
 USER trader
