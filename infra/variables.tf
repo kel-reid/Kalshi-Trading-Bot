@@ -13,4 +13,9 @@ variable "droplet_size" {
 variable "ssh_key_name" {
   type        = string
   description = "Name of the SSH key registered in DigitalOcean to associate with the Droplet"
+
+  validation {
+    condition     = length(trim(var.ssh_key_name)) > 0
+    error_message = "ssh_key_name must be a non-empty DigitalOcean SSH key name."
+  }
 }

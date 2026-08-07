@@ -23,7 +23,7 @@ resource "digitalocean_vpc" "bot_vpc" {
 resource "digitalocean_firewall" "bot_firewall" {
   name = "kalshi-bot-firewall"
 
-  droplet_ids = [digitalocean_droplet.bot_server.id]
+  tags = ["kalshi-bot", "production"]
 
   # Allow inbound SSH traffic (Port 22)
   inbound_rule {
