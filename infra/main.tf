@@ -1,0 +1,85 @@
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "digitalocean" {
+  # Token is fetched from DIGITALOCEAN_TOKEN environment variable by default
+}
+
+# 1. Create a dedicated Virtual Private Cloud (VPC) for network isolation
+resource "digitalocean_vpc" "bot_vpc" {
+  name     = "kalshi-bot-vpc"
+  region   = var.region
+  ip_range = "10.10.0.0/16"
+}
+
+# 2. Setup firewall rules to protect the Droplet
+#tfsec:ignore:digitalocean-compute-no-public-egress
+resource "digitalocean_firewall" "bot_firewall" {
+  name = "kalshi-bot-firewall"
+
+  tags = ["kalshi-bot", "production"]
+
+  # Allow inbound SSH traffic (Port 22) from trusted IP ranges
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "22"
+    source_addresses = var.ssh_source_addresses
+  }
+
+  # Strict Outbound rules (Egress filtering)
+  
+  # DNS Resolution (Port 53 TCP/UDP)
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "53"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "53"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # Secure Web/API Traffic (Port 443 TCP for HTTPS and WSS connections)
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "443"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # NTP Time Sync (Port 123 UDP) - Mandatory for signature timestamp accuracy
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "123"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+}
+
+# 3. Reference or create SSH key for Droplet access
+data "digitalocean_ssh_key" "deploy_key" {
+  name = var.ssh_key_name
+}
+
+# 4. Provision the Droplet inside our custom VPC
+resource "digitalocean_droplet" "bot_server" {
+  image              = "docker-20-04" # Pre-configured with Docker and Compose
+  name               = "kalshi-bot-prod"
+  region             = var.region
+  size               = var.droplet_size
+  vpc_uuid           = digitalocean_vpc.bot_vpc.id
+  ssh_keys           = [data.digitalocean_ssh_key.deploy_key.id]
+  backups            = false
+  monitoring         = true
+  ipv6               = false
+  resize_disk        = true
+
+  tags = ["kalshi-bot", "production"]
+}
