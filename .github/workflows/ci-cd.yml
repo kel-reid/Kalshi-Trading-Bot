@@ -53,9 +53,19 @@ jobs:
           pip install pytest pytest-asyncio pytest-cov
           pip install -e .
 
-      - name: Run logic tests with pytest
+      - name: Run logic tests with pytest and generate coverage
         run: |
-          pytest -v
+          pytest -v --cov=strategy --cov=execution --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: true
 
   build-and-push:
     name: Build & Push Docker Image

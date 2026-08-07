@@ -1,5 +1,9 @@
 # Kalshi Algorithmic Market Maker Bot
 
+[![CI/CD Pipeline](https://github.com/kelcodesstuff/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kelcodesstuff/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
+
+[![codecov](https://codecov.io/gh/kelcodesstuff/Kalshi-Trading-Bot/graph/badge.svg)](https://codecov.io/gh/kelcodesstuff/Kalshi-Trading-Bot)
+
 This project is a fully-functional algorithmic market-making trading bot built for the Kalshi prediction market platform. Its primary goal is to provide dual-sided liquidity (bids and asks) on Kalshi markets to capture the bid-ask spread while actively managing inventory risk.
 
 ## System Overview
