@@ -58,7 +58,9 @@ jobs:
           pytest -v --cov=strategy --cov=execution --cov-report=xml
 
       - name: Upload coverage reports to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
