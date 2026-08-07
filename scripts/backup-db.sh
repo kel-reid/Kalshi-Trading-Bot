@@ -17,8 +17,12 @@ else
 fi
 # Number of days to keep backups locally
 KEEP_DAYS=7
+# Get repository root directory dynamically
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(dirname "$SCRIPT_DIR")
+
 # Env file location to load database configurations
-ENV_FILE="/root/Kalshi-Trading-Bot/.env"
+ENV_FILE="${REPO_ROOT}/.env"
 
 echo "=== Starting PostgreSQL Backup: $(date) ==="
 
@@ -49,7 +53,19 @@ DB_USER="${DB_USER:-postgres}"
 DB_NAME="${DB_NAME:-kalshi_bot}"
 DB_CONTAINER_NAME="kalshi-bot-db"
 
-# 2. Ensure the host backup directory exists
+# 2. Check if the database container is running; if not, spin it up
+if ! docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER_NAME}$"; then
+    echo "Container '${DB_CONTAINER_NAME}' is not running. Attempting to start it..."
+    if ! docker compose -f "${REPO_ROOT}/docker-compose.yml" up -d db; then
+        echo "ERROR: Failed to start database container!" >&2
+        exit 1
+    fi
+    # Wait for the database container to be fully initialized and ready
+    echo "Waiting for database to initialize..."
+    sleep 5
+fi
+
+# 3. Ensure the host backup directory exists
 mkdir -p "$BACKUP_DIR"
 
 # 3. Define output filename with timestamp
