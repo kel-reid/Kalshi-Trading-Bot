@@ -25,28 +25,39 @@ resource "digitalocean_firewall" "bot_firewall" {
 
   tags = ["kalshi-bot", "production"]
 
-  # Allow inbound SSH traffic (Port 22)
+  # Allow inbound SSH traffic (Port 22) from trusted IP ranges
   inbound_rule {
     protocol         = "tcp"
     port_range       = "22"
-    source_addresses = ["0.0.0.0/0", "::/0"]
+    source_addresses = var.ssh_source_addresses
   }
 
-  # Outbound traffic (allow all outbound so the bot can connect to Kalshi API and scrape metrics)
+  # Strict Outbound rules (Egress filtering)
+  
+  # DNS Resolution (Port 53 TCP/UDP)
   outbound_rule {
     protocol              = "tcp"
-    port_range            = "1-65535"
+    port_range            = "53"
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 
   outbound_rule {
     protocol              = "udp"
-    port_range            = "1-65535"
+    port_range            = "53"
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 
+  # Secure Web/API Traffic (Port 443 TCP for HTTPS and WSS connections)
   outbound_rule {
-    protocol              = "icmp"
+    protocol              = "tcp"
+    port_range            = "443"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # NTP Time Sync (Port 123 UDP) - Mandatory for signature timestamp accuracy
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "123"
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 }
