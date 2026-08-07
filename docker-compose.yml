@@ -11,18 +11,23 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-kalshi_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   bot:
     image: ghcr.io/kelcodesstuff/kalshi-trading-bot:latest
     container_name: kalshi-bot
     restart: always
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file:
       - .env
-    # Forcefully override the legacy path that might be hardcoded in the Droplet's .env file
     environment:
       - KALSHI_PRIVATE_KEY_PATH=/app/kalshi_private_key_demo.pem
       - DB_HOST=db
@@ -30,7 +35,7 @@ services:
       - DB_NAME=${DB_NAME:-kalshi_bot}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD}
-    # Mount the local private keys from the host directly into the container's working directory (/app)
+    # Mount the local private keys from the host directly into the container's working directory
     volumes:
       - ./kalshi_private_key_demo.pem:/app/kalshi_private_key_demo.pem:ro
       # Uncomment the line below when you are ready to trade with real fiat money
