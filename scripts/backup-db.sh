@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+# Restrict default file creation permissions to owner-only (600 for files, 700 for directories)
+umask 077
+
 # --- Configuration ---
 # Target directory for backups (adapts to root on Droplet vs local user on Mac)
 if [ "$EUID" -eq 0 ]; then
@@ -52,11 +55,15 @@ mkdir -p "$BACKUP_DIR"
 # 3. Define output filename with timestamp
 BACKUP_FILE="${BACKUP_DIR}/backup_${DB_NAME}_$(date +%Y%m%d_%H%M%S).sql.gz"
 
+# Register cleanup trap to delete partial files on failure/interrupt
+trap 'echo "ERROR: Backup interrupted or failed. Cleaning up partial files..."; rm -f "$BACKUP_FILE"' ERR SIGINT SIGTERM
+
 echo "Backing up database '${DB_NAME}' from container '${DB_CONTAINER_NAME}'..."
 
 # 4. Perform transaction-consistent pg_dump inside the docker container
-# Gzip the output stream on the host directly to save space
-if ! docker exec -t "$DB_CONTAINER_NAME" pg_dump -U "$DB_USER" -d "$DB_NAME" | gzip > "$BACKUP_FILE"; then
+# - Drop -t (no pseudo-TTY) to prevent output corruption/formatting warnings in scripts
+# - Set PGPASSWORD env variable to authenticate pg_dump securely inside the container
+if ! docker exec -i -e PGPASSWORD="${DB_PASSWORD:-}" "$DB_CONTAINER_NAME" pg_dump -U "$DB_USER" -d "$DB_NAME" | gzip > "$BACKUP_FILE"; then
     echo "ERROR: Backup failed!" >&2
     exit 1
 fi
@@ -79,7 +86,10 @@ echo "Integrity verification PASSED."
 echo "Backup created successfully: ${BACKUP_FILE}"
 echo "Size: $(du -sh "$BACKUP_FILE" | cut -f1)"
 
-# 5. Clean up old backups (older than 7 days) to prevent disk space bloat
+# Disable the error/interrupt trap since the backup was successfully created and verified
+trap - ERR SIGINT SIGTERM
+
+# 6. Clean up old backups (older than 7 days) to prevent disk space bloat
 echo "Pruning backups older than ${KEEP_DAYS} days..."
 find "$BACKUP_DIR" -type f -name "backup_${DB_NAME}_*.sql.gz" -mtime +"$KEEP_DAYS" -exec rm -f {} \; -print
 
