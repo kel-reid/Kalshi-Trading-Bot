@@ -19,10 +19,27 @@ ENV_FILE="/root/Kalshi-Trading-Bot/.env"
 
 echo "=== Starting PostgreSQL Backup: $(date) ==="
 
-# 1. Load database credentials from the .env file if it exists
+# 1. Load database credentials from the .env file safely if it exists
 if [ -f "$ENV_FILE" ]; then
-    # Parse env file ignoring comments and exporting variables
-    export $(grep -v '^#' "$ENV_FILE" | xargs)
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Trim leading and trailing whitespace
+        line=$(echo "$line" | xargs 2>/dev/null || echo "$line")
+        # Ignore comments and empty lines
+        if [[ -z "$line" || "$line" =~ ^# ]]; then
+            continue
+        fi
+        # Parse KEY=VALUE pairs securely
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            # Strip wrapping single/double quotes if present
+            val="${val%\"}"
+            val="${val#\"}"
+            val="${val%\'}"
+            val="${val#\'}"
+            export "$key=$val"
+        fi
+    done < "$ENV_FILE"
 fi
 
 DB_USER="${DB_USER:-postgres}"
