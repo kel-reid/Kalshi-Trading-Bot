@@ -6,8 +6,12 @@
 set -euo pipefail
 
 # --- Configuration ---
-# Target directory for backups on the host
-BACKUP_DIR="/root/backups/kalshi-bot"
+# Target directory for backups (adapts to root on Droplet vs local user on Mac)
+if [ "$EUID" -eq 0 ]; then
+    BACKUP_DIR="/root/backups/kalshi-bot"
+else
+    BACKUP_DIR="${HOME}/backups/kalshi-bot"
+fi
 # Number of days to keep backups locally
 KEEP_DAYS=7
 # Env file location to load database configurations
@@ -40,6 +44,21 @@ if ! docker exec -t "$DB_CONTAINER_NAME" pg_dump -U "$DB_USER" -d "$DB_NAME" | g
     exit 1
 fi
 
+# 5. Automatically verify backup file integrity and structure
+echo "Verifying backup integrity..."
+if ! gzip -t "$BACKUP_FILE"; then
+    echo "ERROR: Backup file is corrupted (failed gzip integrity check)!" >&2
+    rm -f "$BACKUP_FILE"
+    exit 1
+fi
+
+if ! gunzip -c "$BACKUP_FILE" | grep -q "PostgreSQL database dump"; then
+    echo "ERROR: Backup file does not contain valid PostgreSQL dump data!" >&2
+    rm -f "$BACKUP_FILE"
+    exit 1
+fi
+
+echo "Integrity verification PASSED."
 echo "Backup created successfully: ${BACKUP_FILE}"
 echo "Size: $(du -sh "$BACKUP_FILE" | cut -f1)"
 
