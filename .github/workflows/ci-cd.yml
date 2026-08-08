@@ -131,14 +131,18 @@ jobs:
             # Automatically install Doppler if missing (self-healing setup)
             if ! command -v doppler &> /dev/null; then
               echo "Doppler not found. Installing..."
-              sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
-              curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/doppler-archive-keyring.gpg
-              echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
-              sudo apt-get update && sudo apt-get install -y doppler
+              # Check if sudo is needed and available (fallback for root-only setups)
+              SUDO=""
+              if [ "$(id -u)" -ne 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; fi
               
-              # Set the token globally using a GitHub Actions secret
-              doppler configure set token ${{ secrets.DOPPLER_TOKEN }} --scope /
+              $SUDO apt-get update && $SUDO apt-get install -y apt-transport-https ca-certificates curl gnupg
+              curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/doppler-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | $SUDO tee /etc/apt/sources.list.d/doppler-cli.list
+              $SUDO apt-get update && $SUDO apt-get install -y doppler
             fi
+
+            # Configure the token unconditionally on every run to support token rotation/idempotency
+            doppler configure set token ${{ secrets.DOPPLER_TOKEN }} --scope /
 
             cd /root/Kalshi-Trading-Bot
             # Ensure Docker logs into GHCR to pull the private image
