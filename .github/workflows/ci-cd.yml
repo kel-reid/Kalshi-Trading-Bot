@@ -129,5 +129,5 @@ jobs:
             echo "${{ secrets.PAT_GHCR }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             # Pull the latest image
             docker compose pull
-            # Restart the service
-            docker compose up -d
+            # Restart the service with Doppler environment variables
+            doppler run -- docker compose up -d
