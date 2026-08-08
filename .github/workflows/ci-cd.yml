@@ -121,10 +121,13 @@ jobs:
 
       - name: SSH into Droplet and deploy
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
         with:
           host: ${{ secrets.DROPLET_IP }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DOPPLER_TOKEN
           timeout: 60s
           command_timeout: 10m
           script: |
@@ -149,8 +152,8 @@ jobs:
               $SUDO apt-get update && $SUDO apt-get install -y doppler
             fi
 
-            # Configure the token unconditionally on every run to support token rotation/idempotency
-            doppler configure set token ${{ secrets.DOPPLER_TOKEN }} --scope /
+            # Configure the token unconditionally using environment variable (prevents CLI process exposure)
+            echo "$DOPPLER_TOKEN" | doppler configure set token --scope /
 
             cd /root/Kalshi-Trading-Bot
             # Ensure Docker logs into GHCR to pull the private image

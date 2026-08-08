@@ -127,7 +127,7 @@ In production, the bot does not store plaintext `.env` configurations or private
 ### Automated Setup & Deployment
 The installation and configuration of Doppler on the Droplet is **fully automated** via the GitHub Actions CI/CD pipeline. 
 
-The only configuration step required is to register your Doppler Service Token in your GitHub Repository Secrets:
+To enable this integration, the only Doppler-specific requirement is to register your Service Token in your GitHub Repository Secrets (in addition to your standard server deployment secrets like `DROPLET_IP` and `SSH_PRIVATE_KEY`):
 * Name: **`DOPPLER_TOKEN`**
 * Value: your Doppler production service token (starts with `dp.st.prd.`)
 
