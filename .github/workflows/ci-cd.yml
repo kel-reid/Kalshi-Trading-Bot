@@ -128,6 +128,18 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           script: |
+            # Automatically install Doppler if missing (self-healing setup)
+            if ! command -v doppler &> /dev/null; then
+              echo "Doppler not found. Installing..."
+              sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+              curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/doppler-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
+              sudo apt-get update && sudo apt-get install -y doppler
+              
+              # Set the token globally using a GitHub Actions secret
+              doppler configure set token ${{ secrets.DOPPLER_TOKEN }} --scope /
+            fi
+
             cd /root/Kalshi-Trading-Bot
             # Ensure Docker logs into GHCR to pull the private image
             echo "${{ secrets.PAT_GHCR }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -135,3 +147,5 @@ jobs:
             docker compose pull
             # Restart the service with Doppler environment variables
             doppler run -- docker compose up -d
+            # Clean up old dangling images to prevent Droplet disk exhaustion
+            docker image prune -f
