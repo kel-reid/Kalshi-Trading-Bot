@@ -34,3 +34,9 @@ ENV/
 *.pem
 *.egg-info/
 .pytest_cache/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars

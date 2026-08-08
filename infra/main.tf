@@ -64,6 +64,13 @@ resource "digitalocean_firewall" "bot_firewall" {
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 
+  # HTTP Traffic (Port 80 TCP for package managers/mirrors)
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "80"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
   # NTP Time Sync (Port 123 UDP) - Mandatory for signature timestamp accuracy
   outbound_rule {
     protocol              = "udp"

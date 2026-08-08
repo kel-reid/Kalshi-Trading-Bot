@@ -28,6 +28,15 @@ if not API_KEY:
 default_key_filename = "kalshi_private_key_prod.pem" if ENVIRONMENT == "prod" else "kalshi_private_key_demo.pem"
 PRIVATE_KEY_PATH = Path(os.getenv("KALSHI_PRIVATE_KEY_PATH", PROJECT_ROOT / default_key_filename))
 
+# Verify private key file exists on startup to fail-fast (bypassed in pytest or if key is provided via env)
+import sys
+has_env_key = bool(os.getenv("KALSHI_PRIVATE_KEY"))
+if "pytest" not in sys.modules and not has_env_key and not PRIVATE_KEY_PATH.exists():
+    raise FileNotFoundError(
+        f"Kalshi private key file not found at {PRIVATE_KEY_PATH}! "
+        f"Please check your KALSHI_PRIVATE_KEY_PATH environment variable."
+    )
+
 # Alerting
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 

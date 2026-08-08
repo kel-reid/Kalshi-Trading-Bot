@@ -48,9 +48,6 @@ class KalshiWebsocketClient:
         """Establish the WebSocket connection to Kalshi."""
         logger.info(f"Connecting to {self.ws_url}")
         
-        # In Kalshi's V2 API, authentication typically needs to be passed via headers
-        headers = get_auth_headers("GET", "/trade-api/ws/v2")
-        
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         
         max_reconnect_delay = 60
@@ -58,6 +55,9 @@ class KalshiWebsocketClient:
         
         while True:
             try:
+                # Generate fresh auth headers for each connection attempt to prevent signature timeouts
+                headers = get_auth_headers("GET", "/trade-api/ws/v2")
+                
                 # Disable ping_interval for now if Kalshi server uses a custom ping mechanism,
                 # though websockets default ping often works fine.
                 async with websockets.connect(self.ws_url, additional_headers=headers, ssl=ssl_context) as websocket:

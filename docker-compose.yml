@@ -26,20 +26,25 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file:
-      - .env
+    # Accept environment variables passed from Doppler/host context
     environment:
+      - KALSHI_ENV
+      - KALSHI_API_KEY
+      - KALSHI_PRIVATE_KEY
       - KALSHI_PRIVATE_KEY_PATH=/app/kalshi_private_key_demo.pem
+      - RISK_GAMMA
+      - MIN_SPREAD
+      - ORDER_SIZE
+      - TARGET_TICKER
+      - ALERT_WEBHOOK_URL
       - DB_HOST=db
       - DB_PORT=5432
-      - DB_NAME=${DB_NAME:-kalshi_bot}
-      - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD}
-    # Mount the local private keys from the host directly into the container's working directory
-    volumes:
-      - ./kalshi_private_key_demo.pem:/app/kalshi_private_key_demo.pem:ro
-      # Uncomment the line below when you are ready to trade with real fiat money
-      # - ./kalshi_private_key_prod.pem:/app/kalshi_private_key_prod.pem:ro
+      - DB_NAME
+      - DB_USER
+      - DB_PASSWORD
+    # Optional: Mount local keys ONLY if not using a secrets manager like Doppler
+    # volumes:
+    #   - ./kalshi_private_key_demo.pem:/app/kalshi_private_key_demo.pem:ro
     # The application logs gracefully to stdout, which Docker captures.
     logging:
       driver: "json-file"

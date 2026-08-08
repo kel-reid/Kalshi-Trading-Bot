@@ -120,6 +120,34 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 | `DB_PASSWORD` | `string` | `postgres` | Password for database authentication. |
 
 
+## Secrets Management & Production Execution (Doppler)
+
+In production, the bot does not store plaintext `.env` configurations or private `.pem` keys on the Droplet host disk. Instead, it utilizes **Doppler** to inject all parameters and keys directly into memory on startup.
+
+### 1. Doppler Setup on the Droplet
+To configure the Droplet to pull configurations securely, run the following setup commands on the VM:
+
+```bash
+# Install the Doppler CLI
+sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.7553EA6C.key | sudo gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
+sudo apt-get update && sudo apt-get install -y doppler
+
+# Configure your production token (create this in the Doppler dashboard)
+cd /root/Kalshi-Trading-Bot
+doppler configure set token <your_doppler_service_token>
+```
+
+### 2. Running the Bot
+Launch the container architecture using the Doppler run wrapper:
+
+```bash
+doppler run -- docker compose up -d
+```
+The Doppler daemon pulls all secrets and environment variables, mapping them dynamically into Docker's runtime environment without creating any physical files.
+
+
 ## Live Output Preview
 
 When running, the bot feeds live log output updating its quotes:
