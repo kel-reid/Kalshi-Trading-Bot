@@ -129,11 +129,19 @@ jobs:
           command_timeout: 10m
           script: |
             # Automatically install Doppler if missing (self-healing setup)
-            if ! command -v doppler &> /dev/null; then
+            if ! command -v doppler > /dev/null 2>&1; then
               echo "Doppler not found. Installing..."
-              # Check if sudo is needed and available (fallback for root-only setups)
+              
+              # Set up privilege escalation (fails early if non-root and sudo is missing)
               SUDO=""
-              if [ "$(id -u)" -ne 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; fi
+              if [ "$(id -u)" -ne 0 ]; then
+                if command -v sudo > /dev/null 2>&1; then
+                  SUDO="sudo"
+                else
+                  echo "Error: Doppler is missing, but deploy script is running as non-root and 'sudo' is not installed." >&2
+                  exit 1
+                fi
+              fi
               
               $SUDO apt-get update && $SUDO apt-get install -y apt-transport-https ca-certificates curl gnupg
               curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/doppler-archive-keyring.gpg

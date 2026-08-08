@@ -133,8 +133,6 @@ The only configuration step required is to register your Doppler Service Token i
 
 Once the secret is added, pushing to `main` will automatically build the images, verify dependencies, install Doppler on the target server, configure authentication, and launch the bot.
 
-The Doppler daemon pulls all secrets and environment variables, mapping them dynamically into Docker's runtime environment without creating any physical files.
-
 
 ## Live Output Preview
 
