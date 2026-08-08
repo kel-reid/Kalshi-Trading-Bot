@@ -5,6 +5,7 @@ provider "registry.terraform.io/digitalocean/digitalocean" {
   version     = "2.99.1"
   constraints = "~> 2.0"
   hashes = [
+    "h1:LOtdHmbsdRbEWhv5rq0w4/29FyxPU1gxl1zVSoS/CEU=",
     "h1:WF6OIEVYInjvpDb571BChu3GtLmIkp/1TWrbc2Cl3iM=",
     "zh:24b9e8fc3459f2582dc11910c3b2a190ba43d8bf93c2bd29fda3de5d7d1c1c3f",
     "zh:274eec1b7c1c749dd84251abd607dc6e7ef5058a3c8e7d2ec2e859267d93be65",

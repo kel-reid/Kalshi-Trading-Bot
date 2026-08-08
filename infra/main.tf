@@ -12,11 +12,20 @@ provider "digitalocean" {
   # Token is fetched from DIGITALOCEAN_TOKEN environment variable by default
 }
 
+# Create tags to organize resources and link them with the firewall
+resource "digitalocean_tag" "tag_kalshi_bot" {
+  name = "kalshi-bot"
+}
+
+resource "digitalocean_tag" "tag_production" {
+  name = "production"
+}
+
 # 1. Create a dedicated Virtual Private Cloud (VPC) for network isolation
 resource "digitalocean_vpc" "bot_vpc" {
   name     = "kalshi-bot-vpc"
   region   = var.region
-  ip_range = "10.10.0.0/16"
+  ip_range = "10.120.0.0/16"
 }
 
 # 2. Setup firewall rules to protect the Droplet
@@ -24,7 +33,7 @@ resource "digitalocean_vpc" "bot_vpc" {
 resource "digitalocean_firewall" "bot_firewall" {
   name = "kalshi-bot-firewall"
 
-  tags = ["kalshi-bot", "production"]
+  tags = [digitalocean_tag.tag_kalshi_bot.id, digitalocean_tag.tag_production.id]
 
   # Allow inbound SSH traffic (Port 22) from trusted IP ranges
   inbound_rule {
@@ -55,6 +64,13 @@ resource "digitalocean_firewall" "bot_firewall" {
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 
+  # HTTP Traffic (Port 80 TCP for package managers/mirrors)
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "80"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
   # NTP Time Sync (Port 123 UDP) - Mandatory for signature timestamp accuracy
   outbound_rule {
     protocol              = "udp"
@@ -76,10 +92,10 @@ resource "digitalocean_droplet" "bot_server" {
   size               = var.droplet_size
   vpc_uuid           = digitalocean_vpc.bot_vpc.id
   ssh_keys           = [data.digitalocean_ssh_key.deploy_key.id]
-  backups            = false
+  backups            = true
   monitoring         = true
   ipv6               = false
   resize_disk        = true
 
-  tags = ["kalshi-bot", "production"]
+  tags = [digitalocean_tag.tag_kalshi_bot.id, digitalocean_tag.tag_production.id]
 }

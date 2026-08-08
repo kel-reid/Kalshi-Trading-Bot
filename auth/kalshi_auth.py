@@ -19,6 +19,8 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from config import API_KEY, PRIVATE_KEY_PATH
 
 
+_private_key = None
+
 def get_auth_headers(method: str, sign_path: str) -> dict:
     """
     Generates Kalshi API authentication headers using RSA-PSS signing.
@@ -30,9 +32,16 @@ def get_auth_headers(method: str, sign_path: str) -> dict:
     Returns:
         dict: A dictionary containing the required Kalshi authentication headers.
     """
-    # 3. Securely load the private key into memory
-    with open(PRIVATE_KEY_PATH, "rb") as key_file:
-        private_key = load_pem_private_key(key_file.read(), password=None)
+    global _private_key
+    # Load the private key into memory only once
+    if _private_key is None:
+        import os
+        env_key = os.getenv("KALSHI_PRIVATE_KEY")
+        if env_key:
+            _private_key = load_pem_private_key(env_key.encode('utf-8'), password=None)
+        else:
+            with open(PRIVATE_KEY_PATH, "rb") as key_file:
+                _private_key = load_pem_private_key(key_file.read(), password=None)
 
     # 4. Generate the current timestamp in milliseconds
     timestamp_str = str(int(datetime.datetime.now().timestamp() * 1000))
@@ -42,7 +51,7 @@ def get_auth_headers(method: str, sign_path: str) -> dict:
     message_bytes = msg_string.encode('utf-8')
 
     # 6. Generate the cryptographic signature using RSA-PSS and SHA256
-    signature_bytes = private_key.sign(
+    signature_bytes = _private_key.sign(
         message_bytes,
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
