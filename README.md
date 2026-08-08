@@ -120,32 +120,18 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 | `DB_PASSWORD` | `string` | `postgres` | Password for database authentication. |
 
 
-## Secrets Management & Production Execution (Doppler)
+## Secrets Management with Doppler
 
 In production, the bot does not store plaintext `.env` configurations or private `.pem` keys on the Droplet host disk. Instead, it utilizes **Doppler** to inject all parameters and keys directly into memory on startup.
 
-### 1. Doppler Setup on the Droplet
-To configure the Droplet to pull configurations securely, run the following setup commands on the VM:
+### Automated Setup & Deployment
+The installation and configuration of Doppler on the Droplet is **fully automated** via the GitHub Actions CI/CD pipeline. 
 
-```bash
-# Install the Doppler CLI
-sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
-curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.7553EA6C.key | sudo gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
-sudo apt-get update && sudo apt-get install -y doppler
+To enable this integration, the only Doppler-specific requirement is to register your Service Token in your GitHub Repository Secrets (in addition to your standard server deployment secrets like `DROPLET_IP` and `SSH_PRIVATE_KEY`):
+* Name: **`DOPPLER_TOKEN`**
+* Value: your Doppler production service token (starts with `dp.st.prd.`)
 
-# Configure your production token (create this in the Doppler dashboard)
-cd /root/Kalshi-Trading-Bot
-doppler configure set token <your_doppler_service_token>
-```
-
-### 2. Running the Bot
-Launch the container architecture using the Doppler run wrapper:
-
-```bash
-doppler run -- docker compose up -d
-```
-The Doppler daemon pulls all secrets and environment variables, mapping them dynamically into Docker's runtime environment without creating any physical files.
+Once the secret is added, pushing to `main` will automatically build the images, verify dependencies, install Doppler on the target server, configure authentication, and launch the bot.
 
 
 ## Live Output Preview

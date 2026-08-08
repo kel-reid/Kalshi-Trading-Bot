@@ -121,17 +121,42 @@ jobs:
 
       - name: SSH into Droplet and deploy
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
         with:
           host: ${{ secrets.DROPLET_IP }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DOPPLER_TOKEN
           timeout: 60s
           command_timeout: 10m
           script: |
+            # 1. Enforce root access up-front (deploy path /root/ is root-only)
+            if [ "$(id -u)" -ne 0 ]; then
+              echo "Error: This deploy script must be run as root." >&2
+              exit 1
+            fi
+
+            # 2. Verify Doppler token exists in session memory (fail-fast check)
+            if [ -z "$DOPPLER_TOKEN" ]; then
+              echo "Error: DOPPLER_TOKEN environment variable is missing from the deploy environment." >&2
+              exit 1
+            fi
+
+            # 3. Automatically install Doppler if missing (self-healing setup)
+            if ! command -v doppler > /dev/null 2>&1; then
+              echo "Doppler not found. Installing..."
+              apt-get update && apt-get install -y apt-transport-https ca-certificates curl gnupg
+              curl -sLf --retry 3 https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key | gpg --dearmor --yes -o /usr/share/keyrings/doppler-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | tee /etc/apt/sources.list.d/doppler-cli.list
+              apt-get update && apt-get install -y doppler
+            fi
+
+            # 4. Perform the deploy (using the RAM-only DOPPLER_TOKEN env variable)
             cd /root/Kalshi-Trading-Bot
-            # Ensure Docker logs into GHCR to pull the private image
             echo "${{ secrets.PAT_GHCR }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            # Pull the latest image
             docker compose pull
-            # Restart the service with Doppler environment variables
             doppler run -- docker compose up -d
+
+            # 5. Clean up dangling images older than 24 hours (preserves recent build for quick rollbacks)
+            docker image prune -f --filter "until=24h"
