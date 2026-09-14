@@ -127,7 +127,7 @@ def mock_kalshi_api_layer():
     if KALSHI_LIVE_TESTS=true is explicitly set and valid credentials exist.
     """
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key_demo.pem")
-    has_key = os.path.exists(key_path) and os.path.getsize(key_path) > 0
+    has_key = bool(os.getenv("KALSHI_PRIVATE_KEY")) or (os.path.exists(key_path) and os.path.getsize(key_path) > 0)
     has_api_key = bool(os.getenv("KALSHI_API_KEY"))
     run_live = (os.getenv("KALSHI_LIVE_TESTS") == "true") and has_key and has_api_key
     
