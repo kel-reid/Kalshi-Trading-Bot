@@ -33,6 +33,13 @@ class OrderbookManager:
         
         await self.ws_client.subscribe(["orderbook_delta"], tickers)
 
+    async def unsubscribe(self, tickers: list[str]):
+        """Unsubscribe from orderbook deltas for the given tickers and clean up cached books."""
+        for ticker in tickers:
+            self.books.pop(ticker, None)
+        await self.ws_client.unsubscribe(["orderbook_delta"], tickers)
+
+
     async def _handle_message(self, message: Dict[str, Any]):
         msg_type = message.get("type")
         

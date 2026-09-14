@@ -8,7 +8,7 @@ all transaction records (order IDs, parameters, and statuses) in the PostgreSQL 
 
 from config import BASE_URL, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 from auth.kalshi_auth import get_auth_headers
-from contextlib import closing
+from contextlib import closing, contextmanager
 
 import logging
 import requests
@@ -16,6 +16,7 @@ import asyncio
 import uuid
 import certifi
 import psycopg2
+from psycopg2 import pool
 import datetime
 from typing import Dict, Any, List, Optional
 from utils.rate_limiter import RateLimiter
@@ -36,21 +37,25 @@ class OrderManager:
     def __init__(self):
         # Maps client_order_id -> Order Dict
         self.active_orders: Dict[str, Dict[str, Any]] = {}
+        self.db_pool: Optional[pool.ThreadedConnectionPool] = None
 
-        # Initialize PostgreSQL database connection and schema
+        # Initialize PostgreSQL database connection pool and schema
+        self._init_db_pool()
         self._init_db()
 
         # Kalshi Rate Limit: 10 requests per second
         self.rate_limiter = RateLimiter(rate=10, per=1.0)
 
-    def _get_connection(self, allow_retries: bool = False):
-        """Helper to establish a PostgreSQL database connection with optional retry logic."""
+    def _init_db_pool(self, allow_retries: bool = True):
+        """Initializes a ThreadedConnectionPool for PostgreSQL."""
         import time
         max_retries = 10 if allow_retries else 1
         delay = 2
         for attempt in range(max_retries):
             try:
-                conn = psycopg2.connect(
+                self.db_pool = pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
                     host=DB_HOST,
                     port=DB_PORT,
                     database=DB_NAME,
@@ -58,20 +63,50 @@ class OrderManager:
                     password=DB_PASSWORD,
                     connect_timeout=5
                 )
-                return conn
+                logger.info("PostgreSQL ThreadedConnectionPool successfully initialized.")
+                return
             except psycopg2.OperationalError as e:
                 if attempt == max_retries - 1:
                     if allow_retries:
-                        logger.critical(f"Database connection failed after {max_retries} attempts: {e}")
+                        logger.critical(f"Database connection pool init failed after {max_retries} attempts: {e}")
                     else:
-                        logger.error(f"Database connection failed: {e}")
+                        logger.error(f"Database connection pool init failed: {e}")
                     raise
-                logger.warning(f"Database not ready yet (attempt {attempt+1}/{max_retries}). Retrying in {delay}s...")
+                logger.warning(f"Database not ready yet for pool (attempt {attempt+1}/{max_retries}). Retrying in {delay}s...")
                 time.sleep(delay)
+
+    @contextmanager
+    def _get_connection(self, allow_retries: bool = False):
+        """Context manager borrowing a connection from the pool and returning it upon exit."""
+        if self.db_pool is None:
+            self._init_db_pool(allow_retries=allow_retries)
+
+        conn = self.db_pool.getconn()
+        try:
+            yield conn
+        except Exception:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if self.db_pool and conn:
+                self.db_pool.putconn(conn)
+
+    def close(self):
+        """Closes all connections in the pool."""
+        if self.db_pool:
+            try:
+                self.db_pool.closeall()
+            except Exception as e:
+                logger.warning(f"Error closing db pool: {e}")
+            self.db_pool = None
 
     def _init_db(self):
         """Initializes the PostgreSQL database table for order tracking."""
-        with closing(self._get_connection(allow_retries=True)) as conn:
+        with self._get_connection(allow_retries=True) as conn:
             with conn.cursor() as cursor:
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS orders (
@@ -93,7 +128,7 @@ class OrderManager:
         """Updates or inserts an order record into the PostgreSQL database. Fails fast without blocking."""
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
-            with closing(self._get_connection(allow_retries=False)) as conn:
+            with self._get_connection(allow_retries=False) as conn:
                 with conn.cursor() as cursor:
                     # Check if order exists
                     cursor.execute("SELECT client_order_id FROM orders WHERE client_order_id = %s", (client_order_id,))

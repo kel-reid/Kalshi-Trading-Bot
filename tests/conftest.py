@@ -26,7 +26,8 @@ class MockResponse:
 def mock_request_handler(method, url, *args, **kwargs):
     if "markets" in url:
         return MockResponse({
-            "markets": [{"ticker": "MOCK_TICKER", "status": "active"}]
+            "markets": [{"ticker": "MOCK_TICKER", "status": "active"}],
+            "market": {"ticker": "MOCK_TICKER", "status": "active"}
         }, 200)
     elif "portfolio/balance" in url:
         return MockResponse({"balance": 10000}, 200)
@@ -55,6 +56,8 @@ class MockCursor:
         pass
 
 class MockDBConnection:
+    def __init__(self):
+        self.closed = False
     def cursor(self):
         return MockCursor()
     def commit(self):
@@ -62,11 +65,22 @@ class MockDBConnection:
     def rollback(self):
         pass
     def close(self):
-        pass
+        self.closed = True
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+class MockDBPool:
+    def __init__(self, *args, **kwargs):
+        self.closed = False
+        self._conn = MockDBConnection()
+    def getconn(self, key=None):
+        return self._conn
+    def putconn(self, conn, key=None, close=False):
+        pass
+    def closeall(self):
+        self.closed = True
 
 # Define Mock Websocket Client
 class MockWebSocket:
@@ -157,9 +171,16 @@ def mock_kalshi_api_layer():
         ws_patcher = patch("websockets.connect", side_effect=MockWSConnectContextManager)
         ws_patcher.start()
 
-        # 4. Mock psycopg2 database connection globally to bypass connection errors
+        # 4. Mock psycopg2 database connection and connection pool globally to bypass connection errors
         db_patcher = patch("psycopg2.connect", return_value=MockDBConnection())
         db_patcher.start()
+        pool_patcher = patch("psycopg2.pool.ThreadedConnectionPool", side_effect=MockDBPool)
+        pool_patcher.start()
+        try:
+            om_pool_patcher = patch("execution.order_manager.pool.ThreadedConnectionPool", side_effect=MockDBPool)
+            om_pool_patcher.start()
+        except Exception:
+            om_pool_patcher = None
         
         yield
         
@@ -170,5 +191,8 @@ def mock_kalshi_api_layer():
         delete_patcher.stop()
         ws_patcher.stop()
         db_patcher.stop()
+        pool_patcher.stop()
+        if om_pool_patcher:
+            om_pool_patcher.stop()
     else:
         yield
