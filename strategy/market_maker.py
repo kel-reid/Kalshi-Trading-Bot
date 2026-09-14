@@ -64,6 +64,7 @@ class AvellanedaStoikovBot:
         
         self.current_bid_price: Optional[int] = None
         self.current_ask_price: Optional[int] = None
+        self._last_empty_ob_log: float = 0.0
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -126,6 +127,13 @@ class AvellanedaStoikovBot:
             if self.min_spread == 0:
                 mid_price = 50.0
             else:
+                now = time.time()
+                if now - self._last_empty_ob_log > 30:
+                    logger.warning(
+                        f"Orderbook for {self.ticker} has no two-sided quotes "
+                        f"(best_bid={best_bid}, best_ask={best_ask}). Waiting for market activity..."
+                    )
+                    self._last_empty_ob_log = now
                 await self._cancel_all_quotes()
                 return
         else:

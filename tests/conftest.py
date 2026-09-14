@@ -122,16 +122,17 @@ class MockWSConnectContextManager:
 @pytest.fixture(autouse=True)
 def mock_kalshi_api_layer():
     """
-    Autouse fixture that detects if live credentials are present.
-    If not, it patches all Kalshi REST API endpoints, private key load functions,
-    database connection, and the WebSocket connection.
+    Autouse fixture that patches all Kalshi REST API endpoints, private key load functions,
+    database connection, and the WebSocket connection. Live testing is only enabled
+    if KALSHI_LIVE_TESTS=true is explicitly set and valid credentials exist.
     """
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key_demo.pem")
     has_key = os.path.exists(key_path) and os.path.getsize(key_path) > 0
     has_api_key = bool(os.getenv("KALSHI_API_KEY"))
+    run_live = (os.getenv("KALSHI_LIVE_TESTS") == "true") and has_key and has_api_key
     
-    # If keys are missing (like in CI or a clean clone), mock out the API and DB layers
-    if not (has_key and has_api_key):
+    # By default, mock out the API and DB layers to prevent live capital execution and local DB dependencies
+    if not run_live:
         # 1. Mock the auth header generator where it is imported in modules
         mock_headers = {"Authorization": "Bearer mock-token"}
         auth_patchers = [

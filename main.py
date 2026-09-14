@@ -20,25 +20,55 @@ from execution.kill_switch import KillSwitch
 
 
 async def main():
-    from config import BASE_URL, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from config import BASE_URL, ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
     
-    ticker = TARGET_TICKER
-    if not ticker:
-        print("No TARGET_TICKER in .env, fetching a random active market...")
-        r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 1000}, verify=certifi.where())
-        eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
+    ticker = TARGET_TICKER.strip() if TARGET_TICKER else ""
+    sports_keywords = ("NFL", "MLB", "NBA", "NHL", "EPL", "SOCCER", "NCAA")
+    fallback_keywords = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
+
+    # Fetch active markets from Kalshi
+    r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 1000}, verify=certifi.where())
+    eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
+    
+    if not eligible_markets:
+        print(f"No active markets found on {ENVIRONMENT.capitalize()}.")
+        sys.exit(1)
         
-        if not eligible_markets:
-            print("No active markets found on Demo.")
-            sys.exit(1)
-            
-        # Prioritize high-liquidity live sports, crypto, and daily financial index markets
-        target_prefixes = ("NBA", "NCAA", "MLB", "NFL", "NHL", "EPL", "UEFA", "SOCCER", "INX", "NASDAQ", "NDX", "BTC", "ETH")
-        high_liquidity = [m for m in eligible_markets if m.upper().startswith(target_prefixes)]
-        if high_liquidity:
-            ticker = random.choice(high_liquidity)
+    # Exclude internal composite / shard combo markets
+    tradeable_markets = [m for m in eligible_markets if not m.upper().startswith("KXMVE")]
+
+    # 1. Exact match if ticker specified and actively tradeable
+    if ticker and ticker in tradeable_markets:
+        print(f"Targeting specified market: {ticker}")
+    # 2. Keyword / category match if TARGET_TICKER provided (e.g. 'NFL', 'SPORTS', 'MLB')
+    elif ticker:
+        if ticker.upper() in ("SPORTS", "SPORT", "MAJOR SPORTS"):
+            matched = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
         else:
-            ticker = random.choice(eligible_markets)
+            # Match specific sport prefix or keyword (e.g. 'NFL')
+            matched = [m for m in tradeable_markets if ticker.upper() in m.upper()]
+        
+        if matched:
+            ticker = random.choice(matched)
+            print(f"Matched active market for keyword '{TARGET_TICKER}': {ticker}")
+        else:
+            print(f"No active markets found matching '{TARGET_TICKER}', falling back to available Major Sports...")
+            sports_markets = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
+            if sports_markets:
+                ticker = random.choice(sports_markets)
+                print(f"Selected alternative Major Sports market: {ticker}")
+            else:
+                ticker = random.choice(tradeable_markets)
+    # 3. Default: Prioritize NFL / Major Sports markets first
+    else:
+        sports_markets = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
+        if sports_markets:
+            ticker = random.choice(sports_markets)
+            print(f"Auto-selected active Major Sports market: {ticker}")
+        else:
+            high_liquidity = [m for m in tradeable_markets if any(k in m.upper() for k in fallback_keywords)]
+            ticker = random.choice(high_liquidity) if high_liquidity else random.choice(tradeable_markets)
+            print(f"No sports markets active currently. Auto-selected market: {ticker}")
         
     print(f"Selected Market: {ticker}")
     print("Starting Avellaneda-Stoikov Bot... Press Ctrl+C to Kill.")

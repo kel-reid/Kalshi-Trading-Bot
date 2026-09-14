@@ -36,6 +36,7 @@ class KalshiWebsocketClient:
             
         self.ws_connection = None
         self.message_handlers = []
+        self.active_subscriptions = []
         self.subscription_requests = []
         self.is_connected = False
         self._msg_id = 1
@@ -66,9 +67,15 @@ class KalshiWebsocketClient:
                     reconnect_delay = 1 # Reset backoff on successful connection
                     logger.info("Connected successfully.")
                     
-                    # Send all queued subscriptions upon successful connect
-                    for sub in self.subscription_requests:
-                        await self.send_message(sub)
+                    # Re-send all registered channel/market subscriptions upon every connect/reconnect
+                    for sub in self.active_subscriptions:
+                        logger.info(f"Restoring subscription: {sub.get('params')}")
+                        await websocket.send(json.dumps(sub))
+                    
+                    # Flush any one-off queued messages
+                    while self.subscription_requests:
+                        queued_msg = self.subscription_requests.pop(0)
+                        await websocket.send(json.dumps(queued_msg))
                     
                     # Listen for incoming text messages
                     async for message in websocket:
@@ -111,4 +118,9 @@ class KalshiWebsocketClient:
             msg["params"]["market_tickers"] = market_tickers
             
         self._msg_id += 1
+        
+        # Persist subscription so reconnects automatically restore it
+        if msg not in self.active_subscriptions:
+            self.active_subscriptions.append(msg)
+            
         await self.send_message(msg)
