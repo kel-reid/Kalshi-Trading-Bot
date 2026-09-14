@@ -59,10 +59,10 @@ Algorithmic trading requires highly sensitive credentials (Kalshi API keys, priv
 ### Decision
 We integrated **Doppler** as the single source of truth for configuration parameters and cryptographic keys.
 *   The GitHub Actions workflow injects the Doppler token into the deployment environment.
-*   The container is executed via `doppler run -- docker compose up -d`. This pulls configuration directly into memory (RAM), ensuring no private keys or API tokens ever touch the Droplet's persistent disk.
+*   The container is executed via `doppler run -- docker compose up -d` to centralize configuration injection at runtime. Docker Compose environment variables are still visible in container metadata, so this setup improves operational key management but is not a zero-disk/metadata-free secret delivery model.
 
 ### Consequences
-*   **Zero-Disk Footprint:** Secrets are only available to the active process memory.
+*   **Centralized Secret Handling:** Credentials are managed from one control plane instead of being hardcoded in tracked files.
 *   **Centralized Configuration:** Changing trading parameters (such as `RISK_GAMMA` or `MIN_SPREAD`) can be done dynamically from the Doppler dashboard without redeploying code.
 
 ---
@@ -72,7 +72,7 @@ We integrated **Doppler** as the single source of truth for configuration parame
 If a trading bot VM or a third-party Python package gets compromised, attackers could attempt to scan the database, scan the private network, or exfiltrate private credentials via remote network calls.
 
 ### Decision
-We implemented a strict networking model in [main.tf](file:///Users/kelreid/Projects/Kalshi-Trading-Bot/infra/main.tf):
+We implemented a strict networking model in [main.tf](../infra/main.tf):
 1.  **VPC Isolation:** The VM is hosted inside a dedicated DigitalOcean VPC, separating it from general network noise.
 2.  **Strict Egress Firewall:** Outbound traffic is restricted to:
     *   Port `53` (DNS)
@@ -93,7 +93,7 @@ Continuous 24/7 trading requires continuous verification. Developers need to kno
 
 ### Decision
 We implemented a decentralized scraping system:
-1.  **Prometheus Client:** The Python bot exposes standard Prometheus metrics locally on port `8000` via [metrics.py](file:///Users/kelreid/Projects/Kalshi-Trading-Bot/utils/metrics.py).
+1.  **Prometheus Client:** The Python bot exposes standard Prometheus metrics locally on port `8000` via [metrics.py](../utils/metrics.py).
 2.  **Grafana Alloy:** We run the Grafana Alloy daemon on the Droplet host to scrape port `8000` and push it to a hosted Grafana Cloud instance.
 3.  **Webhook Alerts:** Critical trading errors and system shutdowns are pushed asynchronously to Slack or Discord.
 
@@ -115,7 +115,7 @@ The bot is designed entirely around **Python Asyncio**.
 
 ### Consequences
 *   **Non-blocking Execution:** The WebSocket read loop continues processing orderbook snapshots even when the bot is busy posting a resting order via HTTP.
-*   **No Multi-threading Overhead:** Python's global interpreter lock (GIL) is bypassed elegantly without thread coordination bugs or excessive context-switching.
+*   **I/O Isolation from Event Loop:** Offloading blocking calls with `asyncio.to_thread` keeps network and database I/O from stalling the main async trading loop.
 
 ---
 

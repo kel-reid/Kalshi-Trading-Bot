@@ -108,7 +108,7 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `KALSHI_ENV` | `string` | `demo` | Kalshi environment connection mode (`demo` or `prod`). |
+| `KALSHI_ENV` | `string` | `prod` | Kalshi environment connection mode (`demo` or `prod`). Defaults to `prod`; `.env.example` intentionally sets `demo` for safer local onboarding. |
 | `TARGET_TICKER` | `string` | - | The market ticker code to quote (e.g., `INX-26AUG-T5700`). |
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to trade per quote side. |
 | `MIN_SPREAD` | `integer` | `4` | The minimum profit margin spread (in cents) required to quote. |

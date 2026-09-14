@@ -23,11 +23,17 @@ async def main():
     from config import BASE_URL, ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
     
     ticker = TARGET_TICKER.strip() if TARGET_TICKER else ""
-    sports_keywords = ("NFL", "MLB", "NBA", "NHL", "EPL", "SOCCER", "NCAA")
+    sports_keywords = ("NFL", "MLB", "NBA", "NHL", "EPL", "SOCCER", "NCAA", "UEFA")
     fallback_keywords = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
 
     # Fetch active markets from Kalshi
-    r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 1000}, verify=certifi.where())
+    r = await asyncio.to_thread(
+        requests.get,
+        BASE_URL + "/trade-api/v2/markets",
+        params={"limit": 1000},
+        verify=certifi.where(),
+        timeout=10,
+    )
     eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
     
     if not eligible_markets:
@@ -36,6 +42,9 @@ async def main():
         
     # Exclude internal composite / shard combo markets
     tradeable_markets = [m for m in eligible_markets if not m.upper().startswith("KXMVE")]
+    if not tradeable_markets:
+        print("No tradeable markets available after filtering internal markets.")
+        sys.exit(1)
 
     # 1. Exact match if ticker specified and actively tradeable
     if ticker and ticker in tradeable_markets:
@@ -58,7 +67,8 @@ async def main():
                 ticker = random.choice(sports_markets)
                 print(f"Selected alternative Major Sports market: {ticker}")
             else:
-                ticker = random.choice(tradeable_markets)
+                high_liquidity = [m for m in tradeable_markets if any(k in m.upper() for k in fallback_keywords)]
+                ticker = random.choice(high_liquidity) if high_liquidity else random.choice(tradeable_markets)
     # 3. Default: Prioritize NFL / Major Sports markets first
     else:
         sports_markets = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
