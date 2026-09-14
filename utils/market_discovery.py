@@ -132,9 +132,11 @@ def check_market_status(ticker: str) -> Optional[str]:
         return None
 
 
-def is_market_active(ticker: str) -> bool:
-    """Return True if the market exists and is currently in an active/open trading state."""
+def is_market_active(ticker: str) -> Optional[bool]:
+    """Return True/False for confirmed market status, or None if the status could not be determined."""
     status = check_market_status(ticker)
+    if status is None:
+        return None
     return status in ("open", "active")
 
 
@@ -146,7 +148,7 @@ async def discover_active_market_async(
     return await asyncio.to_thread(discover_active_market, target_preference, exclude_tickers)
 
 
-async def is_market_active_async(ticker: str) -> bool:
+async def is_market_active_async(ticker: str) -> Optional[bool]:
     """Non-blocking async wrapper for is_market_active."""
     return await asyncio.to_thread(is_market_active, ticker)
 
