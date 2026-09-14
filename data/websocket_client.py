@@ -75,7 +75,8 @@ class KalshiWebsocketClient:
                     # Flush any one-off queued messages
                     while self.subscription_requests:
                         queued_msg = self.subscription_requests.pop(0)
-                        await websocket.send(json.dumps(queued_msg))
+                        if queued_msg not in self.active_subscriptions:
+                            await websocket.send(json.dumps(queued_msg))
                     
                     # Listen for incoming text messages
                     async for message in websocket:
