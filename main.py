@@ -9,9 +9,6 @@ and launches the websocket and quoting loops.
 
 import asyncio
 import signal
-import random
-import requests
-import certifi
 import sys
 
 
@@ -20,65 +17,13 @@ from execution.kill_switch import KillSwitch
 
 
 async def main():
-    from config import BASE_URL, ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from config import ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from utils.market_discovery import discover_active_market_async
     
-    ticker = TARGET_TICKER.strip() if TARGET_TICKER else ""
-    sports_keywords = ("NFL", "MLB", "NBA", "NHL", "EPL", "SOCCER", "NCAA", "UEFA")
-    fallback_keywords = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
-
-    # Fetch active markets from Kalshi
-    r = await asyncio.to_thread(
-        requests.get,
-        BASE_URL + "/trade-api/v2/markets",
-        params={"limit": 1000},
-        verify=certifi.where(),
-        timeout=10,
-    )
-    eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
-    
-    if not eligible_markets:
-        print(f"No active markets found on {ENVIRONMENT.capitalize()}.")
+    ticker = await discover_active_market_async(target_preference=TARGET_TICKER)
+    if not ticker:
+        print(f"No active tradeable markets found on {ENVIRONMENT.capitalize()}.")
         sys.exit(1)
-        
-    # Exclude internal composite / shard combo markets
-    tradeable_markets = [m for m in eligible_markets if not m.upper().startswith("KXMVE")]
-    if not tradeable_markets:
-        print("No tradeable markets available after filtering internal markets.")
-        sys.exit(1)
-
-    # 1. Exact match if ticker specified and actively tradeable
-    if ticker and ticker in tradeable_markets:
-        print(f"Targeting specified market: {ticker}")
-    # 2. Keyword / category match if TARGET_TICKER provided (e.g. 'NFL', 'SPORTS', 'MLB')
-    elif ticker:
-        if ticker.upper() in ("SPORTS", "SPORT", "MAJOR SPORTS"):
-            matched = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
-        else:
-            # Match specific sport prefix or keyword (e.g. 'NFL')
-            matched = [m for m in tradeable_markets if ticker.upper() in m.upper()]
-        
-        if matched:
-            ticker = random.choice(matched)
-            print(f"Matched active market for keyword '{TARGET_TICKER}': {ticker}")
-        else:
-            print(f"No active markets found matching '{TARGET_TICKER}', falling back to available Major Sports...")
-            sports_markets = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
-            if sports_markets:
-                ticker = random.choice(sports_markets)
-                print(f"Selected alternative Major Sports market: {ticker}")
-            else:
-                high_liquidity = [m for m in tradeable_markets if any(k in m.upper() for k in fallback_keywords)]
-                ticker = random.choice(high_liquidity) if high_liquidity else random.choice(tradeable_markets)
-    # 3. Default: Prioritize NFL / Major Sports markets first
-    else:
-        sports_markets = [m for m in tradeable_markets if any(k in m.upper() for k in sports_keywords)]
-        if sports_markets:
-            ticker = random.choice(sports_markets)
-            print(f"Auto-selected active Major Sports market: {ticker}")
-        else:
-            high_liquidity = [m for m in tradeable_markets if any(k in m.upper() for k in fallback_keywords)]
-            ticker = random.choice(high_liquidity) if high_liquidity else random.choice(tradeable_markets)
-            print(f"No sports markets active currently. Auto-selected market: {ticker}")
         
     print(f"Selected Market: {ticker}")
     print("Starting Avellaneda-Stoikov Bot... Press Ctrl+C to Kill.")
@@ -88,7 +33,8 @@ async def main():
         ticker=ticker,
         gamma=RISK_GAMMA,
         min_spread=MIN_SPREAD,
-        order_size=ORDER_SIZE
+        order_size=ORDER_SIZE,
+        target_preference=TARGET_TICKER,
     )
     
     # 2. Wire Safety Kill Switch to manual signals (Ctrl+C and termination signals)

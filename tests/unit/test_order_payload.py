@@ -16,11 +16,13 @@ from execution.order_manager import OrderManager
 @pytest.fixture
 def order_manager():
     """Create an OrderManager with mocked database connection."""
-    with patch("execution.order_manager.psycopg2") as mock_pg:
+    with patch("execution.order_manager.pool.ThreadedConnectionPool") as mock_pool_cls:
         mock_conn = MagicMock()
-        mock_pg.connect.return_value = mock_conn
+        mock_conn.closed = False
+        mock_pool = MagicMock()
+        mock_pool.getconn.return_value = mock_conn
+        mock_pool_cls.return_value = mock_pool
         om = OrderManager()
-        om.db_conn = mock_conn
         return om
 
 

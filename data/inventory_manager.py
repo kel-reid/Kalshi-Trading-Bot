@@ -40,7 +40,7 @@ class InventoryManager:
         headers = get_auth_headers(method="GET", sign_path=sign_path)
         
         with measure_latency("GET", "/trade-api/v2/portfolio/balance"):
-            response = requests.get(BASE_URL + sign_path, headers=headers, verify=certifi.where())
+            response = requests.get(BASE_URL + sign_path, headers=headers, timeout=10, verify=certifi.where())
             
         if response.status_code == 200:
             self.balance_cents = response.json().get("balance", 0)
@@ -54,7 +54,7 @@ class InventoryManager:
         headers = get_auth_headers(method="GET", sign_path=sign_path)
         
         with measure_latency("GET", "/trade-api/v2/portfolio/positions"):
-            response = requests.get(BASE_URL + sign_path, headers=headers, params={"limit": 200}, verify=certifi.where())
+            response = requests.get(BASE_URL + sign_path, headers=headers, params={"limit": 200}, timeout=10, verify=certifi.where())
             
         if response.status_code == 200:
             market_positions = response.json().get("market_positions", [])

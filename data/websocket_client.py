@@ -59,9 +59,14 @@ class KalshiWebsocketClient:
                 # Generate fresh auth headers for each connection attempt to prevent signature timeouts
                 headers = get_auth_headers("GET", "/trade-api/ws/v2")
                 
-                # Disable ping_interval for now if Kalshi server uses a custom ping mechanism,
-                # though websockets default ping often works fine.
-                async with websockets.connect(self.ws_url, additional_headers=headers, ssl=ssl_context) as websocket:
+                # Configure explicit keep-alive ping frames to detect dead sockets proactively
+                async with websockets.connect(
+                    self.ws_url,
+                    additional_headers=headers,
+                    ssl=ssl_context,
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as websocket:
                     self.ws_connection = websocket
                     self.is_connected = True
                     reconnect_delay = 1 # Reset backoff on successful connection
@@ -125,3 +130,27 @@ class KalshiWebsocketClient:
             self.active_subscriptions.append(msg)
             
         await self.send_message(msg)
+
+    async def unsubscribe(self, channels: list[str], market_tickers: list[str] = None):
+        """Helper method to unsubscribe from channels like orderbook."""
+        msg = {
+            "id": self._msg_id,
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": channels
+            }
+        }
+        if market_tickers:
+            msg["params"]["market_tickers"] = market_tickers
+            
+        self._msg_id += 1
+        
+        # Remove matching subscriptions from active_subscriptions
+        self.active_subscriptions = [
+            s for s in self.active_subscriptions
+            if not (s.get("params", {}).get("channels") == channels and 
+                    s.get("params", {}).get("market_tickers") == market_tickers)
+        ]
+        
+        await self.send_message(msg)
+
