@@ -101,6 +101,12 @@ def test_check_market_status_closed():
         assert is_market_active("TEST-1") is False
 
 
+def test_check_market_status_unknown():
+    with patch("requests.get", side_effect=RuntimeError("boom")):
+        assert check_market_status("TEST-1") is None
+        assert is_market_active("TEST-1") is None
+
+
 @pytest.mark.asyncio
 async def test_bot_rotate_market():
     """Verify that rotate_market cancels quotes, resubscribes, and sends alert."""
@@ -118,6 +124,89 @@ async def test_bot_rotate_market():
         assert bot.ticker == "NEW-TICKER"
         mock_alert.assert_awaited_once()
         assert "NEW-TICKER" in mock_alert.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_bot_rotate_market_aborts_when_quote_cancel_fails():
+    bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot._cancel_all_quotes = AsyncMock(return_value=False)
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+        rotated = await bot.rotate_market("NEW-TICKER")
+
+    assert rotated is False
+    assert bot.ticker == "OLD-TICKER"
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    mock_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_quotes_preserves_failed_order_ids():
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.current_bid_id = "bid-1"
+    bot.current_bid_price = 45
+    bot.current_ask_id = "ask-1"
+    bot.current_ask_price = 55
+    bot.om.cancel_order = AsyncMock(side_effect=[False, True])
+
+    cancelled = await bot._cancel_all_quotes()
+
+    assert cancelled is False
+    assert bot.current_bid_id == "bid-1"
+    assert bot.current_bid_price == 45
+    assert bot.current_ask_id is None
+    assert bot.current_ask_price is None
+
+
+@pytest.mark.asyncio
+async def test_bot_unknown_market_status_does_not_rotate():
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(54, 10))
+    bot._cancel_all_quotes = AsyncMock()
+    bot._update_quotes = AsyncMock()
+    bot._last_market_status_check = 0
+
+    with patch("strategy.market_maker.is_market_active_async", new=AsyncMock(return_value=None)) as mock_status, \
+         patch("strategy.market_maker.discover_active_market_async", new=AsyncMock()) as mock_discover:
+        await bot._tick()
+
+    mock_status.assert_awaited_once_with("MOCK_TICKER")
+    mock_discover.assert_not_awaited()
+    bot._cancel_all_quotes.assert_not_awaited()
+    bot._update_quotes.assert_awaited_once_with(50, 54)
+    assert bot._market_inactive is False
+
+
+@pytest.mark.asyncio
+async def test_bot_inactive_market_with_no_replacement_halts_quoting():
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(50, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(54, 10))
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot._update_quotes = AsyncMock()
+    bot._last_market_status_check = 0
+
+    with patch("strategy.market_maker.is_market_active_async", new=AsyncMock(return_value=False)) as mock_status, \
+         patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value=None)) as mock_discover:
+        await bot._tick()
+        await bot._tick()
+
+    mock_status.assert_awaited_once_with("MOCK_TICKER")
+    mock_discover.assert_awaited_once_with(
+        target_preference="MOCK_TICKER",
+        exclude_tickers=["MOCK_TICKER"]
+    )
+    bot._cancel_all_quotes.assert_awaited_once()
+    bot._update_quotes.assert_not_awaited()
+    assert bot._market_inactive is True
 
 
 @pytest.mark.asyncio
