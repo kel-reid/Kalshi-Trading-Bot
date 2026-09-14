@@ -18,7 +18,7 @@ services:
       retries: 5
 
   bot:
-    image: ghcr.io/kelcodesstuff/kalshi-trading-bot:latest
+    image: ghcr.io/kel-reid/kalshi-trading-bot:latest
     container_name: kalshi-bot
     restart: always
     ports:
