@@ -107,8 +107,11 @@ def test_fetch_eligible_markets_queries_open_status_param():
         assert kwargs["params"].get("limit") == 500
 
 
-def test_fetch_eligible_markets_filters_non_open_statuses():
-    """Verify that fetch_eligible_markets strictly admits 'open' status and discards 'active', 'closed', etc."""
+def test_fetch_eligible_markets_accepts_both_open_and_active():
+    """
+    Verify that fetch_eligible_markets admits both 'open' and 'active' statuses
+    (required due to Kalshi API response payload quirk) while strictly discarding 'closed' and 'settled'.
+    """
     mock_markets = [
         {"ticker": "MKT-OPEN", "status": "open"},
         {"ticker": "MKT-ACTIVE", "status": "active"},
@@ -122,7 +125,7 @@ def test_fetch_eligible_markets_filters_non_open_statuses():
         mock_get.return_value = mock_resp
 
         eligible = fetch_eligible_markets()
-        assert [m["ticker"] for m in eligible] == ["MKT-OPEN"]
+        assert [m["ticker"] for m in eligible] == ["MKT-OPEN", "MKT-ACTIVE"]
 
 
 def test_discover_matches_title_and_subtitle():
