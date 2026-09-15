@@ -74,6 +74,10 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
                         if not m.get("subtitle") and e_sub:
                             m["subtitle"] = e_sub
                         markets.append(m)
+                        if len(markets) >= limit:
+                            break
+                    if len(markets) >= limit:
+                        break
 
                 pages_fetched += 1
                 cursor = data.get("cursor")
@@ -81,6 +85,9 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
                     break
         except Exception as e_err:
             logger.warning(f"Failed to query /events: {e_err}; falling back to /markets if needed")
+
+        # Guarantee markets does not exceed requested limit
+        markets = markets[:limit]
 
         # 2. Fallback: Query /markets if /events was unavailable or returned no markets
         if not markets:
