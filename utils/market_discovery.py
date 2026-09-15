@@ -34,15 +34,37 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
         markets = []
 
         # 1. Primary: Query /events with nested markets (bypasses synthetic KXMVE shards)
+        cursor: Optional[str] = None
+        max_event_pages = 10  # defensive bound to prevent infinite pagination
+        pages_fetched = 0
+
         try:
-            resp = requests.get(
-                f"{BASE_URL}/trade-api/v2/events",
-                params={"status": "open", "with_nested_markets": "true", "limit": 200},
-                verify=certifi.where(),
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                events = resp.json().get("events", [])
+            while pages_fetched < max_event_pages:
+                params: Dict[str, Any] = {
+                    "status": "open",
+                    "with_nested_markets": "true",
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+
+                resp = requests.get(
+                    f"{BASE_URL}/trade-api/v2/events",
+                    params=params,
+                    verify=certifi.where(),
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Non-200 response from /events ({resp.status_code}): {resp.text[:200]}"
+                    )
+                    break
+
+                data = resp.json()
+                events = data.get("events", [])
+                if not events:
+                    break
+
                 for e in events:
                     e_title = e.get("title", "")
                     e_sub = e.get("sub_title") or e.get("subtitle", "")
@@ -52,8 +74,13 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
                         if not m.get("subtitle") and e_sub:
                             m["subtitle"] = e_sub
                         markets.append(m)
+
+                pages_fetched += 1
+                cursor = data.get("cursor")
+                if not cursor or len(markets) >= limit:
+                    break
         except Exception as e_err:
-            logger.warning(f"Failed to query /events: {e_err}; falling back to /markets")
+            logger.warning(f"Failed to query /events: {e_err}; falling back to /markets if needed")
 
         # 2. Fallback: Query /markets if /events was unavailable or returned no markets
         if not markets:
