@@ -41,7 +41,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         eligible = []
         for m in markets:
-            if m.get("status") not in ("open", "active"):
+            if m.get("status") != "open":
                 continue
             if str(m.get("ticker", "")).upper().startswith("KXMVE"):
                 continue
