@@ -41,7 +41,10 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         eligible = []
         for m in markets:
-            if m.get("status") != "open":
+            # NOTE (Kalshi API Quirk): Kalshi accepts status="open" as query param,
+            # but returns markets with status="active" (or "open") in the response payload.
+            # Both values must be permitted.
+            if m.get("status") not in ("open", "active"):
                 continue
             if str(m.get("ticker", "")).upper().startswith("KXMVE"):
                 continue
