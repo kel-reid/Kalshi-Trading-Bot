@@ -17,6 +17,7 @@ from data.orderbook_manager import OrderbookManager
 from data.inventory_manager import InventoryManager
 from execution.order_manager import OrderManager
 from utils.alerting import send_alert
+from utils.market_discovery import discover_active_market_async, is_market_active_async
 from utils.metrics import start_metrics_server, BOT_INVENTORY_NET_POSITION, BOT_PNL_CENTS
 from config import RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
 
@@ -43,12 +44,18 @@ class AvellanedaStoikovBot:
         ticker: str, 
         gamma: float = None, # Risk aversion. How much 1 contract skews our price (in cents).
         min_spread: int = None, # Minimum spread to quote (in cents).
-        order_size: int = None   # Number of contracts to quote on each side.
+        order_size: int = None,  # Number of contracts to quote on each side.
+        target_preference: Optional[str] = None,
+        auto_rotate: bool = True,
+        starvation_timeout: float = 900.0, # 15 minutes
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
         self.min_spread = min_spread if min_spread is not None else MIN_SPREAD
         self.order_size = order_size if order_size is not None else ORDER_SIZE
+        self.target_preference = target_preference if target_preference is not None else ticker
+        self.auto_rotate = auto_rotate
+        self.starvation_timeout = starvation_timeout
         
         # Core Managers
         self.ws_client = KalshiWebsocketClient()
@@ -64,6 +71,16 @@ class AvellanedaStoikovBot:
         
         self.current_bid_price: Optional[int] = None
         self.current_ask_price: Optional[int] = None
+        self._last_empty_ob_log: float = 0.0
+
+        # Starvation tracking
+        self._starvation_start_time: Optional[float] = None
+        self._starvation_alert_sent: bool = False
+
+        # Periodic market settlement/status check (every 60s)
+        self._last_market_status_check: float = time.time()
+        self._market_status_check_interval: float = 60.0
+        self._market_inactive: bool = False
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -110,7 +127,37 @@ class AvellanedaStoikovBot:
 
     async def _tick(self):
         """The core logic evaluated every cycle."""
+        now = time.time()
         
+        # Periodic market settlement and expiry detection
+        if self.auto_rotate and (now - self._last_market_status_check >= self._market_status_check_interval):
+            self._last_market_status_check = now
+            is_active = await is_market_active_async(self.ticker)
+            if is_active is False:
+                logger.warning(f"Market {self.ticker} is no longer active (settled or expired). Initiating rotation...")
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker]
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                    else:
+                        self._market_inactive = True
+                    return
+                else:
+                    logger.error(f"No replacement market found for {self.ticker}.")
+                    self._market_inactive = True
+                    await self._cancel_all_quotes()
+                    return
+            elif is_active is True:
+                self._market_inactive = False
+            else:
+                logger.warning(f"Unable to confirm market status for {self.ticker}; retaining current market.")
+
+        if self._market_inactive:
+            return
+
         # Track PnL and Inventory immediately regardless of orderbook state so metrics always show up on Grafana
         inventory = self.inv_manager.get_position(self.ticker)
         BOT_INVENTORY_NET_POSITION.labels(ticker=self.ticker).set(inventory)
@@ -126,9 +173,35 @@ class AvellanedaStoikovBot:
             if self.min_spread == 0:
                 mid_price = 50.0
             else:
+                if self._starvation_start_time is None:
+                    self._starvation_start_time = now
+                
+                starved_duration = now - self._starvation_start_time
+                if starved_duration >= self.starvation_timeout and not self._starvation_alert_sent:
+                    self._starvation_alert_sent = True
+                    msg = (
+                        f"⚠️ [STARVATION ALERT] Orderbook for {self.ticker} has had no two-sided quotes "
+                        f"for {int(starved_duration / 60)} minutes. Quoting halted."
+                    )
+                    logger.error(msg)
+                    await send_alert(msg)
+
+                if now - self._last_empty_ob_log > 30:
+                    logger.warning(
+                        f"Orderbook for {self.ticker} has no two-sided quotes "
+                        f"(best_bid={best_bid}, best_ask={best_ask}, starved={int(starved_duration)}s). "
+                        f"Waiting for market activity..."
+                    )
+                    self._last_empty_ob_log = now
                 await self._cancel_all_quotes()
                 return
         else:
+            if self._starvation_alert_sent:
+                logger.info(f"Orderbook liquidity restored for {self.ticker}.")
+                await send_alert(f"✅ Orderbook Restored: Two-sided liquidity detected for {self.ticker}.")
+            self._starvation_start_time = None
+            self._starvation_alert_sent = False
+
             bid_price = best_bid[0]
             ask_price = best_ask[0]
             
@@ -234,22 +307,75 @@ class AvellanedaStoikovBot:
                 )
                 self.current_ask_price = new_ask if self.current_ask_id else None
 
-    async def _cancel_all_quotes(self):
+    async def _cancel_all_quotes(self) -> bool:
         """Withdraws all active quotes from the market."""
         tasks = []
+        cancel_targets = []
         if self.current_bid_id:
             tasks.append(self.om.cancel_order(self.current_bid_id))
-            self.current_bid_id = None
-            self.current_bid_price = None
+            cancel_targets.append(("bid", self.current_bid_id))
         if self.current_ask_id:
             tasks.append(self.om.cancel_order(self.current_ask_id))
-            self.current_ask_id = None
-            self.current_ask_price = None
-            
-        if tasks:
-            logger.info("Withdrawing quotes...")
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
+            cancel_targets.append(("ask", self.current_ask_id))
+             
+        if not tasks:
+            return True
+
+        logger.info("Withdrawing quotes...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        all_cancelled = True
+
+        for (side, order_id), result in zip(cancel_targets, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to cancel {side} quote {order_id}: {result}")
+                all_cancelled = False
+                continue
+            if result is not True:
+                logger.error(f"Failed to cancel {side} quote {order_id}.")
+                all_cancelled = False
+                continue
+
+            if side == "bid":
+                self.current_bid_id = None
+                self.current_bid_price = None
+            else:
+                self.current_ask_id = None
+                self.current_ask_price = None
+
+        return all_cancelled
+
+    async def rotate_market(self, new_ticker: str) -> bool:
+        """
+        Dynamically rotate bot quoting and orderbook subscription to a new market ticker
+        without restarting the container process.
+        """
+        old_ticker = self.ticker
+        if new_ticker == old_ticker:
+            return True
+
+        logger.warning(f"Rotating target market from {old_ticker} to {new_ticker}...")
+
+        # 1. Withdraw all active quotes on the previous ticker
+        if not await self._cancel_all_quotes():
+            logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
+            return False
+
+        # 2. Swap orderbook subscription
+        await self.ob_manager.unsubscribe([old_ticker])
+        await self.ob_manager.subscribe([new_ticker])
+
+        # 3. Update target ticker and reset state trackers
+        self.ticker = new_ticker
+        self._starvation_start_time = None
+        self._starvation_alert_sent = False
+        self._last_empty_ob_log = 0.0
+        self._last_market_status_check = time.time()
+        self._market_inactive = False
+
+        logger.info(f"Market rotation complete. Now trading {new_ticker}.")
+        await send_alert(f"🔄 Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
+        return True
+
     async def stop(self):
         self.running = False
         await self._cancel_all_quotes()

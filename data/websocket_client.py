@@ -36,6 +36,7 @@ class KalshiWebsocketClient:
             
         self.ws_connection = None
         self.message_handlers = []
+        self.active_subscriptions = []
         self.subscription_requests = []
         self.is_connected = False
         self._msg_id = 1
@@ -58,17 +59,29 @@ class KalshiWebsocketClient:
                 # Generate fresh auth headers for each connection attempt to prevent signature timeouts
                 headers = get_auth_headers("GET", "/trade-api/ws/v2")
                 
-                # Disable ping_interval for now if Kalshi server uses a custom ping mechanism,
-                # though websockets default ping often works fine.
-                async with websockets.connect(self.ws_url, additional_headers=headers, ssl=ssl_context) as websocket:
+                # Configure explicit keep-alive ping frames to detect dead sockets proactively
+                async with websockets.connect(
+                    self.ws_url,
+                    additional_headers=headers,
+                    ssl=ssl_context,
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as websocket:
                     self.ws_connection = websocket
                     self.is_connected = True
                     reconnect_delay = 1 # Reset backoff on successful connection
                     logger.info("Connected successfully.")
                     
-                    # Send all queued subscriptions upon successful connect
-                    for sub in self.subscription_requests:
-                        await self.send_message(sub)
+                    # Re-send all registered channel/market subscriptions upon every connect/reconnect
+                    for sub in self.active_subscriptions:
+                        logger.info(f"Restoring subscription: {sub.get('params')}")
+                        await websocket.send(json.dumps(sub))
+                    
+                    # Flush any one-off queued messages
+                    while self.subscription_requests:
+                        queued_msg = self.subscription_requests.pop(0)
+                        if queued_msg not in self.active_subscriptions:
+                            await websocket.send(json.dumps(queued_msg))
                     
                     # Listen for incoming text messages
                     async for message in websocket:
@@ -111,4 +124,33 @@ class KalshiWebsocketClient:
             msg["params"]["market_tickers"] = market_tickers
             
         self._msg_id += 1
+        
+        # Persist subscription so reconnects automatically restore it
+        if msg not in self.active_subscriptions:
+            self.active_subscriptions.append(msg)
+            
         await self.send_message(msg)
+
+    async def unsubscribe(self, channels: list[str], market_tickers: list[str] = None):
+        """Helper method to unsubscribe from channels like orderbook."""
+        msg = {
+            "id": self._msg_id,
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": channels
+            }
+        }
+        if market_tickers:
+            msg["params"]["market_tickers"] = market_tickers
+            
+        self._msg_id += 1
+        
+        # Remove matching subscriptions from active_subscriptions
+        self.active_subscriptions = [
+            s for s in self.active_subscriptions
+            if not (s.get("params", {}).get("channels") == channels and 
+                    s.get("params", {}).get("market_tickers") == market_tickers)
+        ]
+        
+        await self.send_message(msg)
+

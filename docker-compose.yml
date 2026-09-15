@@ -18,7 +18,7 @@ services:
       retries: 5
 
   bot:
-    image: ghcr.io/kelcodesstuff/kalshi-trading-bot:latest
+    image: ghcr.io/kel-reid/kalshi-trading-bot:latest
     container_name: kalshi-bot
     restart: always
     ports:
@@ -31,7 +31,7 @@ services:
       - KALSHI_ENV
       - KALSHI_API_KEY
       - KALSHI_PRIVATE_KEY
-      - KALSHI_PRIVATE_KEY_PATH=/app/kalshi_private_key_demo.pem
+      - KALSHI_PRIVATE_KEY_PATH
       - RISK_GAMMA
       - MIN_SPREAD
       - ORDER_SIZE

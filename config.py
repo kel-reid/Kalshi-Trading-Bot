@@ -9,7 +9,7 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Environment (Options: "demo" or "prod")
-ENVIRONMENT = os.getenv("KALSHI_ENV", "demo")
+ENVIRONMENT = os.getenv("KALSHI_ENV", "prod")
 
 # Base URLs
 if ENVIRONMENT == "prod":
