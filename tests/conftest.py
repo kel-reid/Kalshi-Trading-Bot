@@ -26,8 +26,8 @@ class MockResponse:
 def mock_request_handler(method, url, *args, **kwargs):
     if "markets" in url:
         return MockResponse({
-            "markets": [{"ticker": "MOCK_TICKER", "status": "active", "close_time": "2030-01-01T00:00:00Z"}],
-            "market": {"ticker": "MOCK_TICKER", "status": "active", "close_time": "2030-01-01T00:00:00Z"}
+            "markets": [{"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}],
+            "market": {"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}
         }, 200)
     elif "portfolio/balance" in url:
         return MockResponse({"balance": 10000}, 200)
