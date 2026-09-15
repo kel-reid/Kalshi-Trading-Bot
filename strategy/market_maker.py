@@ -186,6 +186,28 @@ class AvellanedaStoikovBot:
                     logger.error(msg)
                     await send_alert(msg)
 
+                    # Trigger dynamic market rotation if auto_rotate is enabled
+                    if self.auto_rotate:
+                        logger.warning(
+                            f"Orderbook for {self.ticker} has been starved for {int(starved_duration / 60)}m. "
+                            f"Initiating auto-rotation to find an active market..."
+                        )
+                        replacement = await discover_active_market_async(
+                            target_preference=self.target_preference,
+                            exclude_tickers=[self.ticker]
+                        )
+                        if replacement:
+                            if await self.rotate_market(replacement):
+                                self._market_inactive = False
+                            else:
+                                self._market_inactive = True
+                            return
+                        else:
+                            logger.error(f"No replacement market found for starved market {self.ticker}.")
+                            self._market_inactive = True
+                            await self._cancel_all_quotes()
+                            return
+
                 if now - self._last_empty_ob_log > 30:
                     logger.warning(
                         f"Orderbook for {self.ticker} has no two-sided quotes "
