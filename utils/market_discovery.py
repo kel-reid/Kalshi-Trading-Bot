@@ -26,18 +26,46 @@ FALLBACK_KEYWORDS = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
 def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
     """
     Fetch active and tradeable markets from the Kalshi REST API.
+    Queries /events with with_nested_markets=true to discover real underlying event markets
+    without getting exhausted by synthetic multivariate shards (KXMVE), falling back to /markets if needed.
     Excludes inactive markets, expired contracts, and internal composite / shard combo markets.
     """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/trade-api/v2/markets",
-            params={"limit": limit, "status": "open"},
-            verify=certifi.where(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        markets = resp.json().get("markets", [])
-        
+        markets = []
+
+        # 1. Primary: Query /events with nested markets (bypasses synthetic KXMVE shards)
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/trade-api/v2/events",
+                params={"status": "open", "with_nested_markets": "true", "limit": 200},
+                verify=certifi.where(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                events = resp.json().get("events", [])
+                for e in events:
+                    e_title = e.get("title", "")
+                    e_sub = e.get("sub_title") or e.get("subtitle", "")
+                    for m in e.get("markets", []):
+                        if not m.get("title") and e_title:
+                            m["title"] = e_title
+                        if not m.get("subtitle") and e_sub:
+                            m["subtitle"] = e_sub
+                        markets.append(m)
+        except Exception as e_err:
+            logger.warning(f"Failed to query /events: {e_err}; falling back to /markets")
+
+        # 2. Fallback: Query /markets if /events was unavailable or returned no markets
+        if not markets:
+            resp = requests.get(
+                f"{BASE_URL}/trade-api/v2/markets",
+                params={"limit": limit, "status": "open"},
+                verify=certifi.where(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            markets = resp.json().get("markets", [])
+
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         eligible = []
         for m in markets:
@@ -60,8 +88,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
             eligible.append(m)
 
         logger.info(
-            f"Queried Kalshi markets (status=open, limit={limit}): "
-            f"received {len(markets)} raw markets, {len(eligible)} eligible."
+            f"Queried Kalshi markets: received {len(markets)} raw markets, {len(eligible)} eligible."
         )
         if not eligible and markets:
             statuses = set(m.get("status") for m in markets)
