@@ -31,7 +31,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
     try:
         resp = requests.get(
             f"{BASE_URL}/trade-api/v2/markets",
-            params={"limit": limit},
+            params={"limit": limit, "status": "open"},
             verify=certifi.where(),
             timeout=10,
         )
@@ -41,7 +41,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         eligible = []
         for m in markets:
-            if m.get("status") not in ("open", "active"):
+            if m.get("status") != "open":
                 continue
             if str(m.get("ticker", "")).upper().startswith("KXMVE"):
                 continue
@@ -55,6 +55,16 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
                 except Exception:
                     pass
             eligible.append(m)
+
+        logger.info(
+            f"Queried Kalshi markets (status=open, limit={limit}): "
+            f"received {len(markets)} raw markets, {len(eligible)} eligible."
+        )
+        if not eligible and markets:
+            statuses = set(m.get("status") for m in markets)
+            logger.warning(
+                f"All {len(markets)} returned markets were filtered out. Observed statuses: {statuses}"
+            )
         return eligible
     except Exception as e:
         logger.error(f"Failed to fetch eligible markets: {e}")
