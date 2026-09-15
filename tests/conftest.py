@@ -24,7 +24,22 @@ class MockResponse:
         return self.json_data
 
 def mock_request_handler(method, url, *args, **kwargs):
-    if "markets" in url:
+    if "portfolio/orders" in url or "portfolio/events/orders" in url or "orders" in url:
+        if method == "POST":
+            return MockResponse({"order": {"order_id": "mock-order-id-123", "status": "executed"}}, 201)
+        elif method == "DELETE":
+            return MockResponse({"order": {"order_id": "mock-order-id-123", "status": "canceled"}}, 200)
+    elif "trade-api/v2/events" in url:
+        return MockResponse({
+            "events": [
+                {
+                    "event_ticker": "MOCK_EVENT",
+                    "title": "Mock Event",
+                    "markets": [{"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}]
+                }
+            ]
+        }, 200)
+    elif "markets" in url:
         return MockResponse({
             "markets": [{"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}],
             "market": {"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}
@@ -33,11 +48,6 @@ def mock_request_handler(method, url, *args, **kwargs):
         return MockResponse({"balance": 10000}, 200)
     elif "portfolio/positions" in url:
         return MockResponse({"market_positions": []}, 200)
-    elif "portfolio/orders" in url or "portfolio/events/orders" in url:
-        if method == "POST":
-            return MockResponse({"order": {"order_id": "mock-order-id-123", "status": "executed"}}, 201)
-        elif method == "DELETE":
-            return MockResponse({"order": {"order_id": "mock-order-id-123", "status": "canceled"}}, 200)
     return MockResponse({}, 200)
 
 # Define Mock Database cursor and connection supporting context manager protocols

@@ -92,7 +92,7 @@ def test_discover_filters_expired_close_time():
 
 
 def test_fetch_eligible_markets_queries_open_status_param():
-    """Ensure fetch_eligible_markets explicitly passes status='open' to Kalshi REST API."""
+    """Ensure fetch_eligible_markets explicitly passes status='open' to Kalshi REST API endpoints."""
     with patch("requests.get") as mock_get:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -101,10 +101,47 @@ def test_fetch_eligible_markets_queries_open_status_param():
 
         fetch_eligible_markets(limit=500)
 
+        # When /events returns no events, both /events and fallback /markets are queried
+        assert mock_get.call_count == 2
+        events_call, markets_call = mock_get.call_args_list
+
+        # Call 1: primary query to /events
+        assert "events" in events_call[0][0]
+        assert events_call[1]["params"].get("status") == "open"
+        assert events_call[1]["params"].get("with_nested_markets") == "true"
+
+        # Call 2: fallback query to /markets
+        assert "markets" in markets_call[0][0]
+        assert markets_call[1]["params"].get("status") == "open"
+        assert markets_call[1]["params"].get("limit") == 500
+
+
+def test_fetch_eligible_markets_primary_events_bypasses_markets_call():
+    """Verify that when /events succeeds and yields markets, fallback /markets is not invoked and title is inherited."""
+    mock_events = [
+        {
+            "event_ticker": "KXNFL-SUPERBOWL",
+            "title": "Super Bowl Champion",
+            "subtitle": "NFL 2026",
+            "markets": [
+                {"ticker": "KXNFL-KC", "status": "active", "close_time": "2030-01-01T00:00:00Z"},
+                {"ticker": "KXMVE-SHARD", "status": "active", "close_time": "2030-01-01T00:00:00Z"},
+            ],
+        }
+    ]
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"events": mock_events}
+        mock_get.return_value = mock_resp
+
+        eligible = fetch_eligible_markets()
         mock_get.assert_called_once()
-        _, kwargs = mock_get.call_args
-        assert kwargs["params"].get("status") == "open"
-        assert kwargs["params"].get("limit") == 500
+        assert "events" in mock_get.call_args[0][0]
+        assert len(eligible) == 1
+        assert eligible[0]["ticker"] == "KXNFL-KC"
+        assert eligible[0]["title"] == "Super Bowl Champion"
+        assert eligible[0]["subtitle"] == "NFL 2026"
 
 
 def test_fetch_eligible_markets_accepts_both_open_and_active():
