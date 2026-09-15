@@ -6,6 +6,7 @@ and contract expiration detection.
 """
 
 import pytest
+import requests
 from unittest.mock import patch, MagicMock
 
 from utils.market_discovery import (
@@ -142,6 +143,82 @@ def test_fetch_eligible_markets_primary_events_bypasses_markets_call():
         assert eligible[0]["ticker"] == "KXNFL-KC"
         assert eligible[0]["title"] == "Super Bowl Champion"
         assert eligible[0]["subtitle"] == "NFL 2026"
+
+
+def test_fetch_eligible_markets_events_timeout_falls_back_to_markets():
+    """Verify that when /events times out or raises an exception, the bot falls back to /markets and returns eligible markets."""
+    mock_markets = [
+        {"ticker": "FALLBACK-MKT-1", "status": "active", "close_time": "2030-01-01T00:00:00Z"},
+    ]
+    markets_resp = MagicMock()
+    markets_resp.status_code = 200
+    markets_resp.json.return_value = {"markets": mock_markets}
+
+    with patch("requests.get") as mock_get:
+        mock_get.side_effect = [
+            requests.exceptions.Timeout("Connection timed out"),
+            markets_resp,
+        ]
+
+        eligible = fetch_eligible_markets(limit=500)
+
+        assert mock_get.call_count == 2
+        events_call, markets_call = mock_get.call_args_list
+
+        assert "events" in events_call[0][0]
+        assert "markets" in markets_call[0][0]
+        assert markets_call[1]["params"].get("status") == "open"
+        assert markets_call[1]["params"].get("limit") == 500
+
+        assert len(eligible) == 1
+        assert eligible[0]["ticker"] == "FALLBACK-MKT-1"
+
+
+def test_fetch_eligible_markets_events_pagination():
+    """Verify that fetch_eligible_markets follows cursor on /events across pages until limit or cursor exhaustion."""
+    page1_resp = MagicMock()
+    page1_resp.status_code = 200
+    page1_resp.json.return_value = {
+        "cursor": "cursor_page_2",
+        "events": [
+            {
+                "event_ticker": "EVENT-PAGE-1",
+                "title": "Event Page 1",
+                "markets": [
+                    {"ticker": "MKT-P1", "status": "active", "close_time": "2030-01-01T00:00:00Z"}
+                ],
+            }
+        ],
+    }
+
+    page2_resp = MagicMock()
+    page2_resp.status_code = 200
+    page2_resp.json.return_value = {
+        "cursor": None,
+        "events": [
+            {
+                "event_ticker": "EVENT-PAGE-2",
+                "title": "Event Page 2",
+                "markets": [
+                    {"ticker": "MKT-P2", "status": "active", "close_time": "2030-01-01T00:00:00Z"}
+                ],
+            }
+        ],
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_get.side_effect = [page1_resp, page2_resp]
+
+        eligible = fetch_eligible_markets(limit=10)
+
+        assert mock_get.call_count == 2
+        call1, call2 = mock_get.call_args_list
+
+        assert "cursor" not in call1[1]["params"]
+        assert call2[1]["params"].get("cursor") == "cursor_page_2"
+
+        tickers = [m["ticker"] for m in eligible]
+        assert tickers == ["MKT-P1", "MKT-P2"]
 
 
 def test_fetch_eligible_markets_accepts_both_open_and_active():
