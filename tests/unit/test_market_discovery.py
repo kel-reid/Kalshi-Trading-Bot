@@ -221,6 +221,32 @@ def test_fetch_eligible_markets_events_pagination():
         assert tickers == ["MKT-P1", "MKT-P2"]
 
 
+def test_fetch_eligible_markets_honors_limit_bound_on_events():
+    """Verify that fetch_eligible_markets bounds collected nested markets to limit and stops iteration."""
+    mock_events = [
+        {
+            "event_ticker": "EVENT-MULTI",
+            "title": "Multi Market Event",
+            "markets": [
+                {"ticker": f"MKT-{i}", "status": "active", "close_time": "2030-01-01T00:00:00Z"}
+                for i in range(10)
+            ],
+        }
+    ]
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"events": mock_events, "cursor": "next_page_cursor"}
+        mock_get.return_value = mock_resp
+
+        eligible = fetch_eligible_markets(limit=3)
+
+        # Should only call once because limit (3) is satisfied by the first event
+        mock_get.assert_called_once()
+        assert len(eligible) == 3
+        assert [m["ticker"] for m in eligible] == ["MKT-0", "MKT-1", "MKT-2"]
+
+
 def test_fetch_eligible_markets_accepts_both_open_and_active():
     """
     Verify that fetch_eligible_markets admits both 'open' and 'active' statuses
