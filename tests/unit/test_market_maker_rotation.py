@@ -196,3 +196,70 @@ async def test_starvation_triggers_auto_rotation():
         )
         bot.rotate_market.assert_awaited_once_with("REPLACEMENT_TICKER")
         assert bot._market_inactive is False
+
+
+@pytest.mark.asyncio
+async def test_bot_retries_quote_cancellation_when_market_inactive():
+    """Verify that if quotes remain active in an inactive market, cancellation is retried each tick."""
+    bot = AvellanedaStoikovBot(ticker="INACTIVE_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._market_inactive = True
+    bot.current_bid_id = "unconfirmed-bid-1"
+    bot.current_ask_id = None
+    bot._cancel_all_quotes = AsyncMock(return_value=False)
+
+    await bot._tick()
+
+    bot._cancel_all_quotes.assert_awaited_once()
+    assert bot.current_bid_id == "unconfirmed-bid-1"
+    assert bot._market_inactive is True
+
+
+@pytest.mark.asyncio
+async def test_bot_retries_discovery_and_recovers_from_inactive():
+    """Verify that when market is inactive, discovery is retried after interval and successfully recovers."""
+    bot = AvellanedaStoikovBot(ticker="INACTIVE_TICKER", gamma=0.5, min_spread=4, order_size=1, auto_rotate=True)
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._market_inactive = True
+    bot._last_inactive_retry = time.time() - 10.0  # Elapse the 5s retry interval
+    bot.rotate_market = AsyncMock(return_value=True)
+
+    with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="RECOVERED_TICKER")) as mock_discover:
+        await bot._tick()
+
+        mock_discover.assert_awaited_once_with(
+            target_preference="INACTIVE_TICKER",
+            exclude_tickers=["INACTIVE_TICKER"]
+        )
+        bot.rotate_market.assert_awaited_once_with("RECOVERED_TICKER")
+        assert bot._market_inactive is False
+
+
+@pytest.mark.asyncio
+async def test_starvation_rotation_failure_sets_retry_timestamp():
+    """Verify that starvation rotation failure sets _last_inactive_retry allowing subsequent recovery."""
+    bot = AvellanedaStoikovBot(
+        ticker="DEAD_TICKER",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        starvation_timeout=900.0,
+        auto_rotate=True
+    )
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=None)
+    bot.ob_manager.get_best_ask = MagicMock(return_value=None)
+    bot.rotate_market = AsyncMock(return_value=False)  # Rotation fails (e.g. cancel failed)
+    bot._starvation_start_time = time.time() - 905
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock), \
+         patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="REPLACEMENT_TICKER")):
+        now_before = time.time()
+        await bot._tick()
+
+        assert bot._market_inactive is True
+        assert bot._last_inactive_retry >= now_before
+

@@ -81,6 +81,8 @@ class AvellanedaStoikovBot:
         self._last_market_status_check: float = time.time()
         self._market_status_check_interval: float = 60.0
         self._market_inactive: bool = False
+        self._last_inactive_retry: float = 0.0
+        self._inactive_retry_interval: float = 5.0
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -128,7 +130,36 @@ class AvellanedaStoikovBot:
     async def _tick(self):
         """The core logic evaluated every cycle."""
         now = time.time()
+
+        # Track PnL and Inventory immediately regardless of orderbook state so metrics always show up on Grafana
+        inventory = self.inv_manager.get_position(self.ticker)
+        BOT_INVENTORY_NET_POSITION.labels(ticker=self.ticker).set(inventory)
         
+        balance = self.inv_manager.get_balance()
+        BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
+
+        # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
+        if self._market_inactive:
+            if self.current_bid_id or self.current_ask_id:
+                logger.warning(f"Retrying quote cancellation for inactive market {self.ticker}...")
+                await self._cancel_all_quotes()
+
+            if self.auto_rotate and (now - self._last_inactive_retry >= self._inactive_retry_interval):
+                self._last_inactive_retry = now
+                logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker]
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                        logger.info(f"Successfully rotated from inactive market to {replacement}.")
+                        return
+                    else:
+                        logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
+            return
+
         # Periodic market settlement and expiry detection
         if self.auto_rotate and (now - self._last_market_status_check >= self._market_status_check_interval):
             self._last_market_status_check = now
@@ -144,26 +175,18 @@ class AvellanedaStoikovBot:
                         self._market_inactive = False
                     else:
                         self._market_inactive = True
+                        self._last_inactive_retry = now
                     return
                 else:
                     logger.error(f"No replacement market found for {self.ticker}.")
                     self._market_inactive = True
+                    self._last_inactive_retry = now
                     await self._cancel_all_quotes()
                     return
             elif is_active is True:
                 self._market_inactive = False
             else:
                 logger.warning(f"Unable to confirm market status for {self.ticker}; retaining current market.")
-
-        if self._market_inactive:
-            return
-
-        # Track PnL and Inventory immediately regardless of orderbook state so metrics always show up on Grafana
-        inventory = self.inv_manager.get_position(self.ticker)
-        BOT_INVENTORY_NET_POSITION.labels(ticker=self.ticker).set(inventory)
-        
-        balance = self.inv_manager.get_balance()
-        BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
         
         best_bid = self.ob_manager.get_best_bid(self.ticker)
         best_ask = self.ob_manager.get_best_ask(self.ticker)
@@ -201,10 +224,12 @@ class AvellanedaStoikovBot:
                                 self._market_inactive = False
                             else:
                                 self._market_inactive = True
+                                self._last_inactive_retry = now
                             return
                         else:
                             logger.error(f"No replacement market found for starved market {self.ticker}.")
                             self._market_inactive = True
+                            self._last_inactive_retry = now
                             await self._cancel_all_quotes()
                             return
 
