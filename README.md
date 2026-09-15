@@ -1,8 +1,8 @@
 # Kalshi Algorithmic Market Maker Bot
 
-[![CI/CD Pipeline](https://github.com/kelcodesstuff/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kelcodesstuff/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
+[![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 
-[![codecov](https://codecov.io/gh/KelCodesStuff/Kalshi-Trading-Bot/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/KelCodesStuff/Kalshi-Trading-Bot)
+[![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
 
 This project is a fully-functional algorithmic market-making trading bot built for the Kalshi prediction market platform. Its primary goal is to provide dual-sided liquidity (bids and asks) on Kalshi markets to capture the bid-ask spread while actively managing inventory risk.
 
@@ -108,7 +108,7 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `KALSHI_ENV` | `string` | `demo` | Kalshi environment connection mode (`demo` or `prod`). |
+| `KALSHI_ENV` | `string` | `prod` | Kalshi environment connection mode (`demo` or `prod`). Defaults to `prod`; `.env.example` intentionally sets `demo` for safer local onboarding. |
 | `TARGET_TICKER` | `string` | - | The market ticker code to quote (e.g., `INX-26AUG-T5700`). |
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to trade per quote side. |
 | `MIN_SPREAD` | `integer` | `4` | The minimum profit margin spread (in cents) required to quote. |

@@ -2,14 +2,7 @@
 
 ## Related Issue
 
-## Type of Change
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] DevOps / Infrastructure / CI
-- [ ] Documentation update
-
-## PR Checklist
+## Checklist
 - [ ] I have performed a self-review of my own code.
 - [ ] I have commented my code, particularly in hard-to-understand areas.
 - [ ] I have updated the README and/or Documentation to reflect any code/process changes.

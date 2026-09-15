@@ -9,9 +9,6 @@ and launches the websocket and quoting loops.
 
 import asyncio
 import signal
-import random
-import requests
-import certifi
 import sys
 
 
@@ -20,25 +17,13 @@ from execution.kill_switch import KillSwitch
 
 
 async def main():
-    from config import BASE_URL, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from config import ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from utils.market_discovery import discover_active_market_async
     
-    ticker = TARGET_TICKER
+    ticker = await discover_active_market_async(target_preference=TARGET_TICKER)
     if not ticker:
-        print("No TARGET_TICKER in .env, fetching a random active market...")
-        r = requests.get(BASE_URL + "/trade-api/v2/markets", params={"limit": 1000}, verify=certifi.where())
-        eligible_markets = [m["ticker"] for m in r.json().get("markets", []) if m.get("status") in ("open", "active")]
-        
-        if not eligible_markets:
-            print("No active markets found on Demo.")
-            sys.exit(1)
-            
-        # Prioritize high-liquidity live sports, crypto, and daily financial index markets
-        target_prefixes = ("NBA", "NCAA", "MLB", "NFL", "NHL", "EPL", "UEFA", "SOCCER", "INX", "NASDAQ", "NDX", "BTC", "ETH")
-        high_liquidity = [m for m in eligible_markets if m.upper().startswith(target_prefixes)]
-        if high_liquidity:
-            ticker = random.choice(high_liquidity)
-        else:
-            ticker = random.choice(eligible_markets)
+        print(f"No active tradeable markets found on {ENVIRONMENT.capitalize()}.")
+        sys.exit(1)
         
     print(f"Selected Market: {ticker}")
     print("Starting Avellaneda-Stoikov Bot... Press Ctrl+C to Kill.")
@@ -48,7 +33,8 @@ async def main():
         ticker=ticker,
         gamma=RISK_GAMMA,
         min_spread=MIN_SPREAD,
-        order_size=ORDER_SIZE
+        order_size=ORDER_SIZE,
+        target_preference=TARGET_TICKER,
     )
     
     # 2. Wire Safety Kill Switch to manual signals (Ctrl+C and termination signals)
