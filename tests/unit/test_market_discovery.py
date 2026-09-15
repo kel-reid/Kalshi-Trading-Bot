@@ -20,8 +20,8 @@ def test_discover_exact_match():
     """Verify exact ticker match when specified."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
-            {"ticker": "KXNFL-26SEP14-KC", "status": "active"},
-            {"ticker": "KXINX-26SEP14-5800", "status": "active"},
+            {"ticker": "KXNFL-26SEP14-KC", "status": "open"},
+            {"ticker": "KXINX-26SEP14-5800", "status": "open"},
         ]
         result = discover_active_market(target_preference="KXINX-26SEP14-5800")
         assert result == "KXINX-26SEP14-5800"
@@ -31,8 +31,8 @@ def test_discover_sports_keyword():
     """Verify sports keyword matching on ticker."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
-            {"ticker": "KXNFL-26SEP14-KC", "status": "active"},
-            {"ticker": "KXINX-26SEP14-5800", "status": "active"},
+            {"ticker": "KXNFL-26SEP14-KC", "status": "open"},
+            {"ticker": "KXINX-26SEP14-5800", "status": "open"},
         ]
         result = discover_active_market(target_preference="NFL")
         assert result == "KXNFL-26SEP14-KC"
@@ -42,8 +42,8 @@ def test_discover_category_sports():
     """Verify general 'SPORTS' preference matches any active sport."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
-            {"ticker": "KXMLB-26SEP14-NYY", "status": "active"},
-            {"ticker": "KXINX-26SEP14-5800", "status": "active"},
+            {"ticker": "KXMLB-26SEP14-NYY", "status": "open"},
+            {"ticker": "KXINX-26SEP14-5800", "status": "open"},
         ]
         result = discover_active_market(target_preference="SPORTS")
         assert result == "KXMLB-26SEP14-NYY"
@@ -53,7 +53,7 @@ def test_discover_fallback_when_sports_unavailable():
     """Verify fallback to macro index when requested category is absent."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
-            {"ticker": "KXINX-26SEP14-5800", "status": "active"},
+            {"ticker": "KXINX-26SEP14-5800", "status": "open"},
         ]
         result = discover_active_market(target_preference="NFL")
         assert result == "KXINX-26SEP14-5800"
@@ -63,8 +63,8 @@ def test_discover_exclude_tickers():
     """Verify excluded tickers are skipped."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
-            {"ticker": "KXNFL-FIRST", "status": "active"},
-            {"ticker": "KXNFL-SECOND", "status": "active"},
+            {"ticker": "KXNFL-FIRST", "status": "open"},
+            {"ticker": "KXNFL-SECOND", "status": "open"},
         ]
         result = discover_active_market(
             target_preference="NFL",
@@ -91,11 +91,27 @@ def test_discover_filters_expired_close_time():
         assert "KXNFL-ACTIVE" in tickers
 
 
+def test_fetch_eligible_markets_queries_open_status_param():
+    """Ensure fetch_eligible_markets explicitly passes status='open' to Kalshi REST API."""
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": []}
+        mock_get.return_value = mock_resp
+
+        fetch_eligible_markets(limit=500)
+
+        mock_get.assert_called_once()
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"].get("status") == "open"
+        assert kwargs["params"].get("limit") == 500
+
+
 def test_discover_matches_title_and_subtitle():
     """Verify that keywords match against market title even if ticker doesn't contain the keyword."""
     mock_markets = [
-        {"ticker": "KXSUPERBOWL-KC", "title": "Will Kansas City win the NFL Super Bowl?", "status": "active"},
-        {"ticker": "KXWEATHER-MIA", "title": "Miami Temperature", "status": "active"},
+        {"ticker": "KXSUPERBOWL-KC", "title": "Will Kansas City win the NFL Super Bowl?", "status": "open"},
+        {"ticker": "KXWEATHER-MIA", "title": "Miami Temperature", "status": "open"},
     ]
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets):
         result = discover_active_market(target_preference="NFL")
@@ -105,8 +121,8 @@ def test_discover_matches_title_and_subtitle():
 def test_discover_prioritizes_liquidity():
     """Verify that markets with positive volume/open interest are chosen over zero-volume contracts."""
     mock_markets = [
-        {"ticker": "KXNFL-DEAD", "title": "NFL Matchup", "volume": 0, "open_interest": 0, "status": "active"},
-        {"ticker": "KXNFL-LIQUID", "title": "NFL Matchup", "volume": 15000, "open_interest": 500, "status": "active"},
+        {"ticker": "KXNFL-DEAD", "title": "NFL Matchup", "volume": 0, "open_interest": 0, "status": "open"},
+        {"ticker": "KXNFL-LIQUID", "title": "NFL Matchup", "volume": 15000, "open_interest": 500, "status": "open"},
     ]
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets):
         result = discover_active_market(target_preference="NFL")
