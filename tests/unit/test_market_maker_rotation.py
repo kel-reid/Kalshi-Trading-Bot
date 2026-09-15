@@ -201,7 +201,9 @@ async def test_starvation_triggers_auto_rotation():
 @pytest.mark.asyncio
 async def test_bot_retries_quote_cancellation_when_market_inactive():
     """Verify that if quotes remain active in an inactive market, cancellation is retried each tick."""
-    bot = AvellanedaStoikovBot(ticker="INACTIVE_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot = AvellanedaStoikovBot(
+        ticker="INACTIVE_TICKER", gamma=0.5, min_spread=4, order_size=1, auto_rotate=False
+    )
     bot.inv_manager.get_position = MagicMock(return_value=0)
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot._market_inactive = True
