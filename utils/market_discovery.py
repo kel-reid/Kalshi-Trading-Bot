@@ -26,18 +26,80 @@ FALLBACK_KEYWORDS = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
 def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
     """
     Fetch active and tradeable markets from the Kalshi REST API.
+    Queries /events with with_nested_markets=true to discover real underlying event markets
+    without getting exhausted by synthetic multivariate shards (KXMVE), falling back to /markets if needed.
     Excludes inactive markets, expired contracts, and internal composite / shard combo markets.
     """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/trade-api/v2/markets",
-            params={"limit": limit, "status": "open"},
-            verify=certifi.where(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        markets = resp.json().get("markets", [])
-        
+        markets = []
+
+        # 1. Primary: Query /events with nested markets (bypasses synthetic KXMVE shards)
+        cursor: Optional[str] = None
+        max_event_pages = 10  # defensive bound to prevent infinite pagination
+        pages_fetched = 0
+
+        try:
+            while pages_fetched < max_event_pages:
+                params: Dict[str, Any] = {
+                    "status": "open",
+                    "with_nested_markets": "true",
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+
+                resp = requests.get(
+                    f"{BASE_URL}/trade-api/v2/events",
+                    params=params,
+                    verify=certifi.where(),
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Non-200 response from /events ({resp.status_code}): {resp.text[:200]}"
+                    )
+                    break
+
+                data = resp.json()
+                events = data.get("events", [])
+                if not events:
+                    break
+
+                for e in events:
+                    e_title = e.get("title", "")
+                    e_sub = e.get("sub_title") or e.get("subtitle", "")
+                    for m in e.get("markets", []):
+                        if not m.get("title") and e_title:
+                            m["title"] = e_title
+                        if not m.get("subtitle") and e_sub:
+                            m["subtitle"] = e_sub
+                        markets.append(m)
+                        if len(markets) >= limit:
+                            break
+                    if len(markets) >= limit:
+                        break
+
+                pages_fetched += 1
+                cursor = data.get("cursor")
+                if not cursor or len(markets) >= limit:
+                    break
+        except Exception as e_err:
+            logger.warning(f"Failed to query /events: {e_err}; falling back to /markets if needed")
+
+        # Guarantee markets does not exceed requested limit
+        markets = markets[:limit]
+
+        # 2. Fallback: Query /markets if /events was unavailable or returned no markets
+        if not markets:
+            resp = requests.get(
+                f"{BASE_URL}/trade-api/v2/markets",
+                params={"limit": limit, "status": "open"},
+                verify=certifi.where(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            markets = resp.json().get("markets", [])
+
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         eligible = []
         for m in markets:
@@ -60,8 +122,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
             eligible.append(m)
 
         logger.info(
-            f"Queried Kalshi markets (status=open, limit={limit}): "
-            f"received {len(markets)} raw markets, {len(eligible)} eligible."
+            f"Queried Kalshi markets: received {len(markets)} raw markets, {len(eligible)} eligible."
         )
         if not eligible and markets:
             statuses = set(m.get("status") for m in markets)
