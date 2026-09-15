@@ -31,7 +31,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
     try:
         resp = requests.get(
             f"{BASE_URL}/trade-api/v2/markets",
-            params={"limit": limit, "status": "open"},
+            params={"limit": limit},
             verify=certifi.where(),
             timeout=10,
         )
