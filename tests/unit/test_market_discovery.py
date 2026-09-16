@@ -460,8 +460,10 @@ def test_sports_season_router_calendar_priorities():
 
 
 def test_sports_season_router_full_product_suites():
-    """Verify in-season series include Game Lines and Player Props for all major leagues."""
-    series = SportsSeasonRouter.get_in_season_series()
+    """Verify in-season series include Game Lines and Player Props for all major leagues during active overlap."""
+    import datetime
+    dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    series = SportsSeasonRouter.get_in_season_series(dt_oct)
     # NFL Game Lines & Player Props
     assert "KXNFLGAME" in series
     assert "KXNFLSPREAD" in series
@@ -474,6 +476,39 @@ def test_sports_season_router_full_product_suites():
     # MLB Lines & Props
     assert "KXMLBGAME" in series
     assert "KXMLBSTRIKEOUT" in series
+
+    # Test league-specific series getter
+    nfl_suite = SportsSeasonRouter.get_series_for_league("NFL")
+    assert "KXNFLGAME" in nfl_suite
+    assert "KXNFLPASSYDS" in nfl_suite
+
+
+def test_select_best_market_returns_none_when_preflight_fails_all_candidates():
+    """Verify _select_best_market returns None (not pool[0]) when all candidates fail pre-flight orderbook check."""
+    candidates = [
+        {"ticker": "KXNFL-STARVED-1", "volume_fp": "10000.00"},
+        {"ticker": "KXNFL-STARVED-2", "volume_fp": "5000.00"},
+    ]
+    with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False):
+        # Preflight check enabled -> should return None rather than unquoted pool[0]
+        assert _select_best_market(candidates, preflight_check=True) is None
+        # Preflight check disabled -> falls back to top liquidity candidate
+        assert _select_best_market(candidates, preflight_check=False) == "KXNFL-STARVED-1"
+
+
+def test_discover_active_market_cascades_to_player_props():
+    """Verify waterfall cascades from game lines to player props within the same league when game lines are unquoted."""
+    def mock_fetch(limit=1000, series_ticker=None):
+        if series_ticker == "KXNFLGAME":
+            return []  # no active game lines
+        elif series_ticker == "KXNFLPASSYDS":
+            return [{"ticker": "KXNFLPASSYDS-MAHOMES-300", "status": "open", "volume_fp": "2000.00"}]
+        return []
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        result = discover_active_market(target_preference="NFL")
+        assert result == "KXNFLPASSYDS-MAHOMES-300"
 
 
 def test_fetch_eligible_markets_excludes_nhl_tickers():
