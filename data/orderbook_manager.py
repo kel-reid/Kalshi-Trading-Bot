@@ -11,9 +11,33 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger("OrderbookManager")
 
+def _normalize_price_to_cents(price: Any) -> Optional[int]:
+    if price is None:
+        return None
+    try:
+        p_str = str(price).strip()
+        p_val = float(p_str)
+        if "." in p_str or p_val < 1.0:
+            return round(p_val * 100)
+        return int(round(p_val))
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_qty(qty: Any) -> int:
+    if qty is None:
+        return 0
+    try:
+        return int(round(float(qty)))
+    except (ValueError, TypeError):
+        return 0
+
+
 class OrderbookManager:
     """
     Maintains a real-time L2 order book for tracked Kalshi markets.
+    Supports both Kalshi v2 dollar-formatted feeds (yes_dollars_fp, price_dollars)
+    and legacy integer cent feeds.
     """
     def __init__(self, ws_client):
         self.ws_client = ws_client
@@ -58,10 +82,21 @@ class OrderbookManager:
             
         logger.info(f"Received orderbook snapshot for {ticker}")
         
-        # Load snapshot bids/asks ("yes" and "no" arrays of [price, qty])
+        # Load snapshot bids/asks ("yes" and "no", or v2 "yes_dollars_fp" and "no_dollars_fp")
         for side in ["yes", "no"]:
-            levels = msg.get(side, [])
-            self.books[ticker][side] = {price: qty for price, qty in levels if qty > 0}
+            levels = (
+                msg.get(f"{side}_dollars_fp") or
+                msg.get(f"{side}_dollars") or
+                msg.get(side, [])
+            )
+            side_book: Dict[int, int] = {}
+            for item in levels:
+                if len(item) >= 2:
+                    price_cents = _normalize_price_to_cents(item[0])
+                    qty = _normalize_qty(item[1])
+                    if price_cents is not None and qty > 0 and 1 <= price_cents <= 99:
+                        side_book[price_cents] = qty
+            self.books[ticker][side] = side_book
 
     def _handle_delta(self, msg: Dict[str, Any]):
         ticker = msg.get("market_ticker")
@@ -69,19 +104,28 @@ class OrderbookManager:
             return
             
         side = msg.get("side") # "yes" or "no"
-        price = msg.get("price")
-        delta = msg.get("delta")
+        raw_price = msg.get("price_dollars") if msg.get("price_dollars") is not None else msg.get("price")
+        raw_delta = msg.get("delta_fp") if msg.get("delta_fp") is not None else msg.get("delta")
         
-        if side not in self.books[ticker] or price is None or delta is None:
+        if side not in self.books[ticker] or raw_price is None or raw_delta is None:
+            return
+
+        price_cents = _normalize_price_to_cents(raw_price)
+        if price_cents is None:
+            return
+
+        try:
+            delta = float(raw_delta)
+        except (ValueError, TypeError):
             return
             
-        current_qty = self.books[ticker][side].get(price, 0)
+        current_qty = self.books[ticker][side].get(price_cents, 0)
         new_qty = current_qty + delta
         
         if new_qty <= 0:
-            self.books[ticker][side].pop(price, None)
+            self.books[ticker][side].pop(price_cents, None)
         else:
-            self.books[ticker][side][price] = new_qty
+            self.books[ticker][side][price_cents] = int(round(new_qty))
 
     def get_best_bid(self, ticker: str) -> Optional[tuple[int, int]]:
         """
