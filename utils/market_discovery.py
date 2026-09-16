@@ -56,7 +56,7 @@ class SportsSeasonRouter:
         Return ordered list of active leagues ('NFL', 'NBA', 'MLB') based on calendar month.
         - Sep - Feb: NFL primary, NBA secondary (Oct-Jun), MLB tertiary in postseason (Sep-early Nov)
         - Mar - Jun: NBA primary (playoffs), MLB secondary (opening/regular season)
-        - Jul - Aug: MLB primary (summer lull daily games; Aug adds NFL preseason)
+        - Jul - Aug: MLB primary (summer lull: MLB only; NFL preseason excluded)
         """
         if dt is None:
             dt = datetime.datetime.now(datetime.timezone.utc)
@@ -81,6 +81,16 @@ class SportsSeasonRouter:
             "MLB": "KXMLBGAME",
         }
         return mapping.get(league.upper(), "KXNFLGAME")
+
+    @classmethod
+    def get_series_for_league(cls, league: str) -> List[str]:
+        """Return prioritized list of series tickers for a specific league."""
+        mapping = {
+            "NFL": list(cls.NFL_SERIES),
+            "NBA": list(cls.NBA_SERIES),
+            "MLB": list(cls.MLB_SERIES),
+        }
+        return mapping.get(league.upper(), [cls.get_primary_series_for_league(league)])
 
     @classmethod
     def get_in_season_series(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
@@ -327,8 +337,10 @@ def _select_best_market(candidates: List[Dict[str, Any]], preflight_check: bool 
             if cand_ticker and check_orderbook_has_quotes(cand_ticker):
                 logger.info(f"Pre-flight orderbook check confirmed two-sided quotes for: {cand_ticker}")
                 return cand_ticker
+        logger.info("Pre-flight orderbook check found no candidates with active two-sided quotes.")
+        return None
 
-    # Fallback to the top-ranked candidate if pre-flight check found no active books or was skipped
+    # Fallback to the top-ranked candidate only if pre-flight check was explicitly disabled
     selected = pool[0]
     return selected.get("ticker")
 
@@ -343,7 +355,7 @@ def discover_active_market(
     
     Priority:
     1. Exact match for target_preference (if active and not excluded)
-    2. In-Season Sports Router (waterfall across NFL, NBA, MLB based on calendar month)
+    2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month)
     3. Category/keyword match across ticker, title, and subtitle
     4. Major Sports market (NFL, NBA, MLB)
     5. Safely return None and idle if no active sports markets with two-sided quotes are found
@@ -357,7 +369,7 @@ def discover_active_market(
         "SPORTS", "SPORT", "MAJOR SPORTS"
     ) or not pref
 
-    # 1. SportsSeasonRouter Waterfall for in-season leagues
+    # 1. SportsSeasonRouter Waterfall for in-season leagues and full product suites
     if is_sports_pref:
         if pref in ("NFL", "FOOTBALL"):
             target_leagues = ["NFL"]
@@ -369,27 +381,28 @@ def discover_active_market(
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
 
         for league in target_leagues:
-            primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
-            try:
-                league_markets = fetch_eligible_markets(series_ticker=primary_series)
-            except Exception:
-                league_markets = []
-
+            league_series_list = SportsSeasonRouter.get_series_for_league(league)
             league_prefix = f"KX{league}"
-            tradeable_league = [
-                m for m in league_markets
-                if m.get("ticker") not in exclude
-                and (
-                    str(m.get("ticker", "")).upper().startswith(league_prefix)
-                    or league in _text_for_market(m)
-                )
-            ]
-            # If specific sports keyword was matched
-            if tradeable_league:
-                selected = _select_best_market(tradeable_league, preflight_check=preflight_check)
-                if selected:
-                    logger.info(f"SportsSeasonRouter selected active {league} market: {selected}")
-                    return selected
+
+            for series_ticker in league_series_list:
+                try:
+                    series_markets = fetch_eligible_markets(series_ticker=series_ticker)
+                except Exception:
+                    series_markets = []
+
+                tradeable_series = [
+                    m for m in series_markets
+                    if m.get("ticker") not in exclude
+                    and (
+                        str(m.get("ticker", "")).upper().startswith(league_prefix)
+                        or league in _text_for_market(m)
+                    )
+                ]
+                if tradeable_series:
+                    selected = _select_best_market(tradeable_series, preflight_check=preflight_check)
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected active {league} ({series_ticker}) market: {selected}")
+                        return selected
 
     # 2. General Market Query if sports waterfall did not yield a selection or specific non-sports pref
     eligible = fetch_eligible_markets()
