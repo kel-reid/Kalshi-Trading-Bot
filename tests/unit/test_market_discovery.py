@@ -422,21 +422,26 @@ def test_select_best_market_preflight_filters_empty_orderbook():
 
 
 def test_discover_active_market_prioritizes_kxnflgame_series():
-    """Verify discover_active_market queries KXNFLGAME series when NFL or sports is targeted."""
+    """Verify discover_active_market prioritizes KXNFLGAME series when NFL or sports is targeted."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch, \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
         
         mock_fetch.return_value = [
-            {"ticker": "KXNFLGAME-26SEP17DETBUF", "status": "open", "volume_fp": "50000.00"},
+            {"ticker": "KXNFLPASSYDS-MAHOMES-300", "series_ticker": "KXNFLPASSYDS", "status": "open", "volume_fp": "90000.00"},
+            {"ticker": "KXNFLGAME-26SEP17DETBUF", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "50000.00"},
         ]
         result = discover_active_market(target_preference="NFL")
         assert result == "KXNFLGAME-26SEP17DETBUF"
-        mock_fetch.assert_called_with(series_ticker="KXNFLGAME")
+        mock_fetch.assert_called_once()
 
 
 def test_sports_season_router_calendar_priorities():
     """Verify SportsSeasonRouter resolves seasonal league priorities correctly by month."""
     import datetime
+
+    # Early Fall: September (month 9) -> NFL, MLB (NBA not started)
+    dt_sep = datetime.datetime(2026, 9, 15, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep) == ["NFL", "MLB"]
 
     # Fall/Winter: October (month 10) -> NFL, NBA, MLB
     dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
@@ -498,17 +503,33 @@ def test_select_best_market_returns_none_when_preflight_fails_all_candidates():
 
 def test_discover_active_market_cascades_to_player_props():
     """Verify waterfall cascades from game lines to player props within the same league when game lines are unquoted."""
-    def mock_fetch(limit=1000, series_ticker=None):
-        if series_ticker == "KXNFLGAME":
-            return []  # no active game lines
-        elif series_ticker == "KXNFLPASSYDS":
-            return [{"ticker": "KXNFLPASSYDS-MAHOMES-300", "status": "open", "volume_fp": "2000.00"}]
-        return []
-
-    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+    mock_markets = [
+        {"ticker": "KXNFLPASSYDS-MAHOMES-300", "series_ticker": "KXNFLPASSYDS", "status": "open", "volume_fp": "2000.00"}
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
         result = discover_active_market(target_preference="NFL")
         assert result == "KXNFLPASSYDS-MAHOMES-300"
+
+
+def test_secondary_league_reachable_when_primary_league_game_lines_unquoted():
+    """Verify NBA Game Lines are reached and selected when NFL Game Lines are dormant in October."""
+    import datetime
+    mock_markets = [
+        {"ticker": "KXNFLGAME-DORMANT-1", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "5000.00"},
+        {"ticker": "KXNBAGAME-ACTIVE-1", "series_ticker": "KXNBAGAME", "status": "open", "volume_fp": "4000.00"},
+    ]
+    def mock_quotes(ticker):
+        return ticker == "KXNBAGAME-ACTIVE-1"
+
+    dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", side_effect=mock_quotes), \
+         patch("utils.market_discovery.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = dt_oct
+        mock_dt.datetime.timezone = datetime.timezone
+        result = discover_active_market(target_preference="SPORTS")
+        assert result == "KXNBAGAME-ACTIVE-1"
 
 
 def test_fetch_eligible_markets_excludes_nhl_tickers():
@@ -531,15 +552,17 @@ def test_fetch_eligible_markets_excludes_nhl_tickers():
 
 def test_discovery_wide_probe_budget_caps_total_requests():
     """Verify that an all-dormant cascade strictly honors max_total_probes across all series."""
-    def mock_fetch(limit=1000, series_ticker=None):
-        # Return 5 candidates for every series
-        prefix = series_ticker or "KXNFL"
-        return [
-            {"ticker": f"{prefix}-CAND-{i}", "status": "open", "volume_fp": f"{1000 - i * 10}.00"}
-            for i in range(5)
-        ]
+    mock_markets = [
+        {"ticker": f"KXNFLGAME-CAND-{i}", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "1000.00"} for i in range(5)
+    ] + [
+        {"ticker": f"KXNFLSPREAD-CAND-{i}", "series_ticker": "KXNFLSPREAD", "status": "open", "volume_fp": "1000.00"} for i in range(5)
+    ] + [
+        {"ticker": f"KXNBAGAME-CAND-{i}", "series_ticker": "KXNBAGAME", "status": "open", "volume_fp": "1000.00"} for i in range(5)
+    ] + [
+        {"ticker": f"KXMLBGAME-CAND-{i}", "series_ticker": "KXMLBGAME", "status": "open", "volume_fp": "1000.00"} for i in range(5)
+    ]
 
-    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
         # Request with max_total_probes=6 across all in-season series
         result = discover_active_market(target_preference="SPORTS", max_total_probes=6)
@@ -550,15 +573,12 @@ def test_discovery_wide_probe_budget_caps_total_requests():
 
 def test_per_series_probe_limit_caps_probes_per_series():
     """Verify that a single series with many candidates only probes up to DEFAULT_MAX_PROBES_PER_SERIES."""
-    def mock_fetch(limit=1000, series_ticker=None):
-        if series_ticker == "KXNFLGAME":
-            return [
-                {"ticker": f"KXNFLGAME-CAND-{i}", "status": "open", "volume_fp": f"{10000 - i * 100}.00"}
-                for i in range(10)
-            ]
-        return []
+    mock_markets = [
+        {"ticker": f"KXNFLGAME-CAND-{i}", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": f"{10000 - i * 100}.00"}
+        for i in range(10)
+    ]
 
-    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
         result = discover_active_market(target_preference="NFL", max_total_probes=10)
         assert result is None
