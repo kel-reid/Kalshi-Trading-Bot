@@ -529,3 +529,58 @@ def test_fetch_eligible_markets_excludes_nhl_tickers():
         assert "KXNFL-26SEP14-KC" in tickers
 
 
+def test_discovery_wide_probe_budget_caps_total_requests():
+    """Verify that an all-dormant cascade strictly honors max_total_probes across all series."""
+    def mock_fetch(limit=1000, series_ticker=None):
+        # Return 5 candidates for every series
+        prefix = series_ticker or "KXNFL"
+        return [
+            {"ticker": f"{prefix}-CAND-{i}", "status": "open", "volume_fp": f"{1000 - i * 10}.00"}
+            for i in range(5)
+        ]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
+        # Request with max_total_probes=6 across all in-season series
+        result = discover_active_market(target_preference="SPORTS", max_total_probes=6)
+        assert result is None
+        # Assert the total probes across all series never exceeded the configured quota of 6
+        assert mock_probe.call_count == 6
+
+
+def test_per_series_probe_limit_caps_probes_per_series():
+    """Verify that a single series with many candidates only probes up to DEFAULT_MAX_PROBES_PER_SERIES."""
+    def mock_fetch(limit=1000, series_ticker=None):
+        if series_ticker == "KXNFLGAME":
+            return [
+                {"ticker": f"KXNFLGAME-CAND-{i}", "status": "open", "volume_fp": f"{10000 - i * 100}.00"}
+                for i in range(10)
+            ]
+        return []
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
+        result = discover_active_market(target_preference="NFL", max_total_probes=10)
+        assert result is None
+        # KXNFLGAME had 10 candidates, but per-series limit is 2; subsequent series had 0
+        assert mock_probe.call_count == 2
+
+
+def test_discover_exact_match_with_preflight_check():
+    """Verify exact match screens orderbook quotes when preflight_check is True."""
+    mock_markets = [
+        {"ticker": "KXNFL-TARGET", "status": "open"},
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets):
+        # Case 1: Target ticker has quotes -> selected
+        with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+            res = discover_active_market(target_preference="KXNFL-TARGET", preflight_check=True)
+            assert res == "KXNFL-TARGET"
+
+        # Case 2: Target ticker has no quotes -> not returned (idles)
+        with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False):
+            res = discover_active_market(target_preference="KXNFL-TARGET", preflight_check=True)
+            assert res is None
+
+
+
