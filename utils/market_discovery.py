@@ -25,7 +25,9 @@ logger = logging.getLogger("MarketDiscovery")
 SPORTS_KEYWORDS = ("NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL")
 
 
-
+# ============================================================================
+# Sports Season Router & Seasonal Priority Matrix
+# ============================================================================
 
 class SportsSeasonRouter:
     """
@@ -109,6 +111,9 @@ class SportsSeasonRouter:
         return series_list
 
 
+# ============================================================================
+# Market Ingestion & REST API Client Logic
+# ============================================================================
 
 def fetch_eligible_markets(limit: int = 1000, series_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
     """
@@ -243,6 +248,10 @@ def _parse_float(val: Any) -> float:
         return 0.0
 
 
+# ============================================================================
+# Liquidity Scoring & Pre-Flight Orderbook Probing
+# ============================================================================
+
 def check_orderbook_has_quotes(ticker: str) -> bool:
     """
     Check if a market's live orderbook currently has active two-sided quotes (bids and asks).
@@ -368,6 +377,10 @@ def _select_best_market(
     selected = pool[0]
     return selected.get("ticker")
 
+
+# ============================================================================
+# Market Discovery Orchestration & Seasonal Cascade
+# ============================================================================
 
 def discover_active_market(
     target_preference: str = "",
@@ -503,6 +516,9 @@ def discover_active_market(
     return None
 
 
+# ============================================================================
+# Market Lifecycle & Status Verification (REST & Async)
+# ============================================================================
 
 def check_market_status(ticker: str) -> Optional[str]:
     """
