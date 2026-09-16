@@ -36,19 +36,24 @@ class SportsSeasonRouter:
     Excludes low-liquidity leagues and penalizes distant multi-year futures.
     See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority calendar.
     """
-    # Full Game Lines & Player Props suites per league
-    NFL_SERIES = (
-        "KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL", "KXNFLANYTD",
-        "KXNFLPASSYDS", "KXNFLRUSHYDS", "KXNFLRECYDS", "KXNFLPASSTD"
+    # Game Lines & Player Props suites per league
+    NFL_GAME_LINES = ("KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL")
+    NFL_PROPS = (
+        "KXNFLANYTD", "KXNFLPASSYDS", "KXNFLRUSHYDS", "KXNFLRECYDS", "KXNFLPASSTD"
     )
-    NBA_SERIES = (
-        "KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL", "KXNBAPTS",
-        "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBAPRA"
+    NFL_SERIES = NFL_GAME_LINES + NFL_PROPS
+
+    NBA_GAME_LINES = ("KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL")
+    NBA_PROPS = (
+        "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBAPRA"
     )
-    MLB_SERIES = (
-        "KXMLBGAME", "KXMLBRUNLINE", "KXMLBTOTAL", "KXMLBSTRIKEOUT",
-        "KXMLBHR", "KXMLBHITS", "KXMLBTOTALBASES"
+    NBA_SERIES = NBA_GAME_LINES + NBA_PROPS
+
+    MLB_GAME_LINES = ("KXMLBGAME", "KXMLBRUNLINE", "KXMLBTOTAL")
+    MLB_PROPS = (
+        "KXMLBSTRIKEOUT", "KXMLBHR", "KXMLBHITS", "KXMLBTOTALBASES"
     )
+    MLB_SERIES = MLB_GAME_LINES + MLB_PROPS
 
     ALL_IN_SEASON_PREFIXES = ("KXNFL", "KXNBA", "KXMLB")
 
@@ -56,7 +61,9 @@ class SportsSeasonRouter:
     def get_in_season_leagues(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
         """
         Return ordered list of active leagues ('NFL', 'NBA', 'MLB') based on calendar month.
-        - Sep - Feb: NFL primary, NBA secondary (Oct-Jun), MLB tertiary in postseason (Sep-early Nov)
+        - Sep: NFL primary, MLB secondary (postseason race; NBA excluded)
+        - Oct: Triple overlap: NFL primary, NBA secondary, MLB tertiary (World Series)
+        - Nov - Feb: NFL primary, NBA secondary (MLB season concluded)
         - Mar - Jun: NBA primary (playoffs), MLB secondary (opening/regular season)
         - Jul - Aug: MLB primary (summer lull: MLB only; NFL preseason excluded)
         """
@@ -64,35 +71,56 @@ class SportsSeasonRouter:
             dt = datetime.datetime.now(datetime.timezone.utc)
         month = dt.month
 
-        if month in (9, 10, 11, 12, 1, 2):
-            if month in (9, 10, 11):
-                return ["NFL", "NBA", "MLB"]
+        if month == 9:
+            return ["NFL", "MLB"]
+        elif month == 10:
+            return ["NFL", "NBA", "MLB"]
+        elif month in (11, 12, 1, 2):
             return ["NFL", "NBA"]
         elif month in (3, 4, 5, 6):
             return ["NBA", "MLB"]
         else:  # July, August (Summer lull: MLB only; NFL preseason excluded)
             return ["MLB"]
 
-
     @classmethod
     def get_primary_series_for_league(cls, league: str) -> str:
-        """Return the primary game lines series ticker for a given league."""
+        """Return the primary game lines series ticker for a given league, or empty string if unsupported."""
         mapping = {
             "NFL": "KXNFLGAME",
             "NBA": "KXNBAGAME",
             "MLB": "KXMLBGAME",
         }
-        return mapping.get(league.upper(), "KXNFLGAME")
+        return mapping.get(league.upper(), "")
+
+    @classmethod
+    def get_game_lines_for_league(cls, league: str) -> List[str]:
+        """Return game lines series tickers for a given league."""
+        mapping = {
+            "NFL": list(cls.NFL_GAME_LINES),
+            "NBA": list(cls.NBA_GAME_LINES),
+            "MLB": list(cls.MLB_GAME_LINES),
+        }
+        return mapping.get(league.upper(), [])
+
+    @classmethod
+    def get_props_for_league(cls, league: str) -> List[str]:
+        """Return player props series tickers for a given league."""
+        mapping = {
+            "NFL": list(cls.NFL_PROPS),
+            "NBA": list(cls.NBA_PROPS),
+            "MLB": list(cls.MLB_PROPS),
+        }
+        return mapping.get(league.upper(), [])
 
     @classmethod
     def get_series_for_league(cls, league: str) -> List[str]:
-        """Return prioritized list of series tickers for a specific league."""
+        """Return prioritized list of series tickers for a specific league, or empty list if unsupported."""
         mapping = {
             "NFL": list(cls.NFL_SERIES),
             "NBA": list(cls.NBA_SERIES),
             "MLB": list(cls.MLB_SERIES),
         }
-        return mapping.get(league.upper(), [cls.get_primary_series_for_league(league)])
+        return mapping.get(league.upper(), [])
 
     @classmethod
     def get_in_season_series(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
@@ -102,12 +130,7 @@ class SportsSeasonRouter:
         leagues = cls.get_in_season_leagues(dt)
         series_list: List[str] = []
         for league in leagues:
-            if league == "NFL":
-                series_list.extend(cls.NFL_SERIES)
-            elif league == "NBA":
-                series_list.extend(cls.NBA_SERIES)
-            elif league == "MLB":
-                series_list.extend(cls.MLB_SERIES)
+            series_list.extend(cls.get_series_for_league(league))
         return series_list
 
 
@@ -378,6 +401,18 @@ def _select_best_market(
     return selected.get("ticker")
 
 
+def _markets_for_series(markets: List[Dict[str, Any]], series_ticker: str) -> List[Dict[str, Any]]:
+    """Filter in-memory markets list for a specific series ticker."""
+    st_upper = series_ticker.upper()
+    prefix = f"{st_upper}-"
+    return [
+        m for m in markets
+        if m.get("series_ticker", "").upper() == st_upper
+        or str(m.get("ticker", "")).upper().startswith(prefix)
+        or str(m.get("ticker", "")).upper() == st_upper
+    ]
+
+
 # ============================================================================
 # Market Discovery Orchestration & Seasonal Cascade
 # ============================================================================
@@ -393,10 +428,12 @@ def discover_active_market(
     
     Priority:
     1. Exact match for target_preference (if active and not excluded)
-    2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month)
+    2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month):
+       - Tier 1: Game Lines across active in-season leagues (NFL -> NBA -> MLB)
+       - Tier 2: Player Props across active in-season leagues (NFL -> NBA -> MLB)
+       - Tier 3: General League tradeable sports markets
     3. Category/keyword match across ticker, title, and subtitle
-    4. Major Sports market (NFL, NBA, MLB)
-    5. Safely return None and idle if no active sports markets with two-sided quotes are found
+    4. Safely return None and idle if no active sports markets with two-sided quotes are found
     """
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
@@ -404,61 +441,7 @@ def discover_active_market(
         {"remaining": max_total_probes} if preflight_check else None
     )
 
-    # Check if target preference indicates sports or is default/unspecified
-    is_sports_pref = pref in (
-        "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
-        "SPORTS", "SPORT", "MAJOR SPORTS"
-    ) or not pref
-
-    # 1. SportsSeasonRouter Waterfall for in-season leagues and full product suites
-    if is_sports_pref:
-        if pref in ("NFL", "FOOTBALL"):
-            target_leagues = ["NFL"]
-        elif pref in ("NBA", "BASKETBALL"):
-            target_leagues = ["NBA"]
-        elif pref in ("MLB", "BASEBALL"):
-            target_leagues = ["MLB"]
-        else:
-            target_leagues = SportsSeasonRouter.get_in_season_leagues()
-
-        for league in target_leagues:
-            league_series_list = SportsSeasonRouter.get_series_for_league(league)
-            league_prefix = f"KX{league}"
-
-            for series_ticker in league_series_list:
-                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-                    logger.info("Orderbook probe quota exhausted across sports waterfall; stopping further probes.")
-                    return None
-
-                try:
-                    series_markets = fetch_eligible_markets(series_ticker=series_ticker)
-                except Exception:
-                    series_markets = []
-
-                tradeable_series = [
-                    m for m in series_markets
-                    if m.get("ticker") not in exclude
-                    and (
-                        str(m.get("ticker", "")).upper().startswith(league_prefix)
-                        or league in _text_for_market(m)
-                    )
-                ]
-                if tradeable_series:
-                    selected = _select_best_market(
-                        tradeable_series,
-                        preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
-                        budget_tracker=budget_tracker,
-                    )
-                    if selected:
-                        logger.info(f"SportsSeasonRouter selected active {league} ({series_ticker}) market: {selected}")
-                        return selected
-
-    # 2. General Market Query if sports waterfall did not yield a selection or specific non-sports pref
-    if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-        logger.info("Orderbook probe quota exhausted; idling until market activity resumes.")
-        return None
-
+    # 1. Fetch eligible markets ONCE and filter in memory to protect REST rate limits
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
 
@@ -466,8 +449,14 @@ def discover_active_market(
         logger.warning("No tradeable markets available matching criteria.")
         return None
 
-    # 1. Exact match by ticker
-    if pref and not pref.startswith(("SPORT", "MAJOR SPORT")):
+    # Check if target preference indicates sports or is default/unspecified
+    is_sports_pref = pref in (
+        "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
+        "SPORTS", "SPORT", "MAJOR SPORTS"
+    ) or not pref
+
+    # 2. Exact match by ticker (if explicitly targeted and not a category keyword)
+    if pref and not is_sports_pref:
         exact = [m for m in tradeable_markets if m.get("ticker", "").upper() == pref]
         if exact:
             exact_ticker = exact[0].get("ticker")
@@ -482,13 +471,96 @@ def discover_active_market(
                 logger.info(f"Targeting exact matched market: {pref}")
                 return exact_ticker
 
-    # 2. Category or keyword match (checking ticker, title, and subtitle)
-    if pref:
-        if pref in ("SPORTS", "SPORT", "MAJOR SPORTS"):
-            matched = [m for m in tradeable_markets if any(k in _text_for_market(m) for k in SPORTS_KEYWORDS)]
+    # 3. SportsSeasonRouter Waterfall for in-season leagues and full product suites
+    if is_sports_pref:
+        if pref in ("NFL", "FOOTBALL"):
+            target_leagues = ["NFL"]
+        elif pref in ("NBA", "BASKETBALL"):
+            target_leagues = ["NBA"]
+        elif pref in ("MLB", "BASEBALL"):
+            target_leagues = ["MLB"]
         else:
-            matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
+            target_leagues = SportsSeasonRouter.get_in_season_leagues()
 
+        # Tier 1: Prioritize Game Lines across active in-season leagues
+        for league in target_leagues:
+            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                logger.info("Orderbook probe quota exhausted during Tier 1 Game Lines; stopping further probes.")
+                return None
+
+            game_series = SportsSeasonRouter.get_game_lines_for_league(league)
+            for series_ticker in game_series:
+                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                    break
+
+                series_markets = _markets_for_series(tradeable_markets, series_ticker)
+                if series_markets:
+                    selected = _select_best_market(
+                        series_markets,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        budget_tracker=budget_tracker,
+                    )
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected active {league} Game Line ({series_ticker}): {selected}")
+                        return selected
+
+        # Tier 2: Cascade to Player Props across active in-season leagues
+        for league in target_leagues:
+            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                logger.info("Orderbook probe quota exhausted during Tier 2 Player Props; stopping further probes.")
+                return None
+
+            props_series = SportsSeasonRouter.get_props_for_league(league)
+            for series_ticker in props_series:
+                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                    break
+
+                series_markets = _markets_for_series(tradeable_markets, series_ticker)
+                if series_markets:
+                    selected = _select_best_market(
+                        series_markets,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        budget_tracker=budget_tracker,
+                    )
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected active {league} Player Prop ({series_ticker}): {selected}")
+                        return selected
+
+        # Tier 3: General League tradeable sports markets (excluding series already screened in Tiers 1 and 2)
+        all_configured_series = {
+            s.upper()
+            for l in target_leagues
+            for s in SportsSeasonRouter.get_series_for_league(l)
+        }
+        for league in target_leagues:
+            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                break
+            league_prefix = f"KX{league}"
+            league_markets = [
+                m for m in tradeable_markets
+                if (
+                    str(m.get("ticker", "")).upper().startswith(league_prefix)
+                    or league in _text_for_market(m)
+                )
+                and m.get("series_ticker", "").upper() not in all_configured_series
+                and not any(str(m.get("ticker", "")).upper().startswith(f"{s}-") for s in all_configured_series)
+            ]
+            if league_markets:
+                selected = _select_best_market(
+                    league_markets,
+                    preflight_check=preflight_check,
+                    max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                    budget_tracker=budget_tracker,
+                )
+                if selected:
+                    logger.info(f"SportsSeasonRouter selected active general {league} market: {selected}")
+                    return selected
+
+    # 4. Category or keyword match (for explicit non-sports target preference)
+    if pref and not is_sports_pref:
+        matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
         if matched:
             selected = _select_best_market(
                 matched,
@@ -498,19 +570,6 @@ def discover_active_market(
             if selected:
                 logger.info(f"Matched active market for '{target_preference}': {selected}")
                 return selected
-        logger.warning(f"No active markets found matching '{target_preference}'. Falling back to available sports...")
-
-    # 3. Default: In-season Major Sports
-    sports_markets = [m for m in tradeable_markets if any(k in _text_for_market(m) for k in SPORTS_KEYWORDS)]
-    if sports_markets:
-        selected = _select_best_market(
-            sports_markets,
-            preflight_check=preflight_check,
-            budget_tracker=budget_tracker,
-        )
-        if selected:
-            logger.info(f"Selected active in-season sports market: {selected}")
-            return selected
 
     logger.warning("No active in-season sports markets with two-sided quotes found. Idling until market activity resumes.")
     return None
