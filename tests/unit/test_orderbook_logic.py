@@ -80,3 +80,58 @@ def test_orderbook_delta_processing():
     # Level should be popped from dict
     assert 51 not in manager.books["MOCK_TICKER"]["yes"]
     assert manager.get_best_bid("MOCK_TICKER") == (50, 15)
+
+
+def test_orderbook_v2_snapshot_parsing():
+    """Verify that Kalshi v2 yes_dollars_fp and no_dollars_fp snapshots hydrate correctly."""
+    mock_client = MagicMock()
+    manager = OrderbookManager(mock_client)
+
+    snapshot_msg = {
+        "market_ticker": "KXNFLGAME-26SEP17DETBUF",
+        "yes_dollars_fp": [["0.3200", "150.00"], ["0.3100", "50.00"]],
+        "no_dollars_fp": [["0.6500", "80.00"]],
+    }
+
+    manager._handle_snapshot(snapshot_msg)
+
+    assert manager.books["KXNFLGAME-26SEP17DETBUF"]["yes"] == {32: 150, 31: 50}
+    assert manager.books["KXNFLGAME-26SEP17DETBUF"]["no"] == {65: 80}
+
+    # Best bid: 32c @ 150 contracts
+    assert manager.get_best_bid("KXNFLGAME-26SEP17DETBUF") == (32, 150)
+    # Highest NO bid is 65c -> Implied YES Ask = 100 - 65 = 35c @ 80 contracts
+    assert manager.get_best_ask("KXNFLGAME-26SEP17DETBUF") == (35, 80)
+
+
+def test_orderbook_v2_delta_processing():
+    """Verify that Kalshi v2 price_dollars and delta_fp delta updates modify and prune levels correctly."""
+    mock_client = MagicMock()
+    manager = OrderbookManager(mock_client)
+
+    # Initial state via v2 snapshot
+    manager._handle_snapshot({
+        "market_ticker": "KXNFLGAME-26SEP17DETBUF",
+        "yes_dollars_fp": [["0.4500", "100.00"]],
+        "no_dollars_fp": [["0.5200", "60.00"]],
+    })
+
+    # Delta adding 50 contracts to YES 0.4500
+    manager._handle_delta({
+        "market_ticker": "KXNFLGAME-26SEP17DETBUF",
+        "side": "yes",
+        "price_dollars": "0.4500",
+        "delta_fp": "50.00",
+    })
+    assert manager.books["KXNFLGAME-26SEP17DETBUF"]["yes"][45] == 150
+
+    # Delta pruning YES 0.4500 to 0
+    manager._handle_delta({
+        "market_ticker": "KXNFLGAME-26SEP17DETBUF",
+        "side": "yes",
+        "price_dollars": "0.4500",
+        "delta_fp": "-150.00",
+    })
+    assert 45 not in manager.books["KXNFLGAME-26SEP17DETBUF"]["yes"]
+    assert manager.get_best_bid("KXNFLGAME-26SEP17DETBUF") is None
+

@@ -14,6 +14,10 @@ from utils.market_discovery import (
     fetch_eligible_markets,
     check_market_status,
     is_market_active,
+    check_orderbook_has_quotes,
+    _liquidity_key,
+    _select_best_market,
+    SportsSeasonRouter,
 )
 
 
@@ -50,14 +54,14 @@ def test_discover_category_sports():
         assert result == "KXMLB-26SEP14-NYY"
 
 
-def test_discover_fallback_when_sports_unavailable():
-    """Verify fallback to macro index when requested category is absent."""
+def test_discover_idles_when_sports_unavailable():
+    """Verify market discovery idles (returns None) rather than falling back to macro indices when sports are absent."""
     with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
         mock_fetch.return_value = [
             {"ticker": "KXINX-26SEP14-5800", "status": "open"},
         ]
         result = discover_active_market(target_preference="NFL")
-        assert result == "KXINX-26SEP14-5800"
+        assert result is None
 
 
 def test_discover_exclude_tickers():
@@ -340,3 +344,153 @@ def test_check_market_status_unknown():
     with patch("requests.get", side_effect=RuntimeError("Network error")):
         assert check_market_status("TEST-1") is None
         assert is_market_active("TEST-1") is None
+
+
+def test_liquidity_key_v2_fields_and_horizon_weighting():
+    """Verify _liquidity_key parses v2 float string fields and applies horizon multiplier."""
+    # Near term (3 days) contract with v2 float string fields
+    near_term_market = {
+        "ticker": "KXNFLGAME-26SEP17DETBUF",
+        "volume_fp": "25000.50",
+        "open_interest_fp": "1200.00",
+        "yes_bid_dollars": "0.3200",
+        "yes_ask_dollars": "0.3500",
+        "close_time": "2026-09-18T20:00:00Z",  # near-term
+    }
+
+    # Distant futures prop (e.g. 2 years out) with high legacy volume
+    distant_market = {
+        "ticker": "KXNFLENDSTREAK-40NYJ-2627",
+        "volume": 50000,
+        "open_interest": 2000,
+        "yes_bid": 10,
+        "yes_ask": 25,
+        "close_time": "2029-01-01T00:00:00Z",  # distant horizon (>365d)
+    }
+
+    score_near = _liquidity_key(near_term_market)
+    score_distant = _liquidity_key(distant_market)
+
+    # Near term weekly game line with two-sided quotes & series bonus should heavily outscore distant prop
+    assert score_near > score_distant
+
+
+def test_check_orderbook_has_quotes_fp_and_legacy():
+    """Verify check_orderbook_has_quotes handles both orderbook_fp and legacy orderbook responses."""
+    # 1. Successful v2 orderbook_fp response
+    mock_fp_resp = MagicMock()
+    mock_fp_resp.status_code = 200
+    mock_fp_resp.json.return_value = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.3200", "150.00"]],
+            "no_dollars": [["0.6500", "80.00"]],
+        }
+    }
+    with patch("requests.get", return_value=mock_fp_resp):
+        assert check_orderbook_has_quotes("KXNFLGAME-26SEP17DETBUF") is True
+
+    # 2. Empty/one-sided orderbook_fp response
+    mock_empty_resp = MagicMock()
+    mock_empty_resp.status_code = 200
+    mock_empty_resp.json.return_value = {
+        "orderbook_fp": {
+            "yes_dollars": [],
+            "no_dollars": [],
+        }
+    }
+    with patch("requests.get", return_value=mock_empty_resp):
+        assert check_orderbook_has_quotes("KXNFLENDSTREAK-40NYJ-2627") is False
+
+    # 3. Network error returns False safely
+    with patch("requests.get", side_effect=requests.RequestException("Timeout")):
+        assert check_orderbook_has_quotes("KXNFLGAME-ERROR") is False
+
+
+def test_select_best_market_preflight_filters_empty_orderbook():
+    """Verify _select_best_market selects the first candidate that actually has resting quotes."""
+    candidates = [
+        {"ticker": "KXNFL-STARVED", "volume_fp": "99999.00", "yes_bid_dollars": "0.1000", "yes_ask_dollars": "0.2000"},
+        {"ticker": "KXNFL-ACTIVE", "volume_fp": "1000.00", "yes_bid_dollars": "0.4500", "yes_ask_dollars": "0.5000"},
+    ]
+
+    def mock_check(ticker):
+        return ticker == "KXNFL-ACTIVE"
+
+    with patch("utils.market_discovery.check_orderbook_has_quotes", side_effect=mock_check):
+        selected = _select_best_market(candidates, preflight_check=True)
+        assert selected == "KXNFL-ACTIVE"
+
+
+def test_discover_active_market_prioritizes_kxnflgame_series():
+    """Verify discover_active_market queries KXNFLGAME series when NFL or sports is targeted."""
+    with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch, \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        
+        mock_fetch.return_value = [
+            {"ticker": "KXNFLGAME-26SEP17DETBUF", "status": "open", "volume_fp": "50000.00"},
+        ]
+        result = discover_active_market(target_preference="NFL")
+        assert result == "KXNFLGAME-26SEP17DETBUF"
+        mock_fetch.assert_called_with(series_ticker="KXNFLGAME")
+
+
+def test_sports_season_router_calendar_priorities():
+    """Verify SportsSeasonRouter resolves seasonal league priorities correctly by month."""
+    import datetime
+
+    # Fall/Winter: October (month 10) -> NFL, NBA, MLB
+    dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct) == ["NFL", "NBA", "MLB"]
+
+    # Mid-Winter: January (month 1) -> NFL, NBA
+    dt_jan = datetime.datetime(2026, 1, 10, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_jan) == ["NFL", "NBA"]
+
+    # Spring: April (month 4) -> NBA, MLB
+    dt_apr = datetime.datetime(2026, 4, 15, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_apr) == ["NBA", "MLB"]
+
+    # Summer Lull: July (month 7) -> MLB
+    dt_jul = datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_jul) == ["MLB"]
+
+    # Late Summer: August (month 8) -> MLB only (NFL preseason excluded)
+    dt_aug = datetime.datetime(2026, 8, 15, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_aug) == ["MLB"]
+
+
+def test_sports_season_router_full_product_suites():
+    """Verify in-season series include Game Lines and Player Props for all major leagues."""
+    series = SportsSeasonRouter.get_in_season_series()
+    # NFL Game Lines & Player Props
+    assert "KXNFLGAME" in series
+    assert "KXNFLSPREAD" in series
+    assert "KXNFLTOTAL" in series
+    assert "KXNFLANYTD" in series
+    assert "KXNFLPASSYDS" in series
+    # NBA Lines & Props
+    assert "KXNBAGAME" in series
+    assert "KXNBAPTS" in series
+    # MLB Lines & Props
+    assert "KXMLBGAME" in series
+    assert "KXMLBSTRIKEOUT" in series
+
+
+def test_fetch_eligible_markets_excludes_nhl_tickers():
+    """Verify that markets with KXNHL tickers are filtered out."""
+    mock_markets = [
+        {"ticker": "KXNHL-26SEP14-TORBOS", "status": "open", "close_time": "2030-01-01T00:00:00Z"},
+        {"ticker": "KXNFL-26SEP14-KC", "status": "open", "close_time": "2030-01-01T00:00:00Z"},
+    ]
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": mock_markets}
+        mock_get.return_value = mock_resp
+
+        eligible = fetch_eligible_markets()
+        tickers = [m["ticker"] for m in eligible]
+        assert "KXNHL-26SEP14-TORBOS" not in tickers
+        assert "KXNFL-26SEP14-KC" in tickers
+
+

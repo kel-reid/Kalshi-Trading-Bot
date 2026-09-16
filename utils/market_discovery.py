@@ -2,10 +2,13 @@
 Market Discovery and Dynamic Market Rotation Utility
 
 This module provides automated discovery of active Kalshi prediction markets.
-It prioritizes high-interest categories (NFL, MLB, NBA, NHL, Soccer) with 
-graceful fallbacks to macro indices and liquid commodities. It also provides
-status verification to support seamless market rotation upon settlement or expiry.
+It focuses exclusively on in-season major sports categories (NFL, NBA, MLB) with
+pre-flight orderbook verification to support seamless market rotation upon settlement or expiry.
+Includes SportsSeasonRouter to dynamically prioritize in-season sports suites
+(game lines and player props) across NFL, NBA, and MLB.
+See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal matrix.
 """
+
 
 import logging
 import random
@@ -19,15 +22,90 @@ from config import BASE_URL
 
 logger = logging.getLogger("MarketDiscovery")
 
-SPORTS_KEYWORDS = ("NFL", "MLB", "NBA", "NHL", "EPL", "SOCCER", "NCAA", "UEFA", "FOOTBALL", "BASKETBALL", "BASEBALL", "HOCKEY")
-FALLBACK_KEYWORDS = ("INX", "SPX", "NASDAQ", "NDX", "BTC", "ETH")
+SPORTS_KEYWORDS = ("NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL")
 
 
-def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
+
+
+class SportsSeasonRouter:
+    """
+    Routes market discovery to the optimal in-season sports suites based on calendar dynamics.
+    Defines the full suites (game lines + player props) for NFL, NBA, and MLB.
+    Excludes low-liquidity leagues and penalizes distant multi-year futures.
+    See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority calendar.
+    """
+    # Full Game Lines & Player Props suites per league
+    NFL_SERIES = (
+        "KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL", "KXNFLANYTD",
+        "KXNFLPASSYDS", "KXNFLRUSHYDS", "KXNFLRECYDS", "KXNFLPASSTD"
+    )
+    NBA_SERIES = (
+        "KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL", "KXNBAPTS",
+        "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBAPRA"
+    )
+    MLB_SERIES = (
+        "KXMLBGAME", "KXMLBRUNLINE", "KXMLBTOTAL", "KXMLBSTRIKEOUT",
+        "KXMLBHR", "KXMLBHITS", "KXMLBTOTALBASES"
+    )
+
+    ALL_IN_SEASON_PREFIXES = ("KXNFL", "KXNBA", "KXMLB")
+
+    @classmethod
+    def get_in_season_leagues(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
+        """
+        Return ordered list of active leagues ('NFL', 'NBA', 'MLB') based on calendar month.
+        - Sep - Feb: NFL primary, NBA secondary (Oct-Jun), MLB tertiary in postseason (Sep-early Nov)
+        - Mar - Jun: NBA primary (playoffs), MLB secondary (opening/regular season)
+        - Jul - Aug: MLB primary (summer lull daily games; Aug adds NFL preseason)
+        """
+        if dt is None:
+            dt = datetime.datetime.now(datetime.timezone.utc)
+        month = dt.month
+
+        if month in (9, 10, 11, 12, 1, 2):
+            if month in (9, 10, 11):
+                return ["NFL", "NBA", "MLB"]
+            return ["NFL", "NBA"]
+        elif month in (3, 4, 5, 6):
+            return ["NBA", "MLB"]
+        else:  # July, August (Summer lull: MLB only; NFL preseason excluded)
+            return ["MLB"]
+
+
+    @classmethod
+    def get_primary_series_for_league(cls, league: str) -> str:
+        """Return the primary game lines series ticker for a given league."""
+        mapping = {
+            "NFL": "KXNFLGAME",
+            "NBA": "KXNBAGAME",
+            "MLB": "KXMLBGAME",
+        }
+        return mapping.get(league.upper(), "KXNFLGAME")
+
+    @classmethod
+    def get_in_season_series(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
+        """
+        Return prioritized list of series tickers to query across all active in-season leagues.
+        """
+        leagues = cls.get_in_season_leagues(dt)
+        series_list: List[str] = []
+        for league in leagues:
+            if league == "NFL":
+                series_list.extend(cls.NFL_SERIES)
+            elif league == "NBA":
+                series_list.extend(cls.NBA_SERIES)
+            elif league == "MLB":
+                series_list.extend(cls.MLB_SERIES)
+        return series_list
+
+
+
+def fetch_eligible_markets(limit: int = 1000, series_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Fetch active and tradeable markets from the Kalshi REST API.
     Queries /events with with_nested_markets=true to discover real underlying event markets
     without getting exhausted by synthetic multivariate shards (KXMVE), falling back to /markets if needed.
+    Supports optional series_ticker filter for high-turnover series (e.g. KXNFLGAME).
     Excludes inactive markets, expired contracts, and internal composite / shard combo markets.
     """
     try:
@@ -45,6 +123,8 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
                     "with_nested_markets": "true",
                     "limit": 200,
                 }
+                if series_ticker:
+                    params["series_ticker"] = series_ticker
                 if cursor:
                     params["cursor"] = cursor
 
@@ -91,9 +171,12 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
 
         # 2. Fallback: Query /markets if /events was unavailable or returned no markets
         if not markets:
+            fallback_params: Dict[str, Any] = {"limit": limit, "status": "open"}
+            if series_ticker:
+                fallback_params["series_ticker"] = series_ticker
             resp = requests.get(
                 f"{BASE_URL}/trade-api/v2/markets",
-                params={"limit": limit, "status": "open"},
+                params=fallback_params,
                 verify=certifi.where(),
                 timeout=10,
             )
@@ -108,7 +191,7 @@ def fetch_eligible_markets(limit: int = 1000) -> List[Dict[str, Any]]:
             # Both values must be permitted.
             if m.get("status") not in ("open", "active"):
                 continue
-            if str(m.get("ticker", "")).upper().startswith("KXMVE"):
+            if str(m.get("ticker", "")).upper().startswith(("KXMVE", "KXNHL")):
                 continue
             # Filter out markets whose close_time or expiration_time has passed
             close_time_str = m.get("close_time") or m.get("expiration_time")
@@ -140,47 +223,175 @@ def _text_for_market(m: Dict[str, Any]) -> str:
     return f"{m.get('ticker', '')} {m.get('title', '')} {m.get('subtitle', '')}".upper()
 
 
-def _select_best_market(candidates: List[Dict[str, Any]]) -> Optional[str]:
+def _parse_float(val: Any) -> float:
+    """Safely parse string or numeric value to float, defaulting to 0.0 on error or None."""
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def check_orderbook_has_quotes(ticker: str) -> bool:
+    """
+    Check if a market's live orderbook currently has active two-sided quotes (bids and asks).
+    Makes a lightweight REST check to avoid selecting dormant contracts.
+    """
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/trade-api/v2/markets/{ticker}/orderbook",
+            verify=certifi.where(),
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            ob = data.get("orderbook_fp") or data.get("orderbook") or {}
+            yes_bids = ob.get("yes_dollars") or ob.get("yes") or []
+            no_bids = ob.get("no_dollars") or ob.get("no") or []
+            return bool(len(yes_bids) > 0 and len(no_bids) > 0)
+    except Exception as e:
+        logger.debug(f"Pre-flight orderbook check for {ticker} failed: {e}")
+    return False
+
+
+def _liquidity_key(m: Dict[str, Any]) -> float:
+    """
+    Score market liquidity using Kalshi v2 floating-point schema and horizon weighting.
+    Supports volume_fp, open_interest_fp, yes_bid_dollars, yes_ask_dollars alongside legacy keys.
+    Heavily discounts distant multi-year props in favor of near-term weekly game lines.
+    """
+    vol = _parse_float(m.get("volume_fp")) or _parse_float(m.get("volume"))
+    oi = _parse_float(m.get("open_interest_fp")) or _parse_float(m.get("open_interest"))
+
+    bid = _parse_float(m.get("yes_bid_dollars") if m.get("yes_bid_dollars") is not None else m.get("yes_bid"))
+    ask = _parse_float(m.get("yes_ask_dollars") if m.get("yes_ask_dollars") is not None else m.get("yes_ask"))
+    has_quotes = 1.0 if (bid > 0 and ask > 0 and ask > bid) else 0.0
+
+    # Expiration Horizon Multiplier
+    # Prioritize near-term weekly contracts (<7 to 14 days) over distant future props (e.g. 2028-2030)
+    horizon_multiplier = 1.0
+    close_time_str = m.get("close_time") or m.get("expiration_time")
+    if close_time_str:
+        try:
+            close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
+            if days_to_close <= 7:
+                horizon_multiplier = 3.0
+            elif days_to_close <= 14:
+                horizon_multiplier = 2.0
+            elif days_to_close <= 30:
+                horizon_multiplier = 1.5
+            elif days_to_close <= 90:
+                horizon_multiplier = 1.0
+            elif days_to_close <= 365:
+                horizon_multiplier = 0.5
+            else:
+                horizon_multiplier = 0.05
+        except Exception:
+            pass
+
+    # In-season sports bonus: prioritize high-velocity weekly game lines and player props
+    series_bonus = 0.0
+    ticker = str(m.get("ticker", "")).upper()
+    if any(ticker.startswith(s) for s in SportsSeasonRouter.ALL_IN_SEASON_PREFIXES):
+        series_bonus = 500_000.0
+
+    base_score = (has_quotes * 1_000_000.0) + series_bonus + vol + (oi * 0.5)
+    return base_score * horizon_multiplier
+
+
+def _select_best_market(candidates: List[Dict[str, Any]], preflight_check: bool = True) -> Optional[str]:
     """
     Prioritize markets that have existing trading volume, open interest, or two-sided quotes.
-    Sorts by liquidity and picks from the most liquid candidates.
+    Sorts by liquidity and expiration horizon, screening top candidates for live two-sided orderbooks.
     """
     if not candidates:
         return None
 
-    def liquidity_key(m: Dict[str, Any]) -> int:
-        vol = m.get("volume") or 0
-        oi = m.get("open_interest") or 0
-        has_quotes = 1 if (m.get("yes_bid") is not None and m.get("yes_ask") is not None) else 0
-        return (has_quotes * 1_000_000) + vol + oi
-
     active_pool = [
         m for m in candidates
-        if (m.get("volume", 0) > 0 or m.get("open_interest", 0) > 0 or 
-            (m.get("yes_bid") is not None and m.get("yes_ask") is not None))
+        if (_parse_float(m.get("volume_fp")) > 0 or _parse_float(m.get("volume")) > 0 or
+            _parse_float(m.get("open_interest_fp")) > 0 or _parse_float(m.get("open_interest")) > 0 or
+            m.get("yes_bid") is not None or m.get("yes_bid_dollars") is not None)
     ]
     pool = active_pool if active_pool else candidates
-    pool.sort(key=liquidity_key, reverse=True)
-    top_candidates = pool[:min(3, len(pool))]
-    selected = random.choice(top_candidates)
+    pool.sort(key=_liquidity_key, reverse=True)
+
+    # Pre-flight orderbook check on top candidates (up to 10)
+    if preflight_check:
+        top_candidates = pool[:min(10, len(pool))]
+        for candidate in top_candidates:
+            cand_ticker = candidate.get("ticker")
+            if cand_ticker and check_orderbook_has_quotes(cand_ticker):
+                logger.info(f"Pre-flight orderbook check confirmed two-sided quotes for: {cand_ticker}")
+                return cand_ticker
+
+    # Fallback to the top-ranked candidate if pre-flight check found no active books or was skipped
+    selected = pool[0]
     return selected.get("ticker")
 
 
 def discover_active_market(
     target_preference: str = "",
     exclude_tickers: Optional[List[str]] = None,
+    preflight_check: bool = True,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
     
     Priority:
     1. Exact match for target_preference (if active and not excluded)
-    2. Category/keyword match across ticker, title, and subtitle
-    3. Major Sports market (NFL, MLB, NBA, NHL, Soccer, etc.)
-    4. Liquid macro/crypto fallback markets (INX, SPX, BTC, ETH)
-    5. Any active tradeable market with best liquidity
+    2. In-Season Sports Router (waterfall across NFL, NBA, MLB based on calendar month)
+    3. Category/keyword match across ticker, title, and subtitle
+    4. Major Sports market (NFL, NBA, MLB)
+    5. Safely return None and idle if no active sports markets with two-sided quotes are found
     """
     exclude = set(exclude_tickers or [])
+    pref = target_preference.strip().upper() if target_preference else ""
+
+    # Check if target preference indicates sports or is default/unspecified
+    is_sports_pref = pref in (
+        "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
+        "SPORTS", "SPORT", "MAJOR SPORTS"
+    ) or not pref
+
+    # 1. SportsSeasonRouter Waterfall for in-season leagues
+    if is_sports_pref:
+        if pref in ("NFL", "FOOTBALL"):
+            target_leagues = ["NFL"]
+        elif pref in ("NBA", "BASKETBALL"):
+            target_leagues = ["NBA"]
+        elif pref in ("MLB", "BASEBALL"):
+            target_leagues = ["MLB"]
+        else:
+            target_leagues = SportsSeasonRouter.get_in_season_leagues()
+
+        for league in target_leagues:
+            primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
+            try:
+                league_markets = fetch_eligible_markets(series_ticker=primary_series)
+            except Exception:
+                league_markets = []
+
+            league_prefix = f"KX{league}"
+            tradeable_league = [
+                m for m in league_markets
+                if m.get("ticker") not in exclude
+                and (
+                    str(m.get("ticker", "")).upper().startswith(league_prefix)
+                    or league in _text_for_market(m)
+                )
+            ]
+            # If specific sports keyword was matched
+            if tradeable_league:
+                selected = _select_best_market(tradeable_league, preflight_check=preflight_check)
+                if selected:
+                    logger.info(f"SportsSeasonRouter selected active {league} market: {selected}")
+                    return selected
+
+    # 2. General Market Query if sports waterfall did not yield a selection or specific non-sports pref
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
 
@@ -188,10 +399,9 @@ def discover_active_market(
         logger.warning("No tradeable markets available matching criteria.")
         return None
 
-    pref = target_preference.strip().upper() if target_preference else ""
 
     # 1. Exact match by ticker
-    if pref:
+    if pref and not pref.startswith(("SPORT", "MAJOR SPORT")):
         exact = [m for m in tradeable_markets if m.get("ticker", "").upper() == pref]
         if exact:
             logger.info(f"Targeting exact matched market: {pref}")
@@ -205,34 +415,23 @@ def discover_active_market(
             matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
 
         if matched:
-            selected = _select_best_market(matched)
+            selected = _select_best_market(matched, preflight_check=preflight_check)
             if selected:
                 logger.info(f"Matched active market for '{target_preference}': {selected}")
                 return selected
         logger.warning(f"No active markets found matching '{target_preference}'. Falling back to available sports...")
 
-    # 3. Default: Major Sports
+    # 3. Default: In-season Major Sports
     sports_markets = [m for m in tradeable_markets if any(k in _text_for_market(m) for k in SPORTS_KEYWORDS)]
     if sports_markets:
-        selected = _select_best_market(sports_markets)
+        selected = _select_best_market(sports_markets, preflight_check=preflight_check)
         if selected:
-            logger.info(f"Selected active Major Sports market: {selected}")
+            logger.info(f"Selected active in-season sports market: {selected}")
             return selected
 
-    # 4. Fallback to liquid macro / crypto
-    liquid_markets = [m for m in tradeable_markets if any(k in _text_for_market(m) for k in FALLBACK_KEYWORDS)]
-    if liquid_markets:
-        selected = _select_best_market(liquid_markets)
-        if selected:
-            logger.info(f"Selected liquid fallback market: {selected}")
-            return selected
-
-    # 5. Any active tradeable market (selecting best liquidity first)
-    selected = _select_best_market(tradeable_markets)
-    if selected:
-        logger.info(f"Selected alternative tradeable market: {selected}")
-        return selected
+    logger.warning("No active in-season sports markets with two-sided quotes found. Idling until market activity resumes.")
     return None
+
 
 
 def check_market_status(ticker: str) -> Optional[str]:

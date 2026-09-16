@@ -203,7 +203,7 @@ class AvellanedaStoikovBot:
                 if starved_duration >= self.starvation_timeout and not self._starvation_alert_sent:
                     self._starvation_alert_sent = True
                     msg = (
-                        f"⚠️ [STARVATION ALERT] Orderbook for {self.ticker} has had no two-sided quotes "
+                        f"[STARVATION ALERT] Orderbook for {self.ticker} has had no two-sided quotes "
                         f"for {int(starved_duration / 60)} minutes. Quoting halted."
                     )
                     logger.error(msg)

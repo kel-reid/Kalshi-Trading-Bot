@@ -2,7 +2,7 @@
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 
-[![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
+[![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
 
 This project is a fully-functional algorithmic market-making trading bot built for the Kalshi prediction market platform. Its primary goal is to provide dual-sided liquidity (bids and asks) on Kalshi markets to capture the bid-ask spread while actively managing inventory risk.
 
@@ -118,6 +118,10 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 | `DB_NAME` | `string` | `kalshi_bot` | Name of the database schema. |
 | `DB_USER` | `string` | `postgres` | Username for database authentication. |
 | `DB_PASSWORD` | `string` | `postgres` | Password for database authentication. |
+
+### Dynamic Market Discovery & Seasonal Sports Routing
+The bot includes an automated market discovery engine that selects and rotates between active contracts based on real-time orderbook depth and sports seasonality. For full architecture, product suites (Game Lines & Player Props), and month-by-month priority matrices across NFL, NBA, and MLB, see the [SportsSeasonRouter Specification](docs/SPORTS_SEASON_ROUTER.md).
+
 
 
 ## Secrets Management with Doppler

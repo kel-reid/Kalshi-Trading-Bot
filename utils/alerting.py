@@ -22,12 +22,12 @@ async def send_alert(message: str):
     """
     if not ALERT_WEBHOOK_URL:
         # Fallback if no webhook is configured
-        logger.warning(f"🚨 ALERT (Local Only - No Webhook Configured): {message}")
+        logger.warning(f"ALERT (Local Only - No Webhook Configured): {message}")
         return
 
     # Slack expects a JSON payload with a "text" field
     payload = {
-        "text": f"🚨 *Kalshi Bot Alert* \n{message}"
+        "text": f"*Kalshi Bot Alert* \n{message}"
     }
 
     try:
