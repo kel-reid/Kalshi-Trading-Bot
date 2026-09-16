@@ -312,10 +312,20 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     return base_score * horizon_multiplier
 
 
-def _select_best_market(candidates: List[Dict[str, Any]], preflight_check: bool = True) -> Optional[str]:
+DEFAULT_MAX_TOTAL_PROBES: int = 10
+DEFAULT_MAX_PROBES_PER_SERIES: int = 2
+
+
+def _select_best_market(
+    candidates: List[Dict[str, Any]],
+    preflight_check: bool = True,
+    max_probes: int = 10,
+    budget_tracker: Optional[Dict[str, int]] = None,
+) -> Optional[str]:
     """
     Prioritize markets that have existing trading volume, open interest, or two-sided quotes.
     Sorts by liquidity and expiration horizon, screening top candidates for live two-sided orderbooks.
+    Respects max_probes and an optional discovery-wide budget_tracker to avoid REST rate limits.
     """
     if not candidates:
         return None
@@ -329,12 +339,26 @@ def _select_best_market(candidates: List[Dict[str, Any]], preflight_check: bool 
     pool = active_pool if active_pool else candidates
     pool.sort(key=_liquidity_key, reverse=True)
 
-    # Pre-flight orderbook check on top candidates (up to 10)
+    # Pre-flight orderbook check on top candidates
     if preflight_check:
-        top_candidates = pool[:min(10, len(pool))]
+        if budget_tracker is not None and budget_tracker.get("remaining", 0) <= 0:
+            logger.info("Pre-flight probe quota exhausted; skipping further probes.")
+            return None
+
+        probe_limit = min(max_probes, len(pool))
+        if budget_tracker is not None:
+            probe_limit = min(probe_limit, budget_tracker["remaining"])
+
+        top_candidates = pool[:probe_limit]
         for candidate in top_candidates:
             cand_ticker = candidate.get("ticker")
-            if cand_ticker and check_orderbook_has_quotes(cand_ticker):
+            if not cand_ticker:
+                continue
+
+            if budget_tracker is not None:
+                budget_tracker["remaining"] -= 1
+
+            if check_orderbook_has_quotes(cand_ticker):
                 logger.info(f"Pre-flight orderbook check confirmed two-sided quotes for: {cand_ticker}")
                 return cand_ticker
         logger.info("Pre-flight orderbook check found no candidates with active two-sided quotes.")
@@ -349,6 +373,7 @@ def discover_active_market(
     target_preference: str = "",
     exclude_tickers: Optional[List[str]] = None,
     preflight_check: bool = True,
+    max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
@@ -362,6 +387,9 @@ def discover_active_market(
     """
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
+    budget_tracker: Optional[Dict[str, int]] = (
+        {"remaining": max_total_probes} if preflight_check else None
+    )
 
     # Check if target preference indicates sports or is default/unspecified
     is_sports_pref = pref in (
@@ -385,6 +413,10 @@ def discover_active_market(
             league_prefix = f"KX{league}"
 
             for series_ticker in league_series_list:
+                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                    logger.info("Orderbook probe quota exhausted across sports waterfall; stopping further probes.")
+                    return None
+
                 try:
                     series_markets = fetch_eligible_markets(series_ticker=series_ticker)
                 except Exception:
@@ -399,12 +431,21 @@ def discover_active_market(
                     )
                 ]
                 if tradeable_series:
-                    selected = _select_best_market(tradeable_series, preflight_check=preflight_check)
+                    selected = _select_best_market(
+                        tradeable_series,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        budget_tracker=budget_tracker,
+                    )
                     if selected:
                         logger.info(f"SportsSeasonRouter selected active {league} ({series_ticker}) market: {selected}")
                         return selected
 
     # 2. General Market Query if sports waterfall did not yield a selection or specific non-sports pref
+    if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+        logger.info("Orderbook probe quota exhausted; idling until market activity resumes.")
+        return None
+
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
 
@@ -412,13 +453,21 @@ def discover_active_market(
         logger.warning("No tradeable markets available matching criteria.")
         return None
 
-
     # 1. Exact match by ticker
     if pref and not pref.startswith(("SPORT", "MAJOR SPORT")):
         exact = [m for m in tradeable_markets if m.get("ticker", "").upper() == pref]
         if exact:
-            logger.info(f"Targeting exact matched market: {pref}")
-            return exact[0].get("ticker")
+            exact_ticker = exact[0].get("ticker")
+            if preflight_check:
+                if budget_tracker is not None:
+                    budget_tracker["remaining"] -= 1
+                if exact_ticker and check_orderbook_has_quotes(exact_ticker):
+                    logger.info(f"Targeting exact matched market with active quotes: {pref}")
+                    return exact_ticker
+                logger.info(f"Exact matched market {pref} has no active quotes.")
+            else:
+                logger.info(f"Targeting exact matched market: {pref}")
+                return exact_ticker
 
     # 2. Category or keyword match (checking ticker, title, and subtitle)
     if pref:
@@ -428,7 +477,11 @@ def discover_active_market(
             matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
 
         if matched:
-            selected = _select_best_market(matched, preflight_check=preflight_check)
+            selected = _select_best_market(
+                matched,
+                preflight_check=preflight_check,
+                budget_tracker=budget_tracker,
+            )
             if selected:
                 logger.info(f"Matched active market for '{target_preference}': {selected}")
                 return selected
@@ -437,7 +490,11 @@ def discover_active_market(
     # 3. Default: In-season Major Sports
     sports_markets = [m for m in tradeable_markets if any(k in _text_for_market(m) for k in SPORTS_KEYWORDS)]
     if sports_markets:
-        selected = _select_best_market(sports_markets, preflight_check=preflight_check)
+        selected = _select_best_market(
+            sports_markets,
+            preflight_check=preflight_check,
+            budget_tracker=budget_tracker,
+        )
         if selected:
             logger.info(f"Selected active in-season sports market: {selected}")
             return selected
@@ -495,9 +552,17 @@ def is_market_active(ticker: str) -> Optional[bool]:
 async def discover_active_market_async(
     target_preference: str = "",
     exclude_tickers: Optional[List[str]] = None,
+    preflight_check: bool = True,
+    max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
 ) -> Optional[str]:
     """Non-blocking async wrapper for discover_active_market."""
-    return await asyncio.to_thread(discover_active_market, target_preference, exclude_tickers)
+    return await asyncio.to_thread(
+        discover_active_market,
+        target_preference,
+        exclude_tickers,
+        preflight_check,
+        max_total_probes,
+    )
 
 
 async def is_market_active_async(ticker: str) -> Optional[bool]:
