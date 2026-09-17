@@ -75,12 +75,20 @@ sudo apt-get install grafana-alloy
 
 ### Step 2: Configure Alloy Credentials
 1. Copy `alloy.config/config.alloy` to `/etc/alloy/config.alloy`.
-2. Configure Grafana Cloud credentials as environment variables (or directly within `/etc/alloy/config.alloy`):
-   ```bash
-   export GRAFANA_CLOUD_PROMETHEUS_URL="https://prometheus-us-central1.grafana.net/api/prom/push"
-   export GRAFANA_CLOUD_USERNAME="<your_username_id>"
-   export GRAFANA_CLOUD_API_KEY="<your_api_key>"
-   ```
+2. Configure the `GRAFANA_API_KEY` for the Alloy systemd service:
+   - **Option A (Systemd Environment File - Recommended):**
+     Add your Grafana Cloud API key to `/etc/default/alloy` (Debian/Ubuntu) or `/etc/sysconfig/alloy` (RHEL/CentOS):
+     ```bash
+     echo 'GRAFANA_API_KEY="<your_grafana_cloud_api_key>"' | sudo tee -a /etc/default/alloy
+     ```
+   - **Option B (Direct in `/etc/alloy/config.alloy`):**
+     Replace `sys.env("GRAFANA_API_KEY")` in `/etc/alloy/config.alloy` with your API token directly:
+     ```alloy
+     basic_auth {
+       username = "3049654"
+       password = "<your_grafana_cloud_api_key>"
+     }
+     ```
 3. Restart and enable the Alloy service:
    ```bash
    sudo systemctl restart alloy

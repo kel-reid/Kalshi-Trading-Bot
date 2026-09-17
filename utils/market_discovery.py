@@ -461,12 +461,16 @@ def discover_active_market(
         if exact:
             exact_ticker = exact[0].get("ticker")
             if preflight_check:
+                if budget_tracker is not None and budget_tracker.get("remaining", 0) <= 0:
+                    logger.info(f"Orderbook probe quota exhausted; cannot screen exact matched market: {pref}")
+                    return None
                 if budget_tracker is not None:
                     budget_tracker["remaining"] -= 1
                 if exact_ticker and check_orderbook_has_quotes(exact_ticker):
                     logger.info(f"Targeting exact matched market with active quotes: {pref}")
                     return exact_ticker
                 logger.info(f"Exact matched market {pref} has no active quotes.")
+                return None
             else:
                 logger.info(f"Targeting exact matched market: {pref}")
                 return exact_ticker

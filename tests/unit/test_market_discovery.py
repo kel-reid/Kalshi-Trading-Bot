@@ -602,5 +602,11 @@ def test_discover_exact_match_with_preflight_check():
             res = discover_active_market(target_preference="KXNFL-TARGET", preflight_check=True)
             assert res is None
 
+        # Case 3: Target ticker has quotes but probe budget is 0 -> does not probe, returns None
+        with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True) as mock_quotes:
+            res = discover_active_market(target_preference="KXNFL-TARGET", preflight_check=True, max_total_probes=0)
+            assert res is None
+            mock_quotes.assert_not_called()
+
 
 
