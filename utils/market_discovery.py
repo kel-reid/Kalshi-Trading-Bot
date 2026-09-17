@@ -289,8 +289,12 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
         if resp.status_code == 200:
             data = resp.json()
             ob = data.get("orderbook_fp") or data.get("orderbook") or {}
-            yes_bids = ob.get("yes_dollars") or ob.get("yes") or []
-            no_bids = ob.get("no_dollars") or ob.get("no") or []
+            yes_bids = (
+                ob.get("yes_dollars_fp") or ob.get("yes_dollars") or ob.get("yes") or []
+            )
+            no_bids = (
+                ob.get("no_dollars_fp") or ob.get("no_dollars") or ob.get("no") or []
+            )
             return bool(len(yes_bids) > 0 and len(no_bids) > 0)
     except Exception as e:
         logger.debug(f"Pre-flight orderbook check for {ticker} failed: {e}")

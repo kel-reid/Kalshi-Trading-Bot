@@ -158,3 +158,77 @@ def test_normalize_price_to_cents_formats():
     assert _normalize_price_to_cents(None) is None
     assert _normalize_price_to_cents("invalid") is None
 
+    # $1.00 boundary case
+    assert _normalize_price_to_cents("1.0000", is_dollars=True) == 100.0
+    assert _normalize_price_to_cents("1.0000") == 100.0
+
+
+def test_subcent_price_levels_coexist_without_collision():
+    """Verify that distinct sub-cent levels (e.g. 0.3210 and 0.3240) coexist without overwriting."""
+    mock_client = MagicMock()
+    manager = OrderbookManager(mock_client)
+
+    manager._handle_snapshot({
+        "market_ticker": "KXTEST-SUBCENT",
+        "yes_dollars_fp": [["0.3210", "100.00"], ["0.3240", "150.00"]],
+        "no_dollars_fp": [["0.6760", "200.00"]],
+    })
+
+    # Both sub-cent levels must coexist distinctly in the book
+    assert 32.1 in manager.books["KXTEST-SUBCENT"]["yes"]
+    assert 32.4 in manager.books["KXTEST-SUBCENT"]["yes"]
+    assert manager.books["KXTEST-SUBCENT"]["yes"][32.1] == 100.0
+    assert manager.books["KXTEST-SUBCENT"]["yes"][32.4] == 150.0
+
+    # Best bid is highest price: 32.4c @ 150.0
+    assert manager.get_best_bid("KXTEST-SUBCENT") == (32.4, 150.0)
+    # Best ask: 100.0 - 67.6 = 32.4c @ 200.0
+    assert manager.get_best_ask("KXTEST-SUBCENT") == (32.4, 200.0)
+
+    # Delta modifying only 0.3240
+    manager._handle_delta({
+        "market_ticker": "KXTEST-SUBCENT",
+        "side": "yes",
+        "price_dollars": "0.3240",
+        "delta_fp": "-50.00",
+    })
+    assert manager.books["KXTEST-SUBCENT"]["yes"][32.4] == 100.0
+    assert manager.books["KXTEST-SUBCENT"]["yes"][32.1] == 100.0
+
+
+def test_fractional_quantities_and_delta_reversibility():
+    """Verify that fractional contract sizes (e.g. 0.50) are retained and reversible."""
+    mock_client = MagicMock()
+    manager = OrderbookManager(mock_client)
+
+    # Fractional resting liquidity
+    manager._handle_snapshot({
+        "market_ticker": "KXTEST-FRACT",
+        "yes_dollars_fp": [["0.5000", "0.50"]],
+        "no_dollars_fp": [],
+    })
+
+    # 0.50 contracts must not be rounded to 0
+    assert manager.books["KXTEST-FRACT"]["yes"][50.0] == 0.50
+    assert manager.get_best_bid("KXTEST-FRACT") == (50.0, 0.50)
+
+    # Adding +0.50 -> 1.00
+    manager._handle_delta({
+        "market_ticker": "KXTEST-FRACT",
+        "side": "yes",
+        "price_dollars": "0.5000",
+        "delta_fp": "0.50",
+    })
+    assert manager.books["KXTEST-FRACT"]["yes"][50.0] == 1.00
+
+    # Subtracting -1.00 -> completely pruned to 0
+    manager._handle_delta({
+        "market_ticker": "KXTEST-FRACT",
+        "side": "yes",
+        "price_dollars": "0.5000",
+        "delta_fp": "-1.00",
+    })
+    assert 50.0 not in manager.books["KXTEST-FRACT"]["yes"]
+    assert manager.get_best_bid("KXTEST-FRACT") is None
+
+
