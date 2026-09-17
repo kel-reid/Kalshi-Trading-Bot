@@ -100,9 +100,10 @@ Create a dashboard in Grafana Cloud with the following Prometheus queries:
 
 | Panel Title | Metric Query | Visualization | Description |
 | :--- | :--- | :--- | :--- |
-| **Total Orders Placed** | `sum(orders_placed_total)` | Stat | Total limit orders submitted and confirmed. |
-| **Total Buy Contracts** | `sum(orders_placed_total{action="buy"})` | Stat | Total buy orders executed. |
-| **Total Sell Contracts** | `sum(orders_placed_total{action="sell"})` | Stat | Total sell orders executed. |
-| **Profit & Loss ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot balance in USD. |
+| **Total Orders Placed** | `sum(orders_placed_total)` | Stat | Total limit orders submitted and accepted by the exchange (increments once per accepted order regardless of contract count or fill status). |
+| **Buy Orders Placed** | `sum(orders_placed_total{action="buy"})` | Stat | Total buy orders submitted and accepted (tracks order submissions, not executed contract count or fills). |
+| **Sell Orders Placed** | `sum(orders_placed_total{action="sell"})` | Stat | Total sell orders submitted and accepted (tracks order submissions, not executed contract count or fills). |
+| **Account Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from get_balance() (tracks account cash balance, not net trading P&L). |
 | **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market. |
 | **Kalshi API Latency** | `rate(kalshi_api_latency_seconds_sum[1m]) / rate(kalshi_api_latency_seconds_count[1m]) * 1000` | Time Series | Rolling REST execution roundtrip latency (ms). |
+

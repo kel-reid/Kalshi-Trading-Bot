@@ -473,19 +473,42 @@ def test_sports_season_router_full_product_suites():
     assert "KXNFLGAME" in series
     assert "KXNFLSPREAD" in series
     assert "KXNFLTOTAL" in series
-    assert "KXNFLANYTD" in series
+    assert "KXNFLTD" in series
     assert "KXNFLPASSYDS" in series
+    assert "KXNFLRSHYDS" in series
+    assert "KXNFLRECYDS" in series
+    assert "KXNFLPASSTDS" in series
     # NBA Lines & Props
     assert "KXNBAGAME" in series
+    assert "KXNBASPREAD" in series
+    assert "KXNBATOTAL" in series
     assert "KXNBAPTS" in series
+    assert "KXNBAREB" in series
+    assert "KXNBAAST" in series
+    assert "KXNBA3PT" in series
+    assert "KXNBAPRA" in series
     # MLB Lines & Props
     assert "KXMLBGAME" in series
-    assert "KXMLBSTRIKEOUT" in series
+    assert "KXMLBSPREAD" in series
+    assert "KXMLBTOTAL" in series
+    assert "KXMLBKS" in series
+    assert "KXMLBHR" in series
+    assert "KXMLBHIT" in series
+    assert "KXMLBTB" in series
 
     # Test league-specific series getter
     nfl_suite = SportsSeasonRouter.get_series_for_league("NFL")
     assert "KXNFLGAME" in nfl_suite
-    assert "KXNFLPASSYDS" in nfl_suite
+    assert "KXNFLTD" in nfl_suite
+    assert "KXNFLRSHYDS" in nfl_suite
+    assert "KXNFLPASSTDS" in nfl_suite
+
+    mlb_suite = SportsSeasonRouter.get_series_for_league("MLB")
+    assert "KXMLBGAME" in mlb_suite
+    assert "KXMLBSPREAD" in mlb_suite
+    assert "KXMLBKS" in mlb_suite
+    assert "KXMLBHIT" in mlb_suite
+    assert "KXMLBTB" in mlb_suite
 
 
 def test_select_best_market_returns_none_when_preflight_fails_all_candidates():
