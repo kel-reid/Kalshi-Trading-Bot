@@ -155,3 +155,20 @@ class TestV2PayloadSchema:
         om, captured = order_capture
         await om.place_order(ticker="T", side="no", action="sell", count=1, price=50)
         assert captured["payload"]["side"] == "bid"
+
+    @pytest.mark.asyncio
+    async def test_price_field_preserves_subcent_precision(self, order_capture):
+        """Sub-cent cent prices (e.g. 32.4c, 32.12c) must format with up to 4 decimal places in dollars."""
+        om, captured = order_capture
+        # 32.4 cents = $0.324
+        await om.place_order(ticker="T", side="yes", action="buy", count=1, price=32.4)
+        assert captured["payload"]["price"] == "0.324"
+
+        # 32.12 cents = $0.3212
+        await om.place_order(ticker="T", side="yes", action="sell", count=1, price=32.12)
+        assert captured["payload"]["price"] == "0.3212"
+
+        # Whole cent 50 cents = $0.50
+        await om.place_order(ticker="T", side="yes", action="buy", count=1, price=50)
+        assert captured["payload"]["price"] == "0.50"
+
