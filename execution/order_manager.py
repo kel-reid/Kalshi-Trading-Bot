@@ -18,7 +18,7 @@ import certifi
 import psycopg2
 from psycopg2 import pool
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from utils.rate_limiter import RateLimiter
 from utils.metrics import measure_latency, ORDERS_PLACED_TOTAL, ORDER_ERRORS_TOTAL
 
@@ -169,13 +169,13 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Failed to write order status to database (client_id: {client_order_id}, status: {status}): {e}")
 
-    async def place_order(self, ticker: str, side: str, action: str, count: int, price: int) -> Optional[str]:
+    async def place_order(self, ticker: str, side: str, action: str, count: int, price: Union[int, float]) -> Optional[str]:
         """
         Place a new order.
         side: "yes" or "no"
         action: "buy" or "sell"
         count: number of contracts
-        price: limit price in cents (1-99)
+        price: limit price in cents (1-99, or sub-cent float like 32.4)
         Returns the client_order_id if successful, None otherwise.
         """
         client_order_id = str(uuid.uuid4())
@@ -195,13 +195,19 @@ class OrderManager:
         else:
             v2_side = "ask" if action == "buy" else "bid"
 
+        price_dollars = round(float(price) / 100.0, 4)
+        if round(price_dollars, 2) == price_dollars:
+            price_str = f"{price_dollars:.2f}"
+        else:
+            price_str = f"{price_dollars:.4f}".rstrip("0")
+
         payload = {
             "side": v2_side,
             "count": str(count),
             "type": "limit",
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "price": f"{price / 100:.2f}",
+            "price": price_str,
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross"
         }

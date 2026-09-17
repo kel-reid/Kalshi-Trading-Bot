@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 import math
-from typing import Optional
+from typing import Optional, Union
 
 from data.websocket_client import KalshiWebsocketClient
 from data.orderbook_manager import OrderbookManager
@@ -69,8 +69,8 @@ class AvellanedaStoikovBot:
         self.current_bid_id: Optional[str] = None
         self.current_ask_id: Optional[str] = None
         
-        self.current_bid_price: Optional[int] = None
-        self.current_ask_price: Optional[int] = None
+        self.current_bid_price: Optional[Union[int, float]] = None
+        self.current_ask_price: Optional[Union[int, float]] = None
         self._last_empty_ob_log: float = 0.0
 
         # Starvation tracking
@@ -303,7 +303,7 @@ class AvellanedaStoikovBot:
         # 5. Execute Output
         await self._update_quotes(optimal_bid, optimal_ask)
 
-    async def _update_quotes(self, new_bid: Optional[int], new_ask: Optional[int]):
+    async def _update_quotes(self, new_bid: Optional[Union[int, float]], new_ask: Optional[Union[int, float]]):
         """Places or replaces quotes if the optimal prices have shifted."""
         cancel_tasks = []
         cancel_bid = False
