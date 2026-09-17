@@ -17,7 +17,7 @@ def _normalize_price_to_cents(price: Any) -> Optional[int]:
     try:
         p_str = str(price).strip()
         p_val = float(p_str)
-        if "." in p_str or p_val < 1.0:
+        if p_val < 1.0:
             return round(p_val * 100)
         return int(round(p_val))
     except (ValueError, TypeError):

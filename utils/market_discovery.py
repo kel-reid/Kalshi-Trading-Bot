@@ -429,7 +429,8 @@ def discover_active_market(
     Priority:
     1. Exact match for target_preference (if active and not excluded)
     2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month):
-       - Tier 1: Game Lines across active in-season leagues (NFL -> NBA -> MLB)
+       - Tier 1A: Primary Moneylines across active in-season leagues (NFL -> NBA -> MLB)
+       - Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
        - Tier 2: Player Props across active in-season leagues (NFL -> NBA -> MLB)
        - Tier 3: General League tradeable sports markets
     3. Category/keyword match across ticker, title, and subtitle
@@ -486,14 +487,39 @@ def discover_active_market(
         else:
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
 
-        # Tier 1: Prioritize Game Lines across active in-season leagues
+        # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
+        # Probing flagship moneyline series (KXNFLGAME, KXNBAGAME, KXMLBGAME) across all leagues first
+        # ensures no in-season sport (e.g. October MLB World Series) is starved by another sport's secondary lines.
         for league in target_leagues:
             if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-                logger.info("Orderbook probe quota exhausted during Tier 1 Game Lines; stopping further probes.")
+                logger.info("Orderbook probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
+                return None
+
+            primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
+            if primary_series:
+                series_markets = _markets_for_series(tradeable_markets, primary_series)
+                if series_markets:
+                    selected = _select_best_market(
+                        series_markets,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        budget_tracker=budget_tracker,
+                    )
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected active {league} Primary Moneyline ({primary_series}): {selected}")
+                        return selected
+
+        # Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
+        for league in target_leagues:
+            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                logger.info("Orderbook probe quota exhausted during Tier 1B Secondary Game Lines; stopping further probes.")
                 return None
 
             game_series = SportsSeasonRouter.get_game_lines_for_league(league)
-            for series_ticker in game_series:
+            primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
+            secondary_series = [s for s in game_series if s != primary_series]
+
+            for series_ticker in secondary_series:
                 if budget_tracker is not None and budget_tracker["remaining"] <= 0:
                     break
 

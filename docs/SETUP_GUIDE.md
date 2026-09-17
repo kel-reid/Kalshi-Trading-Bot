@@ -45,7 +45,7 @@ In GitHub, navigate to **Settings** > **Secrets and variables** > **Actions** > 
 * **`SSH_USERNAME`**: Set to `root`.
 * **`SSH_PRIVATE_KEY`**: The complete private SSH key corresponding to the public key registered on the Droplet.
 * **`DOPPLER_TOKEN`**: The Doppler production service token (starts with `dp.st.prd.`) to inject runtime secrets.
-* **`PAT_GHCR`**: A GitHub Personal Access Token with `read:packages` and `write:packages` permissions to pull images from GHCR.
+* **`PAT_GHCR`**: A GitHub Personal Access Token with `read:packages` permission to pull images from GHCR (fine-grained personal access token recommended for least privilege).
 
 ### Step 4: Deploy via Git Push
 Trigger the deployment pipeline by pushing code to `main`:

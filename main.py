@@ -2,9 +2,10 @@
 Primary Production Trading Bot Entrypoint
 
 This script initiates the main Avellaneda-Stoikov market-making loop. 
-It selects the target market (or a random high-liquidity market if target is blank), 
-wires a manual Ctrl+C SIGINT trigger to clean up resting quotes on termination, 
-and launches the websocket and quoting loops.
+It selects the target market (or discovers the most liquid in-season sports market
+via SportsSeasonRouter if target is blank), retries with backoff if no markets
+have active quotes, wires a manual Ctrl+C SIGINT trigger to clean up resting
+quotes on termination, and launches the websocket and quoting loops.
 """
 
 import asyncio
