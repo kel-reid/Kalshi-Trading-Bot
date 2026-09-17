@@ -135,3 +135,26 @@ def test_orderbook_v2_delta_processing():
     assert 45 not in manager.books["KXNFLGAME-26SEP17DETBUF"]["yes"]
     assert manager.get_best_bid("KXNFLGAME-26SEP17DETBUF") is None
 
+
+def test_normalize_price_to_cents_formats():
+    """Verify that both v2 dollar strings and legacy float/int cents normalize accurately."""
+    from data.orderbook_manager import _normalize_price_to_cents
+
+    # v2 dollar representations (< 1.0)
+    assert _normalize_price_to_cents("0.5000") == 50
+    assert _normalize_price_to_cents(0.50) == 50
+    assert _normalize_price_to_cents("0.0100") == 1
+    assert _normalize_price_to_cents("0.9900") == 99
+
+    # Legacy cent representations (>= 1.0)
+    assert _normalize_price_to_cents(50) == 50
+    assert _normalize_price_to_cents(50.0) == 50
+    assert _normalize_price_to_cents("50.0") == 50
+    assert _normalize_price_to_cents("50") == 50
+    assert _normalize_price_to_cents(1) == 1
+    assert _normalize_price_to_cents(99.0) == 99
+
+    # Error handling
+    assert _normalize_price_to_cents(None) is None
+    assert _normalize_price_to_cents("invalid") is None
+

@@ -609,4 +609,38 @@ def test_discover_exact_match_with_preflight_check():
             mock_quotes.assert_not_called()
 
 
+def test_tier_1a_probes_all_league_primary_moneylines_before_secondary_lines():
+    """
+    Verify that in a multi-league overlap (e.g. October with NFL, NBA, MLB),
+    Tier 1A checks primary moneylines across all leagues before secondary lines
+    so dormant NFL does not starve MLB World Series or NBA.
+    """
+    mock_markets = [
+        {"ticker": "KXNFLGAME-OCT-1", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "5000.00"},
+        {"ticker": "KXNFLSPREAD-OCT-1", "series_ticker": "KXNFLSPREAD", "status": "open", "volume_fp": "8000.00"},
+        {"ticker": "KXNBAGAME-OCT-1", "series_ticker": "KXNBAGAME", "status": "open", "volume_fp": "4000.00"},
+        {"ticker": "KXMLBGAME-WS-1", "series_ticker": "KXMLBGAME", "status": "open", "volume_fp": "9000.00"},
+    ]
+
+    # NFL moneyline and NBA moneyline are dormant; MLB World Series has live quotes
+    def mock_quotes(ticker: str) -> bool:
+        if "KXMLBGAME" in ticker:
+            return True
+        return False
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NBA", "MLB"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", side_effect=mock_quotes) as mock_probe:
+        selected = discover_active_market(target_preference="SPORTS", preflight_check=True)
+        assert selected == "KXMLBGAME-WS-1"
+        # Verify probing order: KXNFLGAME was probed, KXNBAGAME was probed, KXMLBGAME was probed
+        probed_tickers = [call.args[0] for call in mock_probe.call_args_list]
+        assert "KXNFLGAME-OCT-1" in probed_tickers
+        assert "KXNBAGAME-OCT-1" in probed_tickers
+        assert "KXMLBGAME-WS-1" in probed_tickers
+        # KXNFLSPREAD was NOT probed because KXMLBGAME was found in Tier 1A
+        assert "KXNFLSPREAD-OCT-1" not in probed_tickers
+
+
+
 
