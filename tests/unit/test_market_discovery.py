@@ -377,13 +377,13 @@ def test_liquidity_key_v2_fields_and_horizon_weighting():
 
 def test_check_orderbook_has_quotes_fp_and_legacy():
     """Verify check_orderbook_has_quotes handles both orderbook_fp and legacy orderbook responses."""
-    # 1. Successful v2 orderbook_fp response
+    # 1. Successful v2 orderbook_fp response (yes_dollars or yes_dollars_fp)
     mock_fp_resp = MagicMock()
     mock_fp_resp.status_code = 200
     mock_fp_resp.json.return_value = {
         "orderbook_fp": {
-            "yes_dollars": [["0.3200", "150.00"]],
-            "no_dollars": [["0.6500", "80.00"]],
+            "yes_dollars_fp": [["0.3200", "150.00"]],
+            "no_dollars_fp": [["0.6500", "80.00"]],
         }
     }
     with patch("requests.get", return_value=mock_fp_resp):
