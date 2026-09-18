@@ -632,7 +632,7 @@ def discover_active_market(
     if target_leagues:
         # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
         for league in target_leagues:
-            if budget_tracker["remaining"] <= 0:
+            if preflight_check and budget_tracker["remaining"] <= 0:
                 logger.info("Probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
                 break
 
@@ -652,7 +652,7 @@ def discover_active_market(
 
         # Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
         for league in target_leagues:
-            if budget_tracker["remaining"] <= 0:
+            if preflight_check and budget_tracker["remaining"] <= 0:
                 logger.info("Probe quota exhausted during Tier 1B Secondary Game Lines; stopping further probes.")
                 break
 
@@ -661,7 +661,7 @@ def discover_active_market(
             secondary_series = [s for s in game_series if s != primary_series]
 
             for series_ticker in secondary_series:
-                if budget_tracker["remaining"] <= 0:
+                if preflight_check and budget_tracker["remaining"] <= 0:
                     break
 
                 series_markets = _ensure_series_markets(series_ticker)
@@ -678,13 +678,13 @@ def discover_active_market(
 
         # Tier 2: Cascade to Player Props across active in-season leagues
         for league in target_leagues:
-            if budget_tracker["remaining"] <= 0:
+            if preflight_check and budget_tracker["remaining"] <= 0:
                 logger.info("Probe quota exhausted during Tier 2 Player Props; stopping further probes.")
                 break
 
             props_series = SportsSeasonRouter.get_props_for_league(league)
             for series_ticker in props_series:
-                if budget_tracker["remaining"] <= 0:
+                if preflight_check and budget_tracker["remaining"] <= 0:
                     break
 
                 series_markets = _ensure_series_markets(series_ticker)
@@ -706,7 +706,7 @@ def discover_active_market(
             for s in SportsSeasonRouter.get_series_for_league(l)
         }
         for league in target_leagues:
-            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+            if preflight_check and budget_tracker["remaining"] <= 0:
                 break
             league_prefix = f"KX{league}"
             league_markets = [
