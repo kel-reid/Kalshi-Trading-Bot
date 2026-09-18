@@ -892,10 +892,11 @@ def test_parse_iso_timestamp():
     assert dt_z.tzinfo == datetime.timezone.utc
     assert dt_z.year == 2026 and dt_z.month == 9 and dt_z.day == 20
 
-    # Aware with offset
+    # Aware with offset: normalized to UTC
     dt_offset = _parse_iso_timestamp("2026-09-20T14:00:00-04:00")
     assert dt_offset is not None
-    assert dt_offset.utcoffset() == datetime.timedelta(hours=-4)
+    assert dt_offset.tzinfo == datetime.timezone.utc
+    assert dt_offset.hour == 18
 
     # Offset-naive ISO timestamp should be normalized to UTC
     dt_naive = _parse_iso_timestamp("2026-09-20T18:00:00")
@@ -962,7 +963,7 @@ def test_is_within_horizon_boundary_and_naive_timestamp_handling():
 def test_targeted_series_fallback_deduplication_and_budget_bounding():
     """
     Verify _ensure_series_markets deduplicates repeated requests for the same series
-    and stays strictly bounded by max_targeted_series_requests without draining orderbook probe quota.
+    and stays strictly bounded by max_targeted_series_fallbacks within the shared discovery probe budget.
     """
     mock_calls = []
 
@@ -976,16 +977,17 @@ def test_targeted_series_fallback_deduplication_and_budget_bounding():
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
          patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
 
-        # Run discovery with budget of at most 2 targeted series queries
+        # Run discovery with budget of at most 2 targeted series fallback queries
         selected = discover_active_market(
             target_preference="NFL",
             preflight_check=True,
-            max_targeted_series_requests=2,
+            max_targeted_series_fallbacks=2,
+            max_total_probes=10,
         )
 
         # Ensure that no series was queried more than once
         assert len(mock_calls) == len(set(mock_calls))
-        # Ensure total fallback calls did not exceed the dedicated budget
+        # Ensure total fallback calls did not exceed the fallback ceiling
         assert len(mock_calls) <= 2
         # Ensure Tier 3 was reached and selected despite empty targeted series responses
         assert selected == "KXNFL-26SEP14-KC"
@@ -1025,7 +1027,7 @@ async def test_async_discovery_wrappers():
     )
     with patch("utils.market_discovery.discover_active_market", return_value="KXNFLGAME-TEST") as mock_disc, \
          patch("utils.market_discovery.check_market_status", return_value="open"):
-        res = await discover_active_market_async(target_preference="NFL", max_expiration_days=8.0)
+        res = await discover_active_market_async(target_preference="NFL", max_expiration_days=8.0, max_targeted_series_fallbacks=3)
         assert res == "KXNFLGAME-TEST"
         mock_disc.assert_called_once()
 
@@ -1058,6 +1060,16 @@ def test_targeted_series_fallback_exception_and_cached_short_circuit():
         assert call_counts.get("KXNFLGAME") == 1
         # Fallback to Tier 3 general league market succeeds
         assert selected == "KXNFL-26SEP14-KC"
+
+
+def test_discover_exhausted_probe_budget_breaks_early():
+    """Verify that when probe budget is exhausted, discovery breaks out of tier loops cleanly."""
+    mock_markets = [{"ticker": "KXNFL-TEST", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+        selected = discover_active_market(target_preference="NFL", max_total_probes=0)
+        assert selected is None
+
 
 
 
