@@ -39,6 +39,13 @@ def mock_request_handler(method, url, *args, **kwargs):
                 }
             ]
         }, 200)
+    elif "orderbook" in url:
+        return MockResponse({
+            "orderbook": {
+                "yes": [[50, 100]],
+                "no": [[50, 100]]
+            }
+        }, 200)
     elif "markets" in url:
         return MockResponse({
             "markets": [{"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}],

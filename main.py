@@ -2,9 +2,10 @@
 Primary Production Trading Bot Entrypoint
 
 This script initiates the main Avellaneda-Stoikov market-making loop. 
-It selects the target market (or a random high-liquidity market if target is blank), 
-wires a manual Ctrl+C SIGINT trigger to clean up resting quotes on termination, 
-and launches the websocket and quoting loops.
+It selects the target market (or discovers the most liquid in-season sports market
+via SportsSeasonRouter if target is blank), retries with backoff if no markets
+have active quotes, wires a manual Ctrl+C SIGINT trigger to clean up resting
+quotes on termination, and launches the websocket and quoting loops.
 """
 
 import asyncio
@@ -20,15 +21,40 @@ async def main():
     from config import ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
     from utils.market_discovery import discover_active_market_async
     
-    ticker = await discover_active_market_async(target_preference=TARGET_TICKER)
+    # Wire basic signal handling for graceful exit during startup idle
+    shutdown_requested = False
+    def startup_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        print(f"\n\n>>> Signal {signum} received during startup. Exiting cleanly. <<<")
+        shutdown_requested = True
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, startup_shutdown)
+    signal.signal(signal.SIGTERM, startup_shutdown)
+
+    # 1. Discover Active Market (Idle and retry loop if sports markets are off-hours / quiet)
+    retry_interval = 30
+    ticker = None
+    while not ticker and not shutdown_requested:
+        ticker = await discover_active_market_async(target_preference=TARGET_TICKER)
+        if not ticker:
+            print(
+                f"No active in-season sports markets with two-sided quotes currently found on {ENVIRONMENT.capitalize()}. "
+                f"Idling and retrying discovery in {retry_interval}s..."
+            )
+            try:
+                await asyncio.sleep(retry_interval)
+            except asyncio.CancelledError:
+                break
+
     if not ticker:
-        print(f"No active tradeable markets found on {ENVIRONMENT.capitalize()}.")
-        sys.exit(1)
+        print(f"Startup aborted before an active market was locked in.")
+        sys.exit(0)
         
     print(f"Selected Market: {ticker}")
     print("Starting Avellaneda-Stoikov Bot... Press Ctrl+C to Kill.")
     
-    # 1. Initialize Bot
+    # 2. Initialize Bot
     bot = AvellanedaStoikovBot(
         ticker=ticker,
         gamma=RISK_GAMMA,
