@@ -117,3 +117,11 @@ To prevent the bot from becoming permanently stalled:
 1. **League-Specific Cascade:** If the target ticker begins with or references a supported league prefix (`KXNFL` $\rightarrow$ NFL, `KXNBA` $\rightarrow$ NBA, `KXMLB` $\rightarrow$ MLB), discovery routes directly to that league's full suite (Tier 1A moneylines, Tier 1B game lines, and Tier 2 props) to locate an active replacement within the same sport.
 2. **Seasonal Fallback:** If the excluded target does not map to a recognized league prefix, discovery falls back to `SportsSeasonRouter.get_in_season_leagues()`, ensuring the bot rotates to the highest-liquidity seasonal market rather than idling indefinitely.
 
+
+## 7. Rolling Weekly Expiration Horizon Filter & Targeted Queries
+To maximize capital velocity and prevent the bot from selecting multi-month or season-long futures (such as season win totals or `KXNFLENDSTREAK` contracts that resolve months later), automated discovery enforces a strict rolling expiration ceiling:
+* **Default Window (`MAX_EXPIRATION_DAYS = 8`):** Configurable via the `MAX_EXPIRATION_DAYS` environment variable. Defaults to **8 days** to span the full weekly NFL broadcast slate (Thursday Night Football through Monday Night Football) plus Kalshi's post-game settlement buffer.
+* **Early Filtering Across Tiers:** Any contract with `close_time > now + MAX_EXPIRATION_DAYS` is strictly excluded from candidate pools across Tier 1A (Moneylines), Tier 1B (Spreads/Totals), Tier 2 (Props), and Tier 3 (General League Catch-All).
+* **Targeted Series Query Fallback:** If global `/events` pagination omits upcoming game lines (e.g. due to hundreds of unrelated political/financial event listings), discovery executes targeted series queries (`series_ticker="KXNFLGAME"`, `series_ticker="KXMLBGAME"`) with the weekly horizon bound, ensuring game lines are located reliably.
+* **Exact Ticker Bypass:** Operators explicitly injecting an exact contract (via `TARGET_TICKER="<exact_ticker>"`) bypass the horizon filter, preserving the flexibility to quote any specific market if explicitly desired.
+
