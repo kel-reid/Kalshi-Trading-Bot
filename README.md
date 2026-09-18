@@ -113,6 +113,7 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to trade per quote side. |
 | `MIN_SPREAD` | `integer` | `4` | The minimum profit margin spread (in cents) required to quote. |
 | `RISK_GAMMA` | `float` | `0.5` | Inventory risk aversion parameter ($\gamma$). Higher values skew reservation prices faster away from accumulated inventory. |
+| `MAX_EXPIRATION_DAYS` | `integer` | `8` | Rolling window (days) to constrain automated discovery to near-term weekly game lines. |
 | `DB_HOST` | `string` | `localhost` | Host address of the PostgreSQL database instance. |
 | `DB_PORT` | `integer` | `5432` | Port number of the PostgreSQL database. |
 | `DB_NAME` | `string` | `kalshi_bot` | Name of the database schema. |

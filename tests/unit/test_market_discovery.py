@@ -5,6 +5,7 @@ Tests market filtering, keyword search across titles, liquidity prioritization,
 and contract expiration detection.
 """
 
+import datetime
 import pytest
 import requests
 from unittest.mock import patch, MagicMock
@@ -703,6 +704,182 @@ def test_excluded_exact_non_sports_ticker_rotates_to_seasonal_fallback():
             preflight_check=True,
         )
         assert selected == "KXNFLGAME-ACTIVE-1"
+
+
+def test_discover_filters_markets_exceeding_weekly_horizon():
+    """
+    Verify that automated sports discovery strictly filters out markets with close_time > 8 days
+    (e.g. season-ending props like KXNFLENDSTREAK) and selects near-term weekly game lines.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    near_term_close = (now + datetime.timedelta(days=3)).isoformat()
+    distant_close = (now + datetime.timedelta(days=150)).isoformat()
+
+    mock_markets = [
+        {
+            "ticker": "KXNFLENDSTREAK-40NYJ-2627",
+            "series_ticker": "KXNFLENDSTREAK",
+            "status": "open",
+            "close_time": distant_close,
+            "volume_fp": "100000.00",
+            "yes_bid_dollars": "0.19",
+            "yes_ask_dollars": "0.23",
+        },
+        {
+            "ticker": "KXNFLGAME-26SEP20-DETBUF",
+            "series_ticker": "KXNFLGAME",
+            "status": "open",
+            "close_time": near_term_close,
+            "volume_fp": "50000.00",
+            "yes_bid_dollars": "0.48",
+            "yes_ask_dollars": "0.52",
+        },
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        assert selected == "KXNFLGAME-26SEP20-DETBUF"
+
+
+def test_discover_respects_custom_max_expiration_days():
+    """
+    Verify that passing max_expiration_days filters out markets beyond the custom threshold.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    one_day_close = (now + datetime.timedelta(days=1)).isoformat()
+    four_day_close = (now + datetime.timedelta(days=4)).isoformat()
+
+    mock_markets = [
+        {
+            "ticker": "KXMLBGAME-TODAY",
+            "series_ticker": "KXMLBGAME",
+            "status": "open",
+            "close_time": one_day_close,
+            "volume_fp": "10000.00",
+        },
+        {
+            "ticker": "KXMLBGAME-FOURDAYS",
+            "series_ticker": "KXMLBGAME",
+            "status": "open",
+            "close_time": four_day_close,
+            "volume_fp": "20000.00",
+        },
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["MLB"]):
+        selected = discover_active_market(
+            target_preference="MLB",
+            preflight_check=True,
+            max_expiration_days=2.0,
+        )
+        assert selected == "KXMLBGAME-TODAY"
+
+
+def test_discover_exact_match_bypasses_horizon_filter():
+    """
+    Verify that an explicitly targeted exact contract is selected even if its close_time
+    exceeds the weekly horizon (e.g. operator explicitly targeting a long-term future).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    distant_close = (now + datetime.timedelta(days=150)).isoformat()
+
+    mock_markets = [
+        {
+            "ticker": "KXNFLENDSTREAK-40NYJ-2627",
+            "series_ticker": "KXNFLENDSTREAK",
+            "status": "open",
+            "close_time": distant_close,
+            "volume_fp": "100000.00",
+        },
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        selected = discover_active_market(
+            target_preference="KXNFLENDSTREAK-40NYJ-2627",
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
+        assert selected == "KXNFLENDSTREAK-40NYJ-2627"
+
+
+def test_tier_3_catchall_filters_multi_month_futures():
+    """
+    Verify that Tier 3 general league catch-all strictly drops markets beyond the weekly horizon
+    and idles (returns None) if no near-term markets exist, rather than selecting distant futures.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    distant_close = (now + datetime.timedelta(days=150)).isoformat()
+
+    mock_markets = [
+        {
+            "ticker": "KXNFLENDSTREAK-40NYJ-2627",
+            "series_ticker": "KXNFLENDSTREAK",
+            "status": "open",
+            "close_time": distant_close,
+            "volume_fp": "100000.00",
+        },
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        assert selected is None
+
+
+def test_targeted_series_fetch_fallback_when_events_misses_series():
+    """
+    Verify that if the initial global markets list lacks the active series,
+    discovery triggers a targeted series query to retrieve the weekly game lines.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    near_term_close = (now + datetime.timedelta(days=2)).isoformat()
+
+    global_markets = [
+        {"ticker": "POLITICS-2028-ELECTION", "status": "open"},
+    ]
+    targeted_nfl_games = [
+        {
+            "ticker": "KXNFLGAME-26SEP20-NEBUF",
+            "series_ticker": "KXNFLGAME",
+            "status": "open",
+            "close_time": near_term_close,
+            "volume_fp": "35000.00",
+        },
+    ]
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker == "KXNFLGAME":
+            return targeted_nfl_games
+        return global_markets
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        assert selected == "KXNFLGAME-26SEP20-NEBUF"
+
+
+def test_fetch_eligible_markets_with_max_expiration_days():
+    """
+    Verify fetch_eligible_markets filters out markets beyond max_expiration_days directly at fetch time.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    mock_markets = [
+        {"ticker": "KXNFL-NEAR", "status": "open", "close_time": (now + datetime.timedelta(days=3)).isoformat()},
+        {"ticker": "KXNFL-DISTANT", "status": "open", "close_time": (now + datetime.timedelta(days=30)).isoformat()},
+    ]
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": mock_markets}
+        mock_get.return_value = mock_resp
+
+        eligible = fetch_eligible_markets(max_expiration_days=8.0)
+        tickers = [m["ticker"] for m in eligible]
+        assert "KXNFL-NEAR" in tickers
+        assert "KXNFL-DISTANT" not in tickers
 
 
 

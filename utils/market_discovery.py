@@ -18,7 +18,7 @@ import datetime
 import requests
 import certifi
 
-from config import BASE_URL
+from config import BASE_URL, MAX_EXPIRATION_DAYS
 
 logger = logging.getLogger("MarketDiscovery")
 
@@ -138,12 +138,41 @@ class SportsSeasonRouter:
 # Market Ingestion & REST API Client Logic
 # ============================================================================
 
-def fetch_eligible_markets(limit: int = 1000, series_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+def _is_within_horizon(
+    m: Dict[str, Any],
+    max_days: Optional[float],
+    now_utc: Optional[datetime.datetime] = None,
+) -> bool:
+    """
+    Return True if market close_time / expiration_time is within max_days from now.
+    Returns True if max_days is None or if close_time cannot be parsed.
+    """
+    if max_days is None:
+        return True
+    close_time_str = m.get("close_time") or m.get("expiration_time")
+    if not close_time_str:
+        return True
+    try:
+        if now_utc is None:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+        close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
+        days_remaining = (close_dt - now_utc).total_seconds() / 86400.0
+        return 0.0 <= days_remaining <= max_days
+    except Exception:
+        return True
+
+
+def fetch_eligible_markets(
+    limit: int = 1000,
+    series_ticker: Optional[str] = None,
+    max_expiration_days: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     """
     Fetch active and tradeable markets from the Kalshi REST API.
     Queries /events with with_nested_markets=true to discover real underlying event markets
     without getting exhausted by synthetic multivariate shards (KXMVE), falling back to /markets if needed.
     Supports optional series_ticker filter for high-turnover series (e.g. KXNFLGAME).
+    Supports optional max_expiration_days filter to restrict ingestion to rolling weekly windows.
     Excludes inactive markets, expired contracts, and internal composite / shard combo markets.
     """
     try:
@@ -240,6 +269,8 @@ def fetch_eligible_markets(limit: int = 1000, series_ticker: Optional[str] = Non
                         continue
                 except Exception:
                     pass
+            if not _is_within_horizon(m, max_expiration_days, now_utc):
+                continue
             eligible.append(m)
 
         logger.info(
@@ -426,6 +457,7 @@ def discover_active_market(
     exclude_tickers: Optional[List[str]] = None,
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
+    max_expiration_days: Optional[float] = None,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
@@ -445,6 +477,8 @@ def discover_active_market(
     budget_tracker: Optional[Dict[str, int]] = (
         {"remaining": max_total_probes} if preflight_check else None
     )
+    if max_expiration_days is None:
+        max_expiration_days = float(MAX_EXPIRATION_DAYS)
 
     # 1. Fetch eligible markets ONCE and filter in memory to protect REST rate limits
     eligible = fetch_eligible_markets()
@@ -473,6 +507,7 @@ def discover_active_market(
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
     else:
         # 2. Exact match by ticker (if explicitly targeted and not a category keyword)
+        # Operators explicitly targeting a specific contract are permitted regardless of horizon.
         exact = [m for m in tradeable_markets if m.get("ticker", "").upper() == pref]
         if exact:
             exact_ticker = exact[0].get("ticker")
@@ -492,7 +527,11 @@ def discover_active_market(
                 return exact_ticker
 
         # 3. Category or keyword match (for explicit non-sports target preference)
-        matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
+        matched = [
+            m for m in tradeable_markets
+            if pref in _text_for_market(m)
+            and _is_within_horizon(m, max_expiration_days)
+        ]
         if matched:
             selected = _select_best_market(
                 matched,
@@ -518,11 +557,41 @@ def discover_active_market(
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
+    # Helper: retrieve candidate markets for a specific series within the rolling weekly horizon,
+    # falling back to a targeted series REST query if the global /events pagination missed it.
+    def _ensure_series_markets(series: str) -> List[Dict[str, Any]]:
+        nonlocal tradeable_markets
+        filtered = [
+            m for m in _markets_for_series(tradeable_markets, series)
+            if _is_within_horizon(m, max_expiration_days)
+        ]
+        if filtered:
+            return filtered
+        try:
+            targeted = fetch_eligible_markets(
+                series_ticker=series,
+                max_expiration_days=max_expiration_days,
+            )
+            if targeted:
+                known_tickers = {m.get("ticker") for m in tradeable_markets}
+                new_items = [
+                    m for m in targeted
+                    if m.get("ticker") not in exclude
+                    and m.get("ticker") not in known_tickers
+                    and _is_within_horizon(m, max_expiration_days)
+                ]
+                tradeable_markets.extend(new_items)
+                return [
+                    m for m in _markets_for_series(tradeable_markets, series)
+                    if _is_within_horizon(m, max_expiration_days)
+                ]
+        except Exception as e_err:
+            logger.debug(f"Targeted series fetch for {series} failed: {e_err}")
+        return []
+
     # 5. SportsSeasonRouter Waterfall for in-season leagues and full product suites
     if target_leagues:
         # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
-        # Probing flagship moneyline series (KXNFLGAME, KXNBAGAME, KXMLBGAME) across all leagues first
-        # ensures no in-season sport (e.g. October MLB World Series) is starved by another sport's secondary lines.
         for league in target_leagues:
             if budget_tracker is not None and budget_tracker["remaining"] <= 0:
                 logger.info("Orderbook probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
@@ -530,7 +599,7 @@ def discover_active_market(
 
             primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
             if primary_series:
-                series_markets = _markets_for_series(tradeable_markets, primary_series)
+                series_markets = _ensure_series_markets(primary_series)
                 if series_markets:
                     selected = _select_best_market(
                         series_markets,
@@ -556,7 +625,7 @@ def discover_active_market(
                 if budget_tracker is not None and budget_tracker["remaining"] <= 0:
                     break
 
-                series_markets = _markets_for_series(tradeable_markets, series_ticker)
+                series_markets = _ensure_series_markets(series_ticker)
                 if series_markets:
                     selected = _select_best_market(
                         series_markets,
@@ -579,7 +648,7 @@ def discover_active_market(
                 if budget_tracker is not None and budget_tracker["remaining"] <= 0:
                     break
 
-                series_markets = _markets_for_series(tradeable_markets, series_ticker)
+                series_markets = _ensure_series_markets(series_ticker)
                 if series_markets:
                     selected = _select_best_market(
                         series_markets,
@@ -591,7 +660,7 @@ def discover_active_market(
                         logger.info(f"SportsSeasonRouter selected active {league} Player Prop ({series_ticker}): {selected}")
                         return selected
 
-        # Tier 3: General League tradeable sports markets (excluding series already screened in Tiers 1 and 2)
+        # Tier 3: General League tradeable sports markets (strictly within weekly expiration horizon)
         all_configured_series = {
             s.upper()
             for l in target_leagues
@@ -609,6 +678,7 @@ def discover_active_market(
                 )
                 and m.get("series_ticker", "").upper() not in all_configured_series
                 and not any(str(m.get("ticker", "")).upper().startswith(f"{s}-") for s in all_configured_series)
+                and _is_within_horizon(m, max_expiration_days)
             ]
             if league_markets:
                 selected = _select_best_market(
@@ -679,6 +749,7 @@ async def discover_active_market_async(
     exclude_tickers: Optional[List[str]] = None,
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
+    max_expiration_days: Optional[float] = None,
 ) -> Optional[str]:
     """Non-blocking async wrapper for discover_active_market."""
     return await asyncio.to_thread(
@@ -687,6 +758,7 @@ async def discover_active_market_async(
         exclude_tickers,
         preflight_check,
         max_total_probes,
+        max_expiration_days,
     )
 
 
