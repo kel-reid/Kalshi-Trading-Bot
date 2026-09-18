@@ -16,7 +16,7 @@ prometheus.remote_write "metrics_hosted_prometheus" {
     url  = "https://prometheus-prod-66-prod-us-east-3.grafana.net/api/prom/push"
     
     basic_auth {
-      username = "3049654"
+      username = "<your_grafana_cloud_prometheus_username>"
       password = sys.env("GRAFANA_API_KEY")
     }
   }
