@@ -138,6 +138,26 @@ class SportsSeasonRouter:
 # Market Ingestion & REST API Client Logic
 # ============================================================================
 
+def _parse_iso_timestamp(ts: Any) -> Optional[datetime.datetime]:
+    """
+    Safely parse an ISO-8601 timestamp string into a timezone-aware UTC datetime.
+    Normalizes 'Z' to '+00:00' and attaches UTC to offset-naive timestamps.
+    Returns None if parsing fails, input is missing, or string is empty.
+    """
+    if ts is None:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 def _is_within_horizon(
     m: Dict[str, Any],
     max_days: Optional[float],
@@ -145,21 +165,26 @@ def _is_within_horizon(
 ) -> bool:
     """
     Return True if market close_time / expiration_time is within max_days from now.
-    Returns True if max_days is None or if close_time cannot be parsed.
+    Returns True if max_days is None.
+    If close_time is missing, returns True for backward-compatibility with untimed mock markets.
+    If close_time is present, parses into UTC and enforces 0.0 <= days_remaining <= max_days.
+    Fails closed (returns False) on any parse error, invalid timestamp, or out-of-horizon date.
     """
     if max_days is None:
         return True
     close_time_str = m.get("close_time") or m.get("expiration_time")
-    if not close_time_str:
+    if not close_time_str or not str(close_time_str).strip():
         return True
-    try:
-        if now_utc is None:
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-        close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
-        days_remaining = (close_dt - now_utc).total_seconds() / 86400.0
-        return 0.0 <= days_remaining <= max_days
-    except Exception:
-        return True
+
+    close_dt = _parse_iso_timestamp(close_time_str)
+    if close_dt is None:
+        return False
+
+    if now_utc is None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    days_remaining = (close_dt - now_utc).total_seconds() / 86400.0
+    return 0.0 <= days_remaining <= max_days
 
 
 def fetch_eligible_markets(
@@ -263,12 +288,9 @@ def fetch_eligible_markets(
             # Filter out markets whose close_time or expiration_time has passed
             close_time_str = m.get("close_time") or m.get("expiration_time")
             if close_time_str:
-                try:
-                    close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
-                    if close_dt <= now_utc:
-                        continue
-                except Exception:
-                    pass
+                close_dt = _parse_iso_timestamp(close_time_str)
+                if close_dt is not None and close_dt <= now_utc:
+                    continue
             if not _is_within_horizon(m, max_expiration_days, now_utc):
                 continue
             eligible.append(m)
@@ -350,8 +372,8 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     horizon_multiplier = 1.0
     close_time_str = m.get("close_time") or m.get("expiration_time")
     if close_time_str:
-        try:
-            close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
+        close_dt = _parse_iso_timestamp(close_time_str)
+        if close_dt is not None:
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
             if days_to_close <= 7:
@@ -366,8 +388,6 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
                 horizon_multiplier = 0.5
             else:
                 horizon_multiplier = 0.05
-        except Exception:
-            pass
 
     # In-season sports bonus: prioritize high-velocity weekly game lines and player props
     series_bonus = 0.0
@@ -381,6 +401,7 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
 
 DEFAULT_MAX_TOTAL_PROBES: int = 10
 DEFAULT_MAX_PROBES_PER_SERIES: int = 2
+DEFAULT_MAX_TARGETED_SERIES_REQUESTS: int = 5
 
 
 def _select_best_market(
@@ -458,6 +479,7 @@ def discover_active_market(
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
+    max_targeted_series_requests: int = DEFAULT_MAX_TARGETED_SERIES_REQUESTS,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
@@ -557,6 +579,9 @@ def discover_active_market(
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
+    queried_series: set[str] = set()
+    targeted_budget: Dict[str, int] = {"remaining": max_targeted_series_requests}
+
     # Helper: retrieve candidate markets for a specific series within the rolling weekly horizon,
     # falling back to a targeted series REST query if the global /events pagination missed it.
     def _ensure_series_markets(series: str) -> List[Dict[str, Any]]:
@@ -567,6 +592,18 @@ def discover_active_market(
         ]
         if filtered:
             return filtered
+
+        series_key = series.upper()
+        if series_key in queried_series:
+            return []
+
+        if targeted_budget["remaining"] <= 0:
+            logger.info(f"Targeted series query budget exhausted; skipping fallback fetch for series: {series}")
+            return []
+
+        targeted_budget["remaining"] -= 1
+        queried_series.add(series_key)
+
         try:
             targeted = fetch_eligible_markets(
                 series_ticker=series,
@@ -719,14 +756,12 @@ def check_market_status(ticker: str) -> Optional[str]:
             # Check close_time / expiration_time
             close_time_str = market_info.get("close_time") or market_info.get("expiration_time")
             if close_time_str:
-                try:
+                close_dt = _parse_iso_timestamp(close_time_str)
+                if close_dt is not None:
                     now_utc = datetime.datetime.now(datetime.timezone.utc)
-                    close_dt = datetime.datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
                     if close_dt <= now_utc:
                         logger.info(f"Market {ticker} has passed its close_time ({close_time_str}); treating as closed.")
                         return "closed"
-                except Exception:
-                    pass
 
             return status
         logger.warning(f"Market status lookup for {ticker} returned HTTP {resp.status_code}")
@@ -750,6 +785,7 @@ async def discover_active_market_async(
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
+    max_targeted_series_requests: int = DEFAULT_MAX_TARGETED_SERIES_REQUESTS,
 ) -> Optional[str]:
     """Non-blocking async wrapper for discover_active_market."""
     return await asyncio.to_thread(
@@ -759,6 +795,7 @@ async def discover_active_market_async(
         preflight_check,
         max_total_probes,
         max_expiration_days,
+        max_targeted_series_requests,
     )
 
 

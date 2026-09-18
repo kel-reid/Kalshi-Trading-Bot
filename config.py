@@ -46,7 +46,16 @@ RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.5"))
 MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
 ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
-MAX_EXPIRATION_DAYS = float(os.getenv("MAX_EXPIRATION_DAYS", "8")) # Rolling window (days) for automated sports discovery
+def _get_float_env(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if val is None or not str(val).strip():
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")
