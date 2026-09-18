@@ -54,10 +54,10 @@ Once both the bot and Alloy services are running on the server, you can view the
 1. Open your web browser and navigate to your Grafana instance (e.g., `https://<your_subdomain>.grafana.net`).
 2. Log into your account and open the **Kalshi Market Maker** dashboard.
 3. Confirm that the data series are actively plotting points for:
-   * **Profit & Loss**
-   * **Current Inventory Risk**
-   * **API Latency**
-   * **Total Orders Placed** (once the bot executes its first quote placements)
+   * **Account Balance ($)** (real-time bot cash balance in USD from `get_balance()`)
+   * **Net Inventory Position** (contract exposure on the active market)
+   * **Kalshi API Latency** (rolling REST roundtrip execution latency)
+   * **Total Orders Placed** (and Buy/Sell Orders Placed once the bot posts quotes)
 
 ## 4. Verify the Database (PostgreSQL)
 
