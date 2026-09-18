@@ -454,14 +454,25 @@ def discover_active_market(
         logger.warning("No tradeable markets available matching criteria.")
         return None
 
+    target_leagues: Optional[List[str]] = None
+
     # Check if target preference indicates sports or is default/unspecified
     is_sports_pref = pref in (
         "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
         "SPORTS", "SPORT", "MAJOR SPORTS"
     ) or not pref
 
-    # 2. Exact match by ticker (if explicitly targeted and not a category keyword)
-    if pref and not is_sports_pref:
+    if is_sports_pref:
+        if pref in ("NFL", "FOOTBALL"):
+            target_leagues = ["NFL"]
+        elif pref in ("NBA", "BASKETBALL"):
+            target_leagues = ["NBA"]
+        elif pref in ("MLB", "BASEBALL"):
+            target_leagues = ["MLB"]
+        else:
+            target_leagues = SportsSeasonRouter.get_in_season_leagues()
+    else:
+        # 2. Exact match by ticker (if explicitly targeted and not a category keyword)
         exact = [m for m in tradeable_markets if m.get("ticker", "").upper() == pref]
         if exact:
             exact_ticker = exact[0].get("ticker")
@@ -480,17 +491,35 @@ def discover_active_market(
                 logger.info(f"Targeting exact matched market: {pref}")
                 return exact_ticker
 
-    # 3. SportsSeasonRouter Waterfall for in-season leagues and full product suites
-    if is_sports_pref:
-        if pref in ("NFL", "FOOTBALL"):
+        # 3. Category or keyword match (for explicit non-sports target preference)
+        matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
+        if matched:
+            selected = _select_best_market(
+                matched,
+                preflight_check=preflight_check,
+                budget_tracker=budget_tracker,
+            )
+            if selected:
+                logger.info(f"Matched active market for '{target_preference}': {selected}")
+                return selected
+
+        # 4. Unmatched or excluded exact ticker (e.g. during auto-rotation after settlement/starvation)
+        # Route to its detected league or seasonal fallback so rotation can find an active replacement.
+        if pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
             target_leagues = ["NFL"]
-        elif pref in ("NBA", "BASKETBALL"):
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to NFL suite for auto-rotation.")
+        elif pref.startswith("KXNBA") or "NBA" in pref or "BASKETBALL" in pref:
             target_leagues = ["NBA"]
-        elif pref in ("MLB", "BASEBALL"):
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to NBA suite for auto-rotation.")
+        elif pref.startswith("KXMLB") or "MLB" in pref or "BASEBALL" in pref:
             target_leagues = ["MLB"]
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to MLB suite for auto-rotation.")
         else:
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
+    # 5. SportsSeasonRouter Waterfall for in-season leagues and full product suites
+    if target_leagues:
         # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
         # Probing flagship moneyline series (KXNFLGAME, KXNBAGAME, KXMLBGAME) across all leagues first
         # ensures no in-season sport (e.g. October MLB World Series) is starved by another sport's secondary lines.
@@ -591,19 +620,6 @@ def discover_active_market(
                 if selected:
                     logger.info(f"SportsSeasonRouter selected active general {league} market: {selected}")
                     return selected
-
-    # 4. Category or keyword match (for explicit non-sports target preference)
-    if pref and not is_sports_pref:
-        matched = [m for m in tradeable_markets if pref in _text_for_market(m)]
-        if matched:
-            selected = _select_best_market(
-                matched,
-                preflight_check=preflight_check,
-                budget_tracker=budget_tracker,
-            )
-            if selected:
-                logger.info(f"Matched active market for '{target_preference}': {selected}")
-                return selected
 
     logger.warning("No active in-season sports markets with two-sided quotes found. Idling until market activity resumes.")
     return None

@@ -665,5 +665,46 @@ def test_tier_1a_probes_all_league_primary_moneylines_before_secondary_lines():
         assert "KXNFLSPREAD-OCT-1" not in probed_tickers
 
 
+def test_excluded_exact_sports_ticker_rotates_to_league_suite():
+    """
+    Verify that when an exact sports ticker is excluded during auto-rotation (e.g. after settlement
+    or starvation), discovery routes to its league suite (e.g. NFL) to find an active replacement.
+    """
+    mock_markets = [
+        {"ticker": "KXNFLGAME-OLD-SETTLED", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "50000.00"},
+        {"ticker": "KXNFLGAME-NEW-ACTIVE", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "40000.00"},
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        # target_preference retains the original exact ticker, but that ticker is now excluded
+        selected = discover_active_market(
+            target_preference="KXNFLGAME-OLD-SETTLED",
+            exclude_tickers=["KXNFLGAME-OLD-SETTLED"],
+            preflight_check=True,
+        )
+        assert selected == "KXNFLGAME-NEW-ACTIVE"
+
+
+def test_excluded_exact_non_sports_ticker_rotates_to_seasonal_fallback():
+    """
+    Verify that when an exact non-sports ticker is excluded and has no keyword matches,
+    discovery routes to the seasonal sports fallback before idling so auto-rotation can find a replacement.
+    """
+    mock_markets = [
+        {"ticker": "FED-RATE-OLD-SETTLED", "status": "open", "volume_fp": "50000.00"},
+        {"ticker": "KXNFLGAME-ACTIVE-1", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "20000.00"},
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        selected = discover_active_market(
+            target_preference="FED-RATE-OLD-SETTLED",
+            exclude_tickers=["FED-RATE-OLD-SETTLED"],
+            preflight_check=True,
+        )
+        assert selected == "KXNFLGAME-ACTIVE-1"
+
+
+
 
 
