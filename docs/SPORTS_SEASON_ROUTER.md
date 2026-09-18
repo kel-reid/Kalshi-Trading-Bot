@@ -51,14 +51,19 @@ The router inspects the current UTC month to determine active league priorities:
 ```mermaid
 flowchart TD
     Start([Market Discovery Request]) --> FetchMarkets[Fetch Eligible Markets Once via REST<br>fetch_eligible_markets]
-    FetchMarkets --> RouteCheck{User Specified<br>Target Market?}
+    FetchMarkets --> RouteCheck{User Specified<br>Target Preference?}
     
-    RouteCheck -- "Exact Ticker (e.g. KXNFLGAME-26SEP17DETBUF)" --> Exact[Target Exact Match]
-    RouteCheck -- "Specific League (e.g. NBA)" --> ManualOverride[Filter Memory for League Series]
-    RouteCheck -- "Default / SPORTS / NFL" --> Router[SportsSeasonRouter.get_in_season_leagues]
+    RouteCheck -- "Exact Ticker (e.g. KXNFLGAME-...)" --> ExactCheck{Active Exact<br>Match Found?}
+    ExactCheck -- "Yes & Has Quotes" --> SelectedMarket([Selected Market Locked In])
+    ExactCheck -- "Excluded / Settled / Starved" --> DetectLeague[Route to League Suite e.g. KXNFL->NFL<br>or Seasonal Fallback]
+    
+    RouteCheck -- "Specific League (e.g. NBA)" --> ManualOverride[Set Target League: e.g. NBA]
+    RouteCheck -- "Default / SPORTS / None" --> Router[SportsSeasonRouter.get_in_season_leagues]
 
+    DetectLeague --> Matrix[/Lookup Priority Sequence/]
+    ManualOverride --> Matrix
     Router --> CheckDate[Check Current UTC Month]
-    CheckDate --> Matrix[/Lookup Priority Sequence<br>e.g. Oct: 1.NFL 2.NBA 3.MLB/]
+    CheckDate --> Matrix
 
     Matrix --> NextTier{Next Tier in<br>Waterfall?}
     NextTier -- Yes --> FilterSeries[Filter In-Memory Markets for Series<br>Tier 1A Moneylines -> 1B Spreads/Totals -> Tier 2 Props]
@@ -72,7 +77,7 @@ flowchart TD
     HorizonRank --> PreFlight[Pre-Flight Orderbook Verification<br>Probe up to 2 Candidates per Series<br>10 Probes Total Budget]
     
     PreFlight --> HasTwoSidedQuotes{Two-Sided Quotes<br>Confirmed?}
-    HasTwoSidedQuotes -- Yes --> SelectedMarket([Selected Market Locked In])
+    HasTwoSidedQuotes -- Yes --> SelectedMarket
     HasTwoSidedQuotes -- No --> NextTier
     NextTier -- No (Exhausted / Budget Depleted) --> IdleRetry([Idle & Retry Discovery Cycle<br>No Unwanted Capital Allocation])
 ```
@@ -103,3 +108,12 @@ Before committing the market maker to any contract, the bot performs a lightweig
   * **Per-Series Limit:** The router probes at most **2 candidates** per series (`DEFAULT_MAX_PROBES_PER_SERIES = 2`).
   * **Total Discovery Budget:** A shared ceiling of **10 total probes** (`DEFAULT_MAX_TOTAL_PROBES = 10`) applies across all tiers in a single discovery cycle. If the probe quota is exhausted, discovery halts cleanly to prevent REST rate-limit penalties.
 * **Failover:** If a candidate is dormant or has one-sided quotes, it is bypassed in favor of the next ranked candidate in the series (up to 2 probes). If both fail, the router cascades to the next tier/series in the seasonal hierarchy.
+
+
+## 6. Auto-Rotation for Configured Exact Tickers
+When operators launch the bot targeting a specific contract ticker (e.g. `TARGET_TICKER="KXNFLGAME-26SEP17DETBUF"`), the bot locks onto that contract on startup. If that market reaches expiration/settlement or encounters prolonged orderbook starvation, the bot's auto-rotation mechanism calls discovery with that ticker added to `exclude_tickers`.
+
+To prevent the bot from becoming permanently stalled:
+1. **League-Specific Cascade:** If the target ticker begins with or references a supported league prefix (`KXNFL` $\rightarrow$ NFL, `KXNBA` $\rightarrow$ NBA, `KXMLB` $\rightarrow$ MLB), discovery routes directly to that league's full suite (Tier 1A moneylines, Tier 1B game lines, and Tier 2 props) to locate an active replacement within the same sport.
+2. **Seasonal Fallback:** If the excluded target does not map to a recognized league prefix, discovery falls back to `SportsSeasonRouter.get_in_season_leagues()`, ensuring the bot rotates to the highest-liquidity seasonal market rather than idling indefinitely.
+

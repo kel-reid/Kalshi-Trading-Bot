@@ -109,10 +109,10 @@ The following parameters customize the bot's trading strategy, risk limits, and 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `KALSHI_ENV` | `string` | `prod` | Kalshi environment connection mode (`demo` or `prod`). Defaults to `prod`; `.env.example` intentionally sets `demo` for safer local onboarding. |
-| `TARGET_TICKER` | `string` | - | The market ticker code to quote (e.g., `INX-26AUG-T5700`). |
+| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g., `KXNFLGAME-26SEP17DETBUF`), league (`NFL`, `NBA`, `MLB`), or category (`SPORTS`). If left empty, defaults to automated in-season sports discovery. |
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to trade per quote side. |
 | `MIN_SPREAD` | `integer` | `4` | The minimum profit margin spread (in cents) required to quote. |
-| `RISK_GAMMA` | `float` | `0.05` | Inventory risk aversion parameter. Higher values skew prices faster. |
+| `RISK_GAMMA` | `float` | `0.5` | Inventory risk aversion parameter ($\gamma$). Higher values skew reservation prices faster away from accumulated inventory. |
 | `DB_HOST` | `string` | `localhost` | Host address of the PostgreSQL database instance. |
 | `DB_PORT` | `integer` | `5432` | Port number of the PostgreSQL database. |
 | `DB_NAME` | `string` | `kalshi_bot` | Name of the database schema. |

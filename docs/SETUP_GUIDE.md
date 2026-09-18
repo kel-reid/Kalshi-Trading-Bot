@@ -75,8 +75,10 @@ sudo apt-get install grafana-alloy
 
 ### Step 2: Configure Alloy Credentials
 1. Copy `alloy.config/config.alloy` to `/etc/alloy/config.alloy`.
-2. Configure your Grafana Cloud Prometheus credentials (`username` and `password`):
-   - In `/etc/alloy/config.alloy`, replace `<your_grafana_cloud_prometheus_username>` with your numeric Prometheus username (found under Grafana Cloud -> Prometheus -> Details / Send Metrics).
+2. Configure your Grafana Cloud Prometheus endpoint and credentials (`url`, `username`, and `password`):
+   - In `/etc/alloy/config.alloy`:
+     - Replace `<your_grafana_cloud_prometheus_remote_write_url>` with your stack's remote-write push URL (found in Grafana Cloud under **Prometheus** -> **Details** / **Send Metrics**, e.g., `https://prometheus-prod-XX-prod-us-east-X.grafana.net/api/prom/push`).
+     - Replace `<your_grafana_cloud_prometheus_username>` with your numeric Prometheus username / Instance ID.
    - Configure the API key:
      - **Option A (Systemd Environment File - Recommended):**
        Add your Grafana Cloud API key to `/etc/default/alloy` (Debian/Ubuntu) or `/etc/sysconfig/alloy` (RHEL/CentOS):
