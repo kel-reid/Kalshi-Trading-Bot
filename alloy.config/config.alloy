@@ -13,10 +13,10 @@ prometheus.scrape "kalshi_bot" {
 prometheus.remote_write "metrics_hosted_prometheus" {
   endpoint {
     name = "hosted-prometheus"
-    url  = "https://prometheus-prod-66-prod-us-east-3.grafana.net/api/prom/push"
+    url  = "<your_grafana_cloud_prometheus_remote_write_url>"
     
     basic_auth {
-      username = "3049654"
+      username = "<your_grafana_cloud_prometheus_username>"
       password = sys.env("GRAFANA_API_KEY")
     }
   }

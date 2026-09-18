@@ -40,7 +40,7 @@ class KillSwitch:
         from config import ALERT_WEBHOOK_URL
         if ALERT_WEBHOOK_URL:
             try:
-                payload = {"text": "🚨 *Kalshi Bot Alert* \nKill Switch Triggered (Synchronous). Withdrawing all quotes."}
+                payload = {"text": "*Kalshi Bot Alert* \nKill Switch Triggered (Synchronous). Withdrawing all quotes."}
                 requests.post(
                     ALERT_WEBHOOK_URL,
                     json=payload,

@@ -146,3 +146,40 @@ async def test_empty_orderbook_handling():
     
     bot._cancel_all_quotes.assert_called_once()
     bot._update_quotes.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_active_hedge_subcent_long():
+    """When long inventory is high, matching sub-cent best bid must preserve sub-cent float price."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(32.4, 10.0))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(35.0, 10.0))
+    
+    bot._update_quotes = AsyncMock()
+    
+    await bot._tick()
+    
+    # Ask should match exact sub-cent best bid (32.4)
+    bot._update_quotes.assert_called_once_with(None, 32.4)
+
+
+@pytest.mark.asyncio
+async def test_active_hedge_subcent_short():
+    """When short inventory is high, matching sub-cent best ask must preserve sub-cent float price."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    
+    bot.inv_manager.get_position = MagicMock(return_value=-5)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(30.0, 10.0))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(32.4, 10.0))
+    
+    bot._update_quotes = AsyncMock()
+    
+    await bot._tick()
+    
+    # Bid should match exact sub-cent best ask (32.4)
+    bot._update_quotes.assert_called_once_with(32.4, None)
+

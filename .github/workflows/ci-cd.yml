@@ -55,7 +55,7 @@ jobs:
 
       - name: Run logic tests with pytest and generate coverage
         run: |
-          pytest -v --cov=strategy --cov=execution --cov-report=xml
+          pytest -v --cov=strategy --cov=execution --cov=data --cov=utils --cov-report=xml
 
       - name: Upload coverage reports to Codecov
         env:

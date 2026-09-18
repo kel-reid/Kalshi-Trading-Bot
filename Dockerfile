@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy setup file and source folders so wheel building can resolve local package modules
 COPY setup.py config.py /build/
+COPY auth /build/auth
+COPY data /build/data
 COPY strategy /build/strategy
 COPY execution /build/execution
 COPY utils /build/utils
