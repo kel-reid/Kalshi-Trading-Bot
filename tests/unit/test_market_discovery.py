@@ -882,6 +882,186 @@ def test_fetch_eligible_markets_with_max_expiration_days():
         assert "KXNFL-DISTANT" not in tickers
 
 
+def test_parse_iso_timestamp():
+    """Verify ISO timestamp parser safely handles aware, naive, Z, and malformed inputs."""
+    from utils.market_discovery import _parse_iso_timestamp
+
+    # Aware with Z
+    dt_z = _parse_iso_timestamp("2026-09-20T18:00:00Z")
+    assert dt_z is not None
+    assert dt_z.tzinfo == datetime.timezone.utc
+    assert dt_z.year == 2026 and dt_z.month == 9 and dt_z.day == 20
+
+    # Aware with offset
+    dt_offset = _parse_iso_timestamp("2026-09-20T14:00:00-04:00")
+    assert dt_offset is not None
+    assert dt_offset.utcoffset() == datetime.timedelta(hours=-4)
+
+    # Offset-naive ISO timestamp should be normalized to UTC
+    dt_naive = _parse_iso_timestamp("2026-09-20T18:00:00")
+    assert dt_naive is not None
+    assert dt_naive.tzinfo == datetime.timezone.utc
+    assert dt_naive.hour == 18
+
+    # Edge cases: None, empty string, whitespace, non-date string
+    assert _parse_iso_timestamp(None) is None
+    assert _parse_iso_timestamp("") is None
+    assert _parse_iso_timestamp("   ") is None
+    assert _parse_iso_timestamp("invalid-date-format") is None
+    assert _parse_iso_timestamp(123456789) is None
+
+
+def test_is_within_horizon_fails_closed_on_corrupt_or_malformed_timestamps():
+    """Verify _is_within_horizon fails closed (returns False) on invalid/unparseable timestamps."""
+    from utils.market_discovery import _is_within_horizon
+
+    # Corrupt / malformed close_time must return False
+    assert _is_within_horizon({"close_time": "invalid-timestamp"}, max_days=8.0) is False
+    assert _is_within_horizon({"expiration_time": "garbage_date_format"}, max_days=8.0) is False
+
+    # Missing close_time maintains backward compatibility for minimal test fixtures
+    assert _is_within_horizon({}, max_days=8.0) is True
+    assert _is_within_horizon({"close_time": ""}, max_days=8.0) is True
+    assert _is_within_horizon({"close_time": "   "}, max_days=8.0) is True
+
+    # When max_days is None, everything is within horizon
+    assert _is_within_horizon({"close_time": "invalid-timestamp"}, max_days=None) is True
+
+
+def test_is_within_horizon_boundary_and_naive_timestamp_handling():
+    """Verify _is_within_horizon accurately handles naive timestamps and strict boundary checks."""
+    from utils.market_discovery import _is_within_horizon
+
+    now_utc = datetime.datetime(2026, 9, 18, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+    # Naive timestamp 2 days in the future (within 8 day horizon)
+    naive_future = {"close_time": "2026-09-20T12:00:00"}
+    assert _is_within_horizon(naive_future, max_days=8.0, now_utc=now_utc) is True
+
+    # Naive timestamp 2 days in the past (expired, should return False)
+    naive_past = {"close_time": "2026-09-16T12:00:00"}
+    assert _is_within_horizon(naive_past, max_days=8.0, now_utc=now_utc) is False
+
+    # Naive timestamp 10 days in the future (beyond 8 day horizon, should return False)
+    naive_distant = {"close_time": "2026-09-28T12:00:00"}
+    assert _is_within_horizon(naive_distant, max_days=8.0, now_utc=now_utc) is False
+
+    # Exact boundary: exactly at now_utc (0 seconds remaining) -> True
+    boundary_exact_now = {"close_time": "2026-09-18T12:00:00Z"}
+    assert _is_within_horizon(boundary_exact_now, max_days=8.0, now_utc=now_utc) is True
+
+    # Exact boundary: exactly at now_utc + 8 days -> True
+    boundary_exact_max = {"close_time": "2026-09-26T12:00:00Z"}
+    assert _is_within_horizon(boundary_exact_max, max_days=8.0, now_utc=now_utc) is True
+
+    # Beyond boundary: now_utc + 8 days + 1 second -> False
+    boundary_beyond = {"close_time": "2026-09-26T12:00:01Z"}
+    assert _is_within_horizon(boundary_beyond, max_days=8.0, now_utc=now_utc) is False
+
+
+def test_targeted_series_fallback_deduplication_and_budget_bounding():
+    """
+    Verify _ensure_series_markets deduplicates repeated requests for the same series
+    and stays strictly bounded by max_targeted_series_requests without draining orderbook probe quota.
+    """
+    mock_calls = []
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker:
+            mock_calls.append(series_ticker)
+            return []
+        return [{"ticker": "KXNFL-26SEP14-KC", "status": "open"}]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+
+        # Run discovery with budget of at most 2 targeted series queries
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=True,
+            max_targeted_series_requests=2,
+        )
+
+        # Ensure that no series was queried more than once
+        assert len(mock_calls) == len(set(mock_calls))
+        # Ensure total fallback calls did not exceed the dedicated budget
+        assert len(mock_calls) <= 2
+        # Ensure Tier 3 was reached and selected despite empty targeted series responses
+        assert selected == "KXNFL-26SEP14-KC"
+
+
+def test_config_get_float_env_defensive_parsing():
+    """Verify _get_float_env in config safely falls back on corrupt or non-numeric strings."""
+    import os
+    from config import _get_float_env
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "invalid_number"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": ""}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "   "}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "12.5"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 12.5
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "14"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 14.0
+
+
+@pytest.mark.asyncio
+async def test_async_discovery_wrappers():
+    """Verify async wrappers discover_active_market_async, is_market_active_async, check_market_status_async."""
+    from utils.market_discovery import (
+        discover_active_market_async,
+        is_market_active_async,
+        check_market_status_async,
+    )
+    with patch("utils.market_discovery.discover_active_market", return_value="KXNFLGAME-TEST") as mock_disc, \
+         patch("utils.market_discovery.check_market_status", return_value="open"):
+        res = await discover_active_market_async(target_preference="NFL", max_expiration_days=8.0)
+        assert res == "KXNFLGAME-TEST"
+        mock_disc.assert_called_once()
+
+        is_active = await is_market_active_async("KXNFLGAME-TEST")
+        assert is_active is True
+
+        status = await check_market_status_async("KXNFLGAME-TEST")
+        assert status == "open"
+
+
+def test_targeted_series_fallback_exception_and_cached_short_circuit():
+    """Verify _ensure_series_markets handles fetch exceptions and caches already queried series."""
+    call_counts = {}
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker:
+            call_counts[series_ticker] = call_counts.get(series_ticker, 0) + 1
+            if series_ticker == "KXNFLGAME":
+                raise RuntimeError("Simulated network timeout")
+            return []
+        return [{"ticker": "KXNFL-26SEP14-KC", "status": "open"}]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_props_for_league", return_value=["KXNFLGAME"]):
+
+        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        # KXNFLGAME should only have been fetched via network once despite being checked in Tier 1A and Tier 2
+        assert call_counts.get("KXNFLGAME") == 1
+        # Fallback to Tier 3 general league market succeeds
+        assert selected == "KXNFL-26SEP14-KC"
+
+
+
+
 
 
 
