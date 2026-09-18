@@ -1071,6 +1071,46 @@ def test_discover_exhausted_probe_budget_breaks_early():
         assert selected is None
 
 
+def test_tier_loops_do_not_break_on_exhausted_probes_when_preflight_disabled():
+    """Verify that when preflight_check is False, probe budget does not short-circuit tier loops."""
+    # Tier 1A: Primary Moneyline
+    mock_markets_1a = [{"ticker": "KXNFLGAME-26SEP14-KC", "series_ticker": "KXNFLGAME", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets_1a), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes") as mock_probe:
+        selected = discover_active_market(target_preference="NFL", preflight_check=False, max_total_probes=0)
+        assert selected == "KXNFLGAME-26SEP14-KC"
+        mock_probe.assert_not_called()
+
+    # Tier 1B: Secondary Game Line
+    mock_markets_1b = [{"ticker": "KXNFLSPREAD-26SEP14-KC", "series_ticker": "KXNFLSPREAD", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets_1b), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes") as mock_probe:
+        selected = discover_active_market(target_preference="NFL", preflight_check=False, max_total_probes=0)
+        assert selected == "KXNFLSPREAD-26SEP14-KC"
+        mock_probe.assert_not_called()
+
+    # Tier 2: Player Prop
+    mock_markets_tier2 = [{"ticker": "KXNFLTD-26SEP14-MAHOMES", "series_ticker": "KXNFLTD", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets_tier2), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes") as mock_probe:
+        selected = discover_active_market(target_preference="NFL", preflight_check=False, max_total_probes=0)
+        assert selected == "KXNFLTD-26SEP14-MAHOMES"
+        mock_probe.assert_not_called()
+
+    # Tier 3: General League Market
+    mock_markets_tier3 = [{"ticker": "KXNFL-26SEP14-KC", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets_tier3), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes") as mock_probe:
+        selected = discover_active_market(target_preference="NFL", preflight_check=False, max_total_probes=0)
+        assert selected == "KXNFL-26SEP14-KC"
+        mock_probe.assert_not_called()
+
+
+
 
 
 
