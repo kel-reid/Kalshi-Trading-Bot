@@ -141,7 +141,7 @@ class SportsSeasonRouter:
 def _parse_iso_timestamp(ts: Any) -> Optional[datetime.datetime]:
     """
     Safely parse an ISO-8601 timestamp string into a timezone-aware UTC datetime.
-    Normalizes 'Z' to '+00:00' and attaches UTC to offset-naive timestamps.
+    Normalizes 'Z' to '+00:00', converts explicit offsets to UTC, and attaches UTC to offset-naive timestamps.
     Returns None if parsing fails, input is missing, or string is empty.
     """
     if ts is None:
@@ -152,8 +152,8 @@ def _parse_iso_timestamp(ts: Any) -> Optional[datetime.datetime]:
     try:
         dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt
+            return dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
     except Exception:
         return None
 
@@ -401,7 +401,7 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
 
 DEFAULT_MAX_TOTAL_PROBES: int = 10
 DEFAULT_MAX_PROBES_PER_SERIES: int = 2
-DEFAULT_MAX_TARGETED_SERIES_REQUESTS: int = 5
+DEFAULT_MAX_TARGETED_SERIES_FALLBACKS: int = 3
 
 
 def _select_best_market(
@@ -479,7 +479,7 @@ def discover_active_market(
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
-    max_targeted_series_requests: int = DEFAULT_MAX_TARGETED_SERIES_REQUESTS,
+    max_targeted_series_fallbacks: int = DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
@@ -496,9 +496,10 @@ def discover_active_market(
     """
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
-    budget_tracker: Optional[Dict[str, int]] = (
-        {"remaining": max_total_probes} if preflight_check else None
-    )
+    budget_tracker: Dict[str, int] = {
+        "remaining": max_total_probes,
+        "targeted_fallbacks_remaining": min(max_targeted_series_fallbacks, max_total_probes),
+    }
     if max_expiration_days is None:
         max_expiration_days = float(MAX_EXPIRATION_DAYS)
 
@@ -580,7 +581,6 @@ def discover_active_market(
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
     queried_series: set[str] = set()
-    targeted_budget: Dict[str, int] = {"remaining": max_targeted_series_requests}
 
     # Helper: retrieve candidate markets for a specific series within the rolling weekly horizon,
     # falling back to a targeted series REST query if the global /events pagination missed it.
@@ -597,11 +597,13 @@ def discover_active_market(
         if series_key in queried_series:
             return []
 
-        if targeted_budget["remaining"] <= 0:
-            logger.info(f"Targeted series query budget exhausted; skipping fallback fetch for series: {series}")
+        # Bound targeted series queries under the shared probe budget and fallback limit
+        if budget_tracker["remaining"] <= 0 or budget_tracker["targeted_fallbacks_remaining"] <= 0:
+            logger.info(f"Probe budget exhausted or targeted fallback limit reached; skipping fallback fetch for series: {series}")
             return []
 
-        targeted_budget["remaining"] -= 1
+        budget_tracker["remaining"] -= 1
+        budget_tracker["targeted_fallbacks_remaining"] -= 1
         queried_series.add(series_key)
 
         try:
@@ -630,9 +632,9 @@ def discover_active_market(
     if target_leagues:
         # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
         for league in target_leagues:
-            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-                logger.info("Orderbook probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
-                return None
+            if budget_tracker["remaining"] <= 0:
+                logger.info("Probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
+                break
 
             primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
             if primary_series:
@@ -650,16 +652,16 @@ def discover_active_market(
 
         # Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
         for league in target_leagues:
-            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-                logger.info("Orderbook probe quota exhausted during Tier 1B Secondary Game Lines; stopping further probes.")
-                return None
+            if budget_tracker["remaining"] <= 0:
+                logger.info("Probe quota exhausted during Tier 1B Secondary Game Lines; stopping further probes.")
+                break
 
             game_series = SportsSeasonRouter.get_game_lines_for_league(league)
             primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
             secondary_series = [s for s in game_series if s != primary_series]
 
             for series_ticker in secondary_series:
-                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                if budget_tracker["remaining"] <= 0:
                     break
 
                 series_markets = _ensure_series_markets(series_ticker)
@@ -676,13 +678,13 @@ def discover_active_market(
 
         # Tier 2: Cascade to Player Props across active in-season leagues
         for league in target_leagues:
-            if budget_tracker is not None and budget_tracker["remaining"] <= 0:
-                logger.info("Orderbook probe quota exhausted during Tier 2 Player Props; stopping further probes.")
-                return None
+            if budget_tracker["remaining"] <= 0:
+                logger.info("Probe quota exhausted during Tier 2 Player Props; stopping further probes.")
+                break
 
             props_series = SportsSeasonRouter.get_props_for_league(league)
             for series_ticker in props_series:
-                if budget_tracker is not None and budget_tracker["remaining"] <= 0:
+                if budget_tracker["remaining"] <= 0:
                     break
 
                 series_markets = _ensure_series_markets(series_ticker)
@@ -785,7 +787,7 @@ async def discover_active_market_async(
     preflight_check: bool = True,
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
-    max_targeted_series_requests: int = DEFAULT_MAX_TARGETED_SERIES_REQUESTS,
+    max_targeted_series_fallbacks: int = DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
 ) -> Optional[str]:
     """Non-blocking async wrapper for discover_active_market."""
     return await asyncio.to_thread(
@@ -795,7 +797,7 @@ async def discover_active_market_async(
         preflight_check,
         max_total_probes,
         max_expiration_days,
-        max_targeted_series_requests,
+        max_targeted_series_fallbacks,
     )
 
 
