@@ -1137,6 +1137,51 @@ def test_tier_loops_do_not_break_on_exhausted_probes_when_preflight_disabled():
         mock_probe.assert_not_called()
 
 
+def test_targeted_fallbacks_allowed_when_preflight_disabled_and_probes_zero():
+    """Verify targeted series fallback queries succeed when preflight_check is False and max_total_probes is 0."""
+    fallback_called = []
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker:
+            fallback_called.append(series_ticker)
+            if series_ticker == "KXNFLGAME":
+                return [{"ticker": "KXNFLGAME-26SEP14-KC", "series_ticker": "KXNFLGAME", "status": "open"}]
+            return []
+        return [{"ticker": "POLITICS-OTHER", "status": "open"}]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes") as mock_probe:
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=False,
+            max_total_probes=0,
+            max_targeted_series_fallbacks=2,
+            max_expiration_days=8.0,
+        )
+        # Targeted series fetch for KXNFLGAME should have executed
+        assert "KXNFLGAME" in fallback_called
+        # No orderbook probing should have occurred
+        mock_probe.assert_not_called()
+        # Candidate should have been selected directly by in-memory rank
+        assert selected == "KXNFLGAME-26SEP14-KC"
+
+    # Also verify that setting max_targeted_series_fallbacks=0 completely stops targeted fallback queries
+    fallback_called.clear()
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=False,
+            max_total_probes=0,
+            max_targeted_series_fallbacks=0,
+            max_expiration_days=8.0,
+        )
+        assert len(fallback_called) == 0
+        assert selected is None
+
+
+
 
 
 
