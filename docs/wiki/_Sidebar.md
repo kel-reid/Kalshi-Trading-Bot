@@ -1,5 +1,0 @@
-* [[Home]]
-* [[1. Setup Guide|Setup-Guide]]
-* [[2. Architecture Decisions|Architecture-Decisions]]
-* [[3. Sports Season Router|Sports-Season-Router]]
-* [[4. Feature Roadmap|Feature-Roadmap]]
