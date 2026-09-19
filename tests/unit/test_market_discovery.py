@@ -1391,6 +1391,69 @@ def test_is_within_horizon_clock_seam_fallback():
             sys.modules["utils.market_discovery"] = saved_md
 
 
+def test_legacy_patch_import_attributes_compatibility():
+    """Verify legacy patch/import seams for BASE_URL, requests, and certifi are preserved."""
+    import sys
+    import certifi
+    import requests
+    from utils import market_api as ma
+    from utils import market_discovery as md
+
+    # 1. Imports from utils.market_discovery
+    from utils.market_discovery import BASE_URL as MD_BASE_URL, requests as md_requests, certifi as md_certifi
+    assert MD_BASE_URL == "https://api.elections.kalshi.com"
+    assert md_requests is requests
+    assert md_certifi is certifi
+    assert "BASE_URL" in md.__all__
+    assert "requests" in md.__all__
+    assert "certifi" in md.__all__
+
+    # 2. Patching utils.market_discovery.BASE_URL propagates to API calls
+    with patch("utils.market_discovery.BASE_URL", "https://mock.kalshi.trade"), \
+         patch("utils.market_discovery.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"market": {"status": "active"}}
+        mock_get.return_value = mock_resp
+
+        md.check_market_status("MOCK-TICKER")
+        mock_get.assert_called_once()
+        called_url = mock_get.call_args[0][0]
+        assert called_url.startswith("https://mock.kalshi.trade/trade-api/v2/markets/MOCK-TICKER")
+
+    # 3. Patching utils.market_discovery.certifi.where propagates to API calls
+    with patch("utils.market_discovery.certifi.where", return_value="/mock/custom/ca.pem"), \
+         patch("utils.market_discovery.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"orderbook": {"yes": [1], "no": [1]}}
+        mock_get.return_value = mock_resp
+
+        md.check_orderbook_has_quotes("MOCK-TICKER")
+        mock_get.assert_called_once()
+        assert mock_get.call_args[1].get("verify") == "/mock/custom/ca.pem"
+
+    # 4. Patching utils.market_discovery.requests.get intercepts fetch_eligible_markets
+    with patch("utils.market_discovery.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"events": []}
+        mock_get.return_value = mock_resp
+
+        md.fetch_eligible_markets(limit=5)
+        assert mock_get.call_count >= 1
+
+    # 5. Standalone fallbacks when utils.market_discovery is not in sys.modules
+    saved_md = sys.modules.pop("utils.market_discovery", None)
+    try:
+        assert ma._get_base_url() == "https://api.elections.kalshi.com"
+        assert ma._get_requests() is requests
+        assert ma._get_certifi() is certifi
+    finally:
+        if saved_md is not None:
+            sys.modules["utils.market_discovery"] = saved_md
+
+
 
 
 

@@ -17,6 +17,33 @@ from utils.horizon import _is_within_horizon, _parse_iso_timestamp
 logger = logging.getLogger("MarketDiscovery")
 
 
+def _get_base_url() -> str:
+    """Retrieve BASE_URL, honoring any mock on utils.market_discovery."""
+    import sys
+    md = sys.modules.get("utils.market_discovery")
+    if md is not None and hasattr(md, "BASE_URL"):
+        return getattr(md, "BASE_URL")
+    return BASE_URL
+
+
+def _get_requests() -> Any:
+    """Retrieve requests module, honoring any mock on utils.market_discovery."""
+    import sys
+    md = sys.modules.get("utils.market_discovery")
+    if md is not None and hasattr(md, "requests"):
+        return getattr(md, "requests")
+    return requests
+
+
+def _get_certifi() -> Any:
+    """Retrieve certifi module, honoring any mock on utils.market_discovery."""
+    import sys
+    md = sys.modules.get("utils.market_discovery")
+    if md is not None and hasattr(md, "certifi"):
+        return getattr(md, "certifi")
+    return certifi
+
+
 def fetch_eligible_markets(
     limit: int = 1000,
     series_ticker: Optional[str] = None,
@@ -32,6 +59,9 @@ def fetch_eligible_markets(
     """
     try:
         markets = []
+        base_url = _get_base_url()
+        req_lib = _get_requests()
+        cert_path = _get_certifi().where()
 
         # 1. Primary: Query /events with nested markets (bypasses synthetic KXMVE shards)
         cursor: Optional[str] = None
@@ -50,10 +80,10 @@ def fetch_eligible_markets(
                 if cursor:
                     params["cursor"] = cursor
 
-                resp = requests.get(
-                    f"{BASE_URL}/trade-api/v2/events",
+                resp = req_lib.get(
+                    f"{base_url}/trade-api/v2/events",
                     params=params,
-                    verify=certifi.where(),
+                    verify=cert_path,
                     timeout=10,
                 )
                 if resp.status_code != 200:
@@ -96,10 +126,10 @@ def fetch_eligible_markets(
             fallback_params: Dict[str, Any] = {"limit": limit, "status": "open"}
             if series_ticker:
                 fallback_params["series_ticker"] = series_ticker
-            resp = requests.get(
-                f"{BASE_URL}/trade-api/v2/markets",
+            resp = req_lib.get(
+                f"{base_url}/trade-api/v2/markets",
                 params=fallback_params,
-                verify=certifi.where(),
+                verify=cert_path,
                 timeout=10,
             )
             resp.raise_for_status()
@@ -149,9 +179,12 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
     Makes a lightweight REST check to avoid selecting dormant contracts.
     """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/trade-api/v2/markets/{ticker}/orderbook",
-            verify=certifi.where(),
+        base_url = _get_base_url()
+        req_lib = _get_requests()
+        cert_path = _get_certifi().where()
+        resp = req_lib.get(
+            f"{base_url}/trade-api/v2/markets/{ticker}/orderbook",
+            verify=cert_path,
             timeout=3,
         )
         if resp.status_code == 200:
@@ -176,9 +209,12 @@ def check_market_status(ticker: str) -> Optional[str]:
     Also verifies close_time to catch expired hourly contracts before batch settlement.
     """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/trade-api/v2/markets/{ticker}",
-            verify=certifi.where(),
+        base_url = _get_base_url()
+        req_lib = _get_requests()
+        cert_path = _get_certifi().where()
+        resp = req_lib.get(
+            f"{base_url}/trade-api/v2/markets/{ticker}",
+            verify=cert_path,
             timeout=10,
         )
         if resp.status_code == 200:

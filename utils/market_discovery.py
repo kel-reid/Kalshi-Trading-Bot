@@ -20,7 +20,10 @@ import datetime
 import logging
 from typing import Any, Dict, List, Optional
 
-from config import MAX_EXPIRATION_DAYS
+import certifi
+import requests
+
+from config import BASE_URL, MAX_EXPIRATION_DAYS
 from utils.horizon import (
     _is_within_horizon,
     _parse_float,
@@ -48,26 +51,29 @@ from utils.sports_router import (
 logger = logging.getLogger("MarketDiscovery")
 
 __all__ = [
+    "BASE_URL",
     "SPORTS_KEYWORDS",
     "SportsSeasonRouter",
-    "_parse_iso_timestamp",
     "_is_within_horizon",
+    "_liquidity_key",
+    "_markets_for_series",
     "_parse_float",
+    "_parse_iso_timestamp",
+    "_select_best_market",
     "_text_for_market",
-    "fetch_eligible_markets",
-    "check_orderbook_has_quotes",
+    "certifi",
     "check_market_status",
-    "is_market_active",
-    "DEFAULT_MAX_TOTAL_PROBES",
+    "check_market_status_async",
+    "check_orderbook_has_quotes",
     "DEFAULT_MAX_PROBES_PER_SERIES",
     "DEFAULT_MAX_TARGETED_SERIES_FALLBACKS",
-    "_liquidity_key",
-    "_select_best_market",
-    "_markets_for_series",
+    "DEFAULT_MAX_TOTAL_PROBES",
     "discover_active_market",
     "discover_active_market_async",
+    "fetch_eligible_markets",
+    "is_market_active",
     "is_market_active_async",
-    "check_market_status_async",
+    "requests",
 ]
 
 
