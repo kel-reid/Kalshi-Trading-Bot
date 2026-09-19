@@ -141,18 +141,28 @@ Once the secret is added, pushing to `main` will automatically build the images,
 
 ## Live Output Preview
 
-When running, the bot feeds live log output updating its quotes:
+When running, the bot feeds structured telemetry and execution updates via its primary logging loop:
 
 ```text
-[2026-08-02 22:45:12] INFO: Hydrated initial balance: $1,245.50 | Net Position: 0
-[2026-08-02 22:45:14] INFO: WebSocket Connected & Hydrated L2 Orderbook.
-[2026-08-02 22:45:15] INFO: Midpoint: 54c | Reservation Price: 54c | Spread: 4c
-[2026-08-02 22:45:15] INFO: Placing Quotes -> Bid: 52c (x1) | Ask: 56c (x1)
-[2026-08-02 22:45:18] INFO: Fill Event Received: Bought 1 YES at 52c. Position: +1 YES
-[2026-08-02 22:45:19] INFO: Skewing quotes due to +1 YES position. Res Price: 53.2c
-[2026-08-02 22:45:19] INFO: Replacing Quotes -> Bid: 51c (x1) | Ask: 55c (x1)
+Selected Market: KXNFLGAME-26SEP21NYGLAR-NYG
+2026-09-19 16:21:12,851 - MarketMaker - INFO - Starting Market Maker for KXNFLGAME-26SEP21NYGLAR-NYG
+2026-09-19 16:21:13,234 - KalshiWS - INFO - Connected successfully.
+2026-09-19 16:21:13,334 - MarketMaker - INFO - WebSocket Connected. Hydrating state...
+2026-09-19 16:21:13,452 - MarketMaker - INFO - State hydrated. Beginning quoting loop.
+2026-09-19 16:21:14,455 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Inventory=0 | Gamma=0.5 | ReservationPrice=25.50c | Spread=4c → Bid=23c  Ask=28c
+2026-09-19 16:21:14,455 - MarketMaker - INFO - >> Placing new BID: 1 YES @ 23c
+2026-09-19 16:21:14,515 - MarketMaker - INFO - >> Placing new ASK: 1 YES @ 28c
+2026-09-19 16:21:18,120 - InventoryManager - INFO - Fill processed for KXNFLGAME-26SEP21NYGLAR-NYG: buy 1 yes @ 23c. New Net Pos: 1.
+2026-09-19 16:21:18,589 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Inventory=1 | Gamma=0.5 | ReservationPrice=25.00c | Spread=4c → Bid=23c  Ask=27c
+2026-09-19 16:21:18,590 - MarketMaker - INFO - >> Replacing ASK: 1 YES @ 27c
 ```
 
-## Financial Disclaimer
 
-This project is for research purposes only. Algorithmic trading carries significant financial risk. Live trading configuration should only be attempted after thorough testing on the Demo environment. Use at your own risk. The authors are not responsible for any financial losses incurred.
+## Production Operations & Risk Notice
+
+This software is an algorithmic trading system engineered for automated market making and live capital deployment on the Kalshi prediction exchange.
+
+Algorithmic market making involves real financial exposure, execution latency sensitivities, and exchange counterparty dynamics. Operators deploying live capital should ensure:
+* **Risk Calibration:** Operational risk parameters (`RISK_GAMMA`, `MIN_SPREAD`, `ORDER_SIZE`, and `MAX_EXPIRATION_DAYS`) are strictly scaled to account equity and risk limits.
+* **Continuous Observability:** Production deployments maintain real-time telemetry via Grafana Cloud, Prometheus metrics, and automated Slack/Discord alerting.
+* **Safety Controls:** Emergency shutdown protocols, state reconciliation routines, and synchronous kill-switch mechanisms are actively enforced to protect deployed funds.
