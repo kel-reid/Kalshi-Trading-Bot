@@ -1368,6 +1368,30 @@ async def test_is_market_active_honors_check_market_status_override():
             sys.modules["utils.market_discovery"] = saved_md
 
 
+def test_is_within_horizon_clock_seam_fallback():
+    """Verify _is_within_horizon honors patched clock on utils.market_discovery and standalone fallback."""
+    import sys
+    from utils.horizon import _is_within_horizon
+
+    m = {"ticker": "KXTEST-1", "close_time": "2026-10-18T00:00:00Z"}
+    mock_now = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+
+    # 1. Honors mocked datetime on utils.market_discovery
+    with patch("utils.market_discovery.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = mock_now
+        mock_dt.datetime.timezone = datetime.timezone
+        assert _is_within_horizon(m, max_days=7.0) is True
+
+    # 2. Standalone fallback when utils.market_discovery is not in sys.modules
+    saved_md = sys.modules.pop("utils.market_discovery", None)
+    try:
+        assert _is_within_horizon({"ticker": "KXTEST-2"}, max_days=7.0) is True
+    finally:
+        if saved_md is not None:
+            sys.modules["utils.market_discovery"] = saved_md
+
+
+
 
 
 
