@@ -1,0 +1,57 @@
+name: Sync Documentation to GitHub Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/sync-wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-wiki:
+    name: Publish to GitHub Wiki
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Wiki repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Synchronize documentation to Wiki
+        run: |
+          mkdir -p wiki
+          
+          # Copy guides with wiki-friendly naming and numbered sequence
+          cp docs/SETUP_GUIDE.md wiki/1.-Setup-Guide.md
+          cp docs/ARCHITECTURE_DECISIONS.md wiki/2.-Architecture-Decisions.md
+          cp docs/SPORTS_SEASON_ROUTER.md wiki/3.-Sports-Season-Router.md
+          cp docs/FEATURE_ROADMAP.md wiki/4.-Feature-Roadmap.md
+          
+          # Copy wiki-specific navigation and home templates if present
+          if [ -d "docs/wiki" ]; then
+            cp docs/wiki/* wiki/ 2>/dev/null || true
+          fi
+
+      - name: Commit and push updates to Wiki
+        run: |
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No documentation changes to sync to wiki."
+          else
+            git commit -m "docs(wiki): sync latest documentation from main [skip ci]"
+            git push origin master
+          fi
