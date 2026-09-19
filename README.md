@@ -1,143 +1,84 @@
 # Kalshi Algorithmic Market Maker Bot
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
-
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
 
-This project is a fully-functional algorithmic market-making trading bot built for the Kalshi prediction market platform. Its primary goal is to provide dual-sided liquidity (bids and asks) on Kalshi markets to capture the bid-ask spread while actively managing inventory risk.
+> 📚 **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
 
-## System Overview
+---
 
-* **Compute:** Managed container execution via Docker and Docker Compose running on a 24/7 DigitalOcean Droplet.
-* **Database:** Relational order logs and execution history persisted via a PostgreSQL container.
-* **Observability:** Telemetry captured via Grafana Alloy and pushed to a hosted Grafana Cloud instance.
-* **Alerting:** Real-time error alerts and critical status updates broadcasted to Discord or Slack via webhooks.
+## Overview
+
+This project is a production-grade algorithmic market-making trading bot built for the **Kalshi** prediction market exchange. It continuously provides dual-sided liquidity (bids and asks) using an asynchronous **Avellaneda-Stoikov** pricing model to capture the bid-ask spread while actively hedging inventory exposure.
+
+### Key Capabilities
+* **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory ($q$) and risk aversion ($\gamma$).
+* **Active Inventory Hedging:** Halts adverse quoting and aggressively crosses the spread when inventory crosses $\pm 5$ contracts.
+* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds ($\le 8$ days).
+* **Zero-Downtime Telemetry:** Emits real-time Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
+
+---
 
 ## System Architecture
 
-The following diagram illustrates the relationships between the core trading loop, the PostgreSQL database, DigitalOcean cloud resources, and external observability and alerting components:
+The trading bot executes as an asynchronous event-driven system on a hardened DigitalOcean Droplet:
+* **Compute:** Containerized Python service with asyncio concurrency for simultaneous WebSocket orderbook feeds and REST execution.
+* **Database:** Isolated PostgreSQL container recording persistent order history and execution state.
+* **Observability:** Telemetry scraped on loopback port `8000` via Grafana Alloy daemon and streamed to Grafana Cloud.
+* **Security:** Cryptographic RSA request signing and in-memory secret injection via Doppler.
 
-```mermaid
-graph TD
-    subgraph GrafanaCloud ["Grafana Cloud (Managed Monitoring)"]
-        Grafana[Grafana Dashboards] -->|Visualize Metrics| CloudProm[Prometheus Database]
-    end
+👉 **For the complete interactive system architecture diagram and component workflows, see the [Wiki: System Architecture](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture).**
 
-    subgraph DigitalOcean ["DigitalOcean Droplet (Cloud VPS)"]
-        Alloy[Grafana Alloy Daemon]
-        DBVolume[(Host Volume: postgres_data)]
+---
 
-        subgraph DockerContainer ["Docker Container: kalshi-bot"]
-            BotLoop[Avellaneda-Stoikov Bot Loop]
-            OrderBook[Orderbook Manager]
-            InvManager[Inventory Manager]
-            OrderManager[Order Manager]
-            KillSwitch[Kill Switch]
-            Auth[RSA Cryptographic Auth]
-        end
+## Quick Start (Local Development)
 
-        subgraph DBContainer ["Docker Container: kalshi-bot-db"]
-            DB[(PostgreSQL Database)]
-        end
-    end
+### Prerequisites
+* Python 3.12+ (tested on Python 3.12 & 3.14)
+* Git
 
-    subgraph External ["External Services"]
-        GHCR[GitHub Container Registry] -->|Deploy Image| DockerContainer
-        KalshiWS[Kalshi V2 WebSockets] <-->|Real-time Feed & Fills| OrderBook
-        KalshiWS <-->|Fills| InvManager
-        OrderManager -->|REST Order Placement/Cancel| KalshiREST[Kalshi V2 REST API]
-        KillSwitch -->|Emergency Cancel| KalshiREST
-    end
+### Setup & Testing
+```bash
+# 1. Clone the repository
+git clone git@github.com:kel-reid/Kalshi-Trading-Bot.git
+cd Kalshi-Trading-Bot
 
-    %% Flow relationships inside the container
-    BotLoop -->|Evaluate Risk & Mid Price| OrderBook
-    BotLoop -->|Evaluate Exposure| InvManager
-    BotLoop -->|Send Quotes| OrderManager
-    BotLoop -.->|Interrupt / Safety Shutdown| KillSwitch
-    OrderManager -.->|Register Active IDs| KillSwitch
-    Auth -.->|Sign Requests| OrderManager
-    Auth -.->|Authorize Connection| KalshiWS
+# 2. Initialize virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-    %% Database transaction logging
-    OrderManager -->|Write Transaction Logs| DB
-    KillSwitch -->|Update Order Status| DB
-    DB -->|Persist Data| DBVolume
+# 3. Install dependencies
+pip install -r requirements.txt
 
-    %% Telemetry pipeline flows
-    Alloy -->|Scrape Metrics: Port 8000| BotLoop
-    Alloy -->|Push Metrics: Remote Write| CloudProm
-
-    %% Assign styles to subgraph containers
-    style GrafanaCloud fill:#172b22,stroke:#2d5a27,stroke-width:2px;
-    style DigitalOcean fill:#0f1d2e,stroke:#1f3c5c,stroke-width:2px;
-    style External fill:#1f132e,stroke:#3b205c,stroke-width:2px;
-    style DockerContainer fill:#142334,stroke:#264870,stroke-width:1px,stroke-dasharray: 5 5;
-    style DBContainer fill:#142334,stroke:#264870,stroke-width:1px,stroke-dasharray: 5 5;
-    style DBVolume fill:#2c1913,stroke:#5c3520,stroke-width:1px;
+# 4. Run full test suite
+pytest -v
 ```
 
-## Deployment & Infrastructure
+For server provisioning, Docker deployment, and Doppler secret configuration, follow the **[Setup & Operations Guide](docs/SETUP_GUIDE.md)**.
 
-The server infrastructure and security policies are defined using Terraform and hardened using Docker best practices.
-
-### Infrastructure as Code (Terraform)
-The `infra` directory contains configuration to spin up the DigitalOcean Droplet, VPC, and firewalls:
-*   **VPC Isolation:** The Droplet is placed inside a dedicated private network.
-*   **Egress Filtering:** The firewall strictly blocks all outbound ports except `53` (DNS), `443` (HTTPS/WSS to Kalshi and GitHub), and `123` (NTP).
-*   **Inbound Protection:** SSH (Port 22) is restricted to your trusted IP ranges. The metrics port (`8000`) is closed to the public internet.
-
-### Docker Hardening & Security
-The runtime environment is hardened to ensure a secure production footprint:
-*   **Multi-Stage Build:** The Dockerfile compiles all dependencies in a builder container, leaving the final production image clean of compilers like `gcc`.
-*   **Non-Root User:** The container runs under a dedicated, low-privilege system user named `trader`.
-*   **Healthchecks:** Both PostgreSQL and the trading bot utilize Docker container healthchecks to monitor initialization status and API metrics endpoints automatically.
-*   **Local Port Binding:** The Prometheus metrics port is bound strictly to the local loopback interface (`127.0.0.1:8000:8000`), making it inaccessible over the public IP of the Droplet.
-
-### Database Backups
-The project includes an automated backup pipeline for the PostgreSQL database containing order execution history. 
-
-Backups are saved to `/root/backups/kalshi-bot/` on the host, and local backups older than 7 days are automatically pruned to prevent disk bloat.
-
-### DigitalOcean Backups
-In addition to database-level logical backups, daily full-system snapshots are enabled at the cloud provider level in DigitalOcean for the Droplet. This serves as a disaster recovery safety net to restore the entire operating system, code repository, and configuration files in the event of hardware or virtual machine failure.
-
+---
 
 ## Configuration Parameters
 
-The following parameters customize the bot's trading strategy, risk limits, and database connections. They are loaded dynamically on startup from the `.env` file or the system environment:
+The bot loads configuration parameters dynamically from environment variables or Doppler:
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `KALSHI_ENV` | `string` | `prod` | Kalshi environment connection mode (`demo` or `prod`). Defaults to `prod`; `.env.example` intentionally sets `demo` for safer local onboarding. |
-| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g., `KXNFLGAME-26SEP17DETBUF`), league (`NFL`, `NBA`, `MLB`), or category (`SPORTS`). If left empty, defaults to automated in-season sports discovery. |
-| `ORDER_SIZE` | `integer` | `1` | Number of contracts to trade per quote side. |
-| `MIN_SPREAD` | `integer` | `4` | The minimum profit margin spread (in cents) required to quote. |
-| `RISK_GAMMA` | `float` | `0.5` | Inventory risk aversion parameter ($\gamma$). Higher values skew reservation prices faster away from accumulated inventory. |
-| `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Rolling window (days) to constrain automated discovery to near-term weekly game lines. |
-| `DB_HOST` | `string` | `localhost` | Host address of the PostgreSQL database instance. |
-| `DB_PORT` | `integer` | `5432` | Port number of the PostgreSQL database. |
-| `DB_NAME` | `string` | `kalshi_bot` | Name of the database schema. |
-| `DB_USER` | `string` | `postgres` | Username for database authentication. |
-| `DB_PASSWORD` | `string` | `postgres` | Password for database authentication. |
+| `KALSHI_ENV` | `string` | `prod` | Exchange environment (`demo` or `prod`). |
+| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26SEP21NYGLAR-NYG`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
+| `ORDER_SIZE` | `integer` | `1` | Number of contracts to quote per side. |
+| `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
+| `RISK_GAMMA` | `float` | `0.5` | Risk-aversion parameter ($\gamma$) controlling the rate of inventory skewing. |
+| `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Maximum contract expiration window (days) to enforce weekly liquidity and prevent capital lockup. |
+| `DB_HOST` | `string` | `localhost` | PostgreSQL host address (`db` inside Docker Compose). |
+| `DB_PORT` | `integer` | `5432` | PostgreSQL port. |
+| `DB_NAME` | `string` | `kalshi_bot` | PostgreSQL database name. |
+| `DB_USER` | `string` | `postgres` | PostgreSQL username. |
+| `DB_PASSWORD` | `string` | `postgres` | PostgreSQL password. |
 
-### Dynamic Market Discovery & Seasonal Sports Routing
-The bot includes an automated market discovery engine that selects and rotates between active contracts based on real-time orderbook depth and sports seasonality. For full architecture, product suites (Game Lines & Player Props), and month-by-month priority matrices across NFL, NBA, and MLB, see the [SportsSeasonRouter Specification](docs/SPORTS_SEASON_ROUTER.md).
+For the seasonal matrix and series precedence rules, see the **[SportsSeasonRouter Specification](docs/SPORTS_SEASON_ROUTER.md)**.
 
-
-
-## Secrets Management with Doppler
-
-In production, the bot does not store plaintext `.env` configurations or private `.pem` keys on the Droplet host disk. Instead, it utilizes **Doppler** to inject all parameters and keys directly into memory on startup.
-
-### Automated Setup & Deployment
-The installation and configuration of Doppler on the Droplet is **fully automated** via the GitHub Actions CI/CD pipeline. 
-
-To enable this integration, the only Doppler-specific requirement is to register your Service Token in your GitHub Repository Secrets (in addition to your standard server deployment secrets like `DROPLET_IP` and `SSH_PRIVATE_KEY`):
-* Name: **`DOPPLER_TOKEN`**
-* Value: your Doppler production service token (starts with `dp.st.prd.`)
-
-Once the secret is added, pushing to `main` will automatically build the images, verify dependencies, install Doppler on the target server, configure authentication, and launch the bot.
-
+---
 
 ## Live Output Preview
 
@@ -157,6 +98,7 @@ Selected Market: KXNFLGAME-26SEP21NYGLAR-NYG
 2026-09-19 16:21:18,590 - MarketMaker - INFO - >> Replacing ASK: 1 YES @ 27c
 ```
 
+---
 
 ## Production Operations & Risk Notice
 
