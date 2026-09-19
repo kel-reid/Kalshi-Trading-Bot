@@ -738,7 +738,11 @@ def test_discover_filters_markets_exceeding_weekly_horizon():
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
          patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
-        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
         assert selected == "KXNFLGAME-26SEP20-DETBUF"
 
 
@@ -824,7 +828,11 @@ def test_tier_3_catchall_filters_multi_month_futures():
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
          patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
-        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
         assert selected is None
 
 
@@ -857,7 +865,11 @@ def test_targeted_series_fetch_fallback_when_events_misses_series():
     with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
          patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]):
-        selected = discover_active_market(target_preference="NFL", preflight_check=True)
+        selected = discover_active_market(
+            target_preference="NFL",
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
         assert selected == "KXNFLGAME-26SEP20-NEBUF"
 
 
@@ -994,7 +1006,7 @@ def test_targeted_series_fallback_deduplication_and_budget_bounding():
 
 
 def test_config_get_float_env_defensive_parsing():
-    """Verify _get_float_env in config safely falls back on corrupt or non-numeric strings."""
+    """Verify _get_float_env in config safely falls back on corrupt, non-finite, or non-positive strings."""
     import os
     from config import _get_float_env
 
@@ -1008,6 +1020,21 @@ def test_config_get_float_env_defensive_parsing():
         assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
 
     with patch.dict(os.environ, {}, clear=True):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "nan"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "inf"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "-inf"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "0"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "-5.0"}):
         assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 8.0
 
     with patch.dict(os.environ, {"TEST_FLOAT_VAL": "12.5"}):

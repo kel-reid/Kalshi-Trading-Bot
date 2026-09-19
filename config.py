@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -46,14 +47,20 @@ RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.5"))
 MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
 ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
+
+
 def _get_float_env(name: str, default: float) -> float:
     val = os.getenv(name)
     if val is None or not str(val).strip():
         return default
     try:
-        return float(val)
+        f = float(val)
+        if not math.isfinite(f) or f <= 0.0:
+            return default
+        return f
     except (ValueError, TypeError):
         return default
+
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
