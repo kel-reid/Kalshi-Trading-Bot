@@ -1,15 +1,15 @@
-# Setup Guide: Infrastructure, CI/CD & Observability
+# Setup & Operations Guide: Infrastructure, CI/CD, Droplet & Observability
 
-This guide provides complete instructions for provisioning a DigitalOcean Droplet, configuring automated GitHub Actions deployments, and optionally setting up telemetry with Grafana Cloud.
+This guide provides end-to-end instructions for provisioning a DigitalOcean Droplet, configuring automated GitHub Actions deployments via Doppler, running day-to-day Droplet operations, and setting up Grafana Cloud telemetry.
 
-
+---
 
 ## Part 1: Server Provisioning & CI/CD Deployment
 
 ### Step 1: Create the Droplet
 1. Log into the DigitalOcean Dashboard.
 2. Click **Create** > **Droplets**.
-3. **Region**: Choose **New York** (`NYC1` or `NYC3`). Kalshi's API infrastructure is hosted in AWS `us-east-1` (N. Virginia/NYC area); New York hosting minimizes network latency.
+3. **Region**: Choose **New York** (`NYC1` or `NYC3`). Kalshi's API infrastructure is hosted in AWS `us-east-1` (N. Virginia/NYC area); New York hosting minimizes network execution latency.
 4. **OS Image**: Select **Ubuntu** (24.04 LTS or latest).
 5. **Droplet Type**: Basic.
 6. **CPU Options**: Regular ($6/month plan with 1GB RAM is sufficient).
@@ -53,15 +53,64 @@ Trigger the deployment pipeline by pushing code to `main`:
 git push origin main
 ```
 
-The GitHub Actions workflow builds the image, pushes it to GHCR, transfers `docker-compose.yml` to the Droplet, and starts the container via Doppler.
+The GitHub Actions workflow builds the image, pushes it to GHCR, transfers `docker-compose.yml` to the Droplet, installs Doppler if missing, and launches the container stack via `doppler run -- docker compose up -d`.
 
+---
 
+## Part 2: Droplet Runtime Operations & Maintenance
 
-## Part 2: Observability Setup (Grafana Cloud & Alloy) *(Optional)*
+All container management on the server should be done cleanly to avoid evaluating `${DB_PASSWORD}` without Doppler context.
 
-The bot exposes Prometheus metrics locally on port `8000` via [metrics.py](../utils/metrics.py). [Grafana Alloy](https://grafana.com/docs/alloy/latest/) runs as a daemon on the Droplet, scraping port `8000` and pushing data to a hosted Grafana Cloud instance.
+### 1. View Container Execution Logs
+Use direct Docker commands referencing the container name (`kalshi-bot`) to query the Docker daemon directly without parsing `docker-compose.yml`:
 
-### Step 1: Install Grafana Alloy on the Server
+* **Check the selected market and discovery logs:**
+  ```bash
+  docker logs kalshi-bot | grep -i "Selected Market"
+  ```
+* **Stream live execution, order placements, and fills:**
+  ```bash
+  docker logs -f kalshi-bot
+  ```
+* **Inspect the last 100 log lines:**
+  ```bash
+  docker logs --tail=100 kalshi-bot
+  ```
+
+### 2. Container Lifecycle Commands
+* **Restart the trading bot container:**
+  ```bash
+  docker restart kalshi-bot
+  ```
+  *(Or via Doppler: `cd ~/Kalshi-Trading-Bot && doppler run -- docker compose restart bot`)*
+
+* **Stop the bot safely:**
+  ```bash
+  docker stop kalshi-bot
+  ```
+  *(Triggers the synchronous kill switch on SIGTERM before stopping).*
+
+* **Teardown the full stack (Bot + Database):**
+  ```bash
+  cd ~/Kalshi-Trading-Bot && doppler run -- docker compose down
+  ```
+
+### 3. PostgreSQL Database Inspection
+The database container (`kalshi-bot-db`) stores order execution history on a persistent host volume (`postgres_data`).
+
+To inspect database orders directly from the Droplet:
+```bash
+cd ~/Kalshi-Trading-Bot
+doppler run -- docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM orders ORDER BY created_at DESC LIMIT 10;"'
+```
+
+---
+
+## Part 3: Observability Setup & Monitoring (Grafana Cloud & Alloy)
+
+The bot exposes Prometheus metrics locally on loopback port `8000` via [`utils/metrics.py`](../utils/metrics.py). [Grafana Alloy](https://grafana.com/docs/alloy/latest/) runs as a system daemon on the Droplet, scraping port `8000` and streaming telemetry to your hosted Grafana Cloud account.
+
+### Step 1: Install Grafana Alloy on the Droplet
 SSH into the Droplet and install Alloy:
 ```bash
 sudo apt-get update
@@ -75,39 +124,33 @@ sudo apt-get install grafana-alloy
 
 ### Step 2: Configure Alloy Credentials
 1. Copy `alloy.config/config.alloy` to `/etc/alloy/config.alloy`.
-2. Configure your Grafana Cloud Prometheus endpoint and credentials (`url`, `username`, and `password`):
+2. Configure your Grafana Cloud Prometheus remote write credentials:
    - In `/etc/alloy/config.alloy`:
-     - Replace `<your_grafana_cloud_prometheus_remote_write_url>` with your stack's remote-write push URL (found in Grafana Cloud under **Prometheus** -> **Details** / **Send Metrics**, e.g., `https://prometheus-prod-XX-prod-us-east-X.grafana.net/api/prom/push`).
-     - Replace `<your_grafana_cloud_prometheus_username>` with your numeric Prometheus username / Instance ID.
-   - Configure the API key:
-     - **Option A (Systemd Environment File - Recommended):**
-       Add your Grafana Cloud API key to `/etc/default/alloy` (Debian/Ubuntu) or `/etc/sysconfig/alloy` (RHEL/CentOS):
-       ```bash
-       echo 'GRAFANA_API_KEY="<your_grafana_cloud_api_key>"' | sudo tee -a /etc/default/alloy
-       ```
-     - **Option B (Direct in `/etc/alloy/config.alloy`):**
-       Set both your username and password directly in `/etc/alloy/config.alloy`:
-       ```alloy
-       basic_auth {
-         username = "<your_grafana_cloud_prometheus_username>"
-         password = "<your_grafana_cloud_api_key>"
-       }
-       ```
-3. Restart and enable the Alloy service:
+     - Replace `<your_grafana_cloud_prometheus_remote_write_url>` with your stack's remote-write push URL (from Grafana Cloud under **Prometheus** > **Details** / **Send Metrics**, e.g., `https://prometheus-prod-XX-prod-us-east-X.grafana.net/api/prom/push`).
+     - Replace `<your_grafana_cloud_prometheus_username>` with your numeric Prometheus instance ID.
+3. Configure the API key in `/etc/default/alloy`:
+   ```bash
+   echo 'GRAFANA_API_KEY="<your_grafana_cloud_api_key>"' | sudo tee -a /etc/default/alloy
+   ```
+4. Restart and enable Alloy:
    ```bash
    sudo systemctl restart alloy
    sudo systemctl enable alloy
    ```
+5. Verify that Alloy is running and healthy:
+   ```bash
+   sudo systemctl status alloy
+   journalctl -u alloy.service -n 50 --no-pager
+   ```
 
 ### Step 3: Recommended Dashboard Panels in Grafana Cloud
-Create a dashboard in Grafana Cloud with the following Prometheus queries:
+Create a dashboard in Grafana Cloud with the following PromQL queries:
 
 | Panel Title | Metric Query | Visualization | Description |
 | :--- | :--- | :--- | :--- |
-| **Total Orders Placed** | `sum(orders_placed_total)` | Stat | Total limit orders submitted and accepted by the exchange (increments once per accepted order regardless of contract count or fill status). |
-| **Buy Orders Placed** | `sum(orders_placed_total{action="buy"})` | Stat | Total buy orders submitted and accepted (tracks order submissions, not executed contract count or fills). |
-| **Sell Orders Placed** | `sum(orders_placed_total{action="sell"})` | Stat | Total sell orders submitted and accepted (tracks order submissions, not executed contract count or fills). |
-| **Account Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from get_balance() (tracks account cash balance, not net trading P&L). |
-| **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market. |
+| **Total Orders Placed** | `sum(orders_placed_total)` | Stat | Total limit orders submitted and accepted by the exchange. |
+| **Buy Orders Placed** | `sum(orders_placed_total{action="buy"})` | Stat | Total buy orders submitted and accepted. |
+| **Sell Orders Placed** | `sum(orders_placed_total{action="sell"})` | Stat | Total sell orders submitted and accepted. |
+| **Account Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from `get_balance()`. |
+| **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market ($q$). |
 | **Kalshi API Latency** | `rate(kalshi_api_latency_seconds_sum[1m]) / rate(kalshi_api_latency_seconds_count[1m]) * 1000` | Time Series | Rolling REST execution roundtrip latency (ms). |
-

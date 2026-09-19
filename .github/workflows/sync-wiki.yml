@@ -36,7 +36,6 @@ jobs:
           cp docs/ARCHITECTURE_DECISIONS.md wiki/Architecture-Decisions.md
           cp docs/SPORTS_SEASON_ROUTER.md wiki/Sports-Season-Router.md
           cp docs/FEATURE_ROADMAP.md wiki/Feature-Roadmap.md
-          cp docs/DEPLOYMENT_GUIDE.md wiki/Deployment-Guide.md
           cp docs/SETUP_GUIDE.md wiki/Setup-Guide.md
           
           # Copy wiki-specific navigation and home templates if present
