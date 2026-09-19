@@ -32,11 +32,11 @@ jobs:
         run: |
           mkdir -p wiki
           
-          # Copy guides with wiki-friendly naming
-          cp docs/ARCHITECTURE_DECISIONS.md wiki/Architecture-Decisions.md
-          cp docs/SPORTS_SEASON_ROUTER.md wiki/Sports-Season-Router.md
-          cp docs/FEATURE_ROADMAP.md wiki/Feature-Roadmap.md
-          cp docs/SETUP_GUIDE.md wiki/Setup-Guide.md
+          # Copy guides with wiki-friendly naming and numbered sequence
+          cp docs/SETUP_GUIDE.md wiki/1.-Setup-Guide.md
+          cp docs/ARCHITECTURE_DECISIONS.md wiki/2.-Architecture-Decisions.md
+          cp docs/SPORTS_SEASON_ROUTER.md wiki/3.-Sports-Season-Router.md
+          cp docs/FEATURE_ROADMAP.md wiki/4.-Feature-Roadmap.md
           
           # Copy wiki-specific navigation and home templates if present
           if [ -d "docs/wiki" ]; then
