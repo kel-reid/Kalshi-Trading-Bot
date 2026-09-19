@@ -1396,12 +1396,13 @@ def test_legacy_patch_import_attributes_compatibility():
     import sys
     import certifi
     import requests
+    import config
     from utils import market_api as ma
     from utils import market_discovery as md
 
     # 1. Imports from utils.market_discovery
     from utils.market_discovery import BASE_URL as MD_BASE_URL, requests as md_requests, certifi as md_certifi
-    assert MD_BASE_URL == "https://api.elections.kalshi.com"
+    assert MD_BASE_URL == config.BASE_URL
     assert md_requests is requests
     assert md_certifi is certifi
     assert "BASE_URL" in md.__all__
@@ -1446,7 +1447,7 @@ def test_legacy_patch_import_attributes_compatibility():
     # 5. Standalone fallbacks when utils.market_discovery is not in sys.modules
     saved_md = sys.modules.pop("utils.market_discovery", None)
     try:
-        assert ma._get_base_url() == "https://api.elections.kalshi.com"
+        assert ma._get_base_url() == config.BASE_URL
         assert ma._get_requests() is requests
         assert ma._get_certifi() is certifi
     finally:
