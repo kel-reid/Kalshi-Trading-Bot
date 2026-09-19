@@ -109,6 +109,8 @@ def discover_active_market(
     if max_expiration_days is None:
         max_expiration_days = float(MAX_EXPIRATION_DAYS)
 
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
     # 1. Fetch eligible markets ONCE and filter in memory to protect REST rate limits
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
@@ -194,7 +196,7 @@ def discover_active_market(
         nonlocal tradeable_markets
         filtered = [
             m for m in _markets_for_series(tradeable_markets, series)
-            if _is_within_horizon(m, max_expiration_days)
+            if _is_within_horizon(m, max_expiration_days, now_utc)
         ]
         if filtered:
             return filtered
@@ -226,12 +228,12 @@ def discover_active_market(
                     m for m in targeted
                     if m.get("ticker") not in exclude
                     and m.get("ticker") not in known_tickers
-                    and _is_within_horizon(m, max_expiration_days)
+                    and _is_within_horizon(m, max_expiration_days, now_utc)
                 ]
                 tradeable_markets.extend(new_items)
                 return [
                     m for m in _markets_for_series(tradeable_markets, series)
-                    if _is_within_horizon(m, max_expiration_days)
+                    if _is_within_horizon(m, max_expiration_days, now_utc)
                 ]
         except Exception as e_err:
             logger.debug(f"Targeted series fetch for {series} failed: {e_err}")
@@ -326,7 +328,7 @@ def discover_active_market(
                 )
                 and m.get("series_ticker", "").upper() not in all_configured_series
                 and not any(str(m.get("ticker", "")).upper().startswith(f"{s}-") for s in all_configured_series)
-                and _is_within_horizon(m, max_expiration_days)
+                and _is_within_horizon(m, max_expiration_days, now_utc)
             ]
             if league_markets:
                 selected = _select_best_market(

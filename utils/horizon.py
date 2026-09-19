@@ -52,7 +52,10 @@ def _is_within_horizon(
         return False
 
     if now_utc is None:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        import sys
+        md = sys.modules.get("utils.market_discovery")
+        dt_module = getattr(md, "datetime", datetime) if md else datetime
+        now_utc = dt_module.datetime.now(datetime.timezone.utc)
 
     days_remaining = (close_dt - now_utc).total_seconds() / 86400.0
     return 0.0 <= days_remaining <= max_days
