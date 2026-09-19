@@ -34,7 +34,7 @@ jobs:
           
           # Copy guides with wiki-friendly naming and numbered sequence
           cp docs/SETUP_GUIDE.md wiki/1.-Setup-Guide.md
-          cp docs/ARCHITECTURE_DECISIONS.md wiki/2.-Architecture-Decisions.md
+          cp docs/ARCHITECTURE_DECISIONS.md wiki/2.-Architecture-Decisions.md || cp docs/architecture_decisions.md wiki/2.-Architecture-Decisions.md
           cp docs/SPORTS_SEASON_ROUTER.md wiki/3.-Sports-Season-Router.md
           cp docs/FEATURE_ROADMAP.md wiki/4.-Feature-Roadmap.md
           
