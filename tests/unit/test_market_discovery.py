@@ -1208,6 +1208,136 @@ def test_discover_non_sports_keyword_bypasses_horizon_filter():
         assert selected == "KXFED-26NOV-CUT25"
 
 
+def test_parse_float_handles_type_and_value_errors():
+    """Verify _parse_float handles invalid types and non-numeric strings."""
+    from utils.horizon import _parse_float
+    assert _parse_float("not_a_number") == 0.0
+    assert _parse_float({}) == 0.0
+    assert _parse_float([1, 2, 3]) == 0.0
+
+
+def test_market_scoring_missing_coverage_branches():
+    """Verify market scoring fallback checker, horizon brackets, empty candidates, and empty tickers."""
+    import sys
+    from utils.market_scoring import _liquidity_key, _select_best_market, _get_orderbook_checker
+
+    # 1. Test _get_orderbook_checker fallback when utils.market_discovery is not in sys.modules
+    saved_md = sys.modules.pop("utils.market_discovery", None)
+    try:
+        checker = _get_orderbook_checker()
+        assert callable(checker)
+    finally:
+        if saved_md is not None:
+            sys.modules["utils.market_discovery"] = saved_md
+
+    # 2. Test _liquidity_key horizon brackets (10d -> 2.0x, 25d -> 1.5x, 100d -> 0.5x)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    m_10d = {"ticker": "KXNFL-10D", "close_time": (now + datetime.timedelta(days=10)).isoformat(), "volume_fp": "100.0"}
+    m_25d = {"ticker": "KXNFL-25D", "close_time": (now + datetime.timedelta(days=25)).isoformat(), "volume_fp": "100.0"}
+    m_100d = {"ticker": "KXNFL-100D", "close_time": (now + datetime.timedelta(days=100)).isoformat(), "volume_fp": "100.0"}
+    assert _liquidity_key(m_10d) > _liquidity_key(m_25d) > _liquidity_key(m_100d)
+
+    # 3. Empty candidates returns None
+    assert _select_best_market([]) is None
+
+    # 4. Exhausted budget returns None
+    assert _select_best_market([{"ticker": "T1"}], budget_tracker={"remaining": 0}) is None
+
+    # 5. Candidate with empty ticker is skipped
+    with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        res = _select_best_market([{"ticker": ""}, {"ticker": "VALID"}], preflight_check=True)
+        assert res == "VALID"
+
+
+def test_market_api_missing_coverage_branches():
+    """Verify market API series filtering, non-200 responses, observed statuses warning, and errors."""
+    from utils.market_api import fetch_eligible_markets, check_market_status
+
+    # 1. /events query with series_ticker
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "events": [{"markets": [{"ticker": "KXNFLGAME-1", "status": "open"}]}]
+        }
+        mock_get.return_value = mock_resp
+        res = fetch_eligible_markets(series_ticker="KXNFLGAME")
+        assert len(res) == 1
+        assert res[0]["ticker"] == "KXNFLGAME-1"
+
+    # 2. Non-200 on /events falling back to /markets with series_ticker
+    with patch("requests.get") as mock_get:
+        resp_err = MagicMock()
+        resp_err.status_code = 500
+        resp_err.text = "Internal error"
+        resp_fallback = MagicMock()
+        resp_fallback.status_code = 200
+        resp_fallback.json.return_value = {"markets": [{"ticker": "KXNFLGAME-FALLBACK", "status": "open"}]}
+        mock_get.side_effect = [resp_err, resp_fallback]
+        res = fetch_eligible_markets(series_ticker="KXNFLGAME")
+        assert len(res) == 1
+        assert res[0]["ticker"] == "KXNFLGAME-FALLBACK"
+
+    # 3. All returned markets filtered out triggers observed statuses warning
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": [{"ticker": "KX-CLOSED", "status": "closed"}]}
+        mock_get.return_value = mock_resp
+        res = fetch_eligible_markets()
+        assert res == []
+
+    # 4. Top-level exception in fetch_eligible_markets returns []
+    with patch("requests.get", side_effect=RuntimeError("Fatal error")):
+        assert fetch_eligible_markets() == []
+
+    # 5. Non-200 in check_market_status returns None
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+        assert check_market_status("INVALID") is None
+
+
+def test_market_discovery_missing_coverage_branches():
+    """Verify tradeable market absence, NBA preferences, non-preflight exact matches, and tier 2 budget exhaustion."""
+    # 1. No tradeable markets available returns None
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=[]):
+        assert discover_active_market() is None
+
+    # 2. Target preference for NBA
+    mock_nba = [{"ticker": "KXNBAGAME-1", "series_ticker": "KXNBAGAME", "status": "open", "volume_fp": "100.0"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_nba), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        res = discover_active_market(target_preference="NBA")
+        assert res == "KXNBAGAME-1"
+
+    # 3. Exact match with preflight_check=False
+    mock_exact = [{"ticker": "KXNFL-SPECIFIC", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_exact):
+        res = discover_active_market(target_preference="KXNFL-SPECIFIC", preflight_check=False)
+        assert res == "KXNFL-SPECIFIC"
+
+    # 4. Excluded exact NBA and MLB target routes to league suite
+    dummy_pool = [{"ticker": "KXOTHER-1", "status": "open"}]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=dummy_pool), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False):
+        assert discover_active_market(target_preference="KXNBAGAME-EX", exclude_tickers=["KXNBAGAME-EX"]) is None
+        assert discover_active_market(target_preference="KXMLBGAME-EX", exclude_tickers=["KXMLBGAME-EX"]) is None
+
+    # 5. Exhausted probes inside Tier 2 props inner loop breaks
+    mock_props = [
+        {"ticker": "KXNFLTD-1", "series_ticker": "KXNFLTD", "status": "open", "volume_fp": "10.0"},
+        {"ticker": "KXNFLPASSYDS-1", "series_ticker": "KXNFLPASSYDS", "status": "open", "volume_fp": "10.0"},
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_props), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False):
+        res = discover_active_market(target_preference="SPORTS", max_total_probes=4)
+        assert res is None
+
+
+
 
 
 
