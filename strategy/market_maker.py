@@ -245,7 +245,7 @@ class AvellanedaStoikovBot:
         else:
             if self._starvation_alert_sent:
                 logger.info(f"Orderbook liquidity restored for {self.ticker}.")
-                await send_alert(f"✅ Orderbook Restored: Two-sided liquidity detected for {self.ticker}.")
+                await send_alert(f"Orderbook Restored: Two-sided liquidity detected for {self.ticker}.")
             self._starvation_start_time = None
             self._starvation_alert_sent = False
 
@@ -420,7 +420,7 @@ class AvellanedaStoikovBot:
         self._market_inactive = False
 
         logger.info(f"Market rotation complete. Now trading {new_ticker}.")
-        await send_alert(f"🔄 Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
+        await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
 
     async def stop(self):
