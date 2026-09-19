@@ -554,10 +554,10 @@ def discover_active_market(
                 return exact_ticker
 
         # 3. Category or keyword match (for explicit non-sports target preference)
+        # Operators explicitly targeting a non-sports category (e.g. INX, FED, CPI) are not constrained by sports horizon.
         matched = [
             m for m in tradeable_markets
             if pref in _text_for_market(m)
-            and _is_within_horizon(m, max_expiration_days)
         ]
         if matched:
             selected = _select_best_market(

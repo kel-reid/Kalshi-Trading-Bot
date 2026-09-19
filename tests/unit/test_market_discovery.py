@@ -1181,6 +1181,34 @@ def test_targeted_fallbacks_allowed_when_preflight_disabled_and_probes_zero():
         assert selected is None
 
 
+def test_discover_non_sports_keyword_bypasses_horizon_filter():
+    """
+    Verify that non-sports keyword targeting (e.g. FED, CPI, INX) matches and selects
+    legitimate contracts expiring beyond the sports weekly horizon.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    distant_close = (now + datetime.timedelta(days=45)).isoformat()
+
+    mock_markets = [
+        {
+            "ticker": "KXFED-26NOV-CUT25",
+            "title": "Federal Reserve Interest Rate Decision November 2026",
+            "status": "open",
+            "close_time": distant_close,
+            "volume_fp": "250000.00",
+        },
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        selected = discover_active_market(
+            target_preference="FED",
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
+        assert selected == "KXFED-26NOV-CUT25"
+
+
+
 
 
 
