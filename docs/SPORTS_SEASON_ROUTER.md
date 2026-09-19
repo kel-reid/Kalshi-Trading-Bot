@@ -8,7 +8,7 @@ Rather than remaining pinned to a single league or suffering orderbook starvatio
 
 ## 1. Supported Leagues & Full Product Suites
 
-The router supports the three dominant liquidity drivers on Kalshi: **NFL**, **NBA**, and **MLB**. 
+The router supports the three dominant liquidity drivers on Kalshi: **NFL**, **NBA**, and **MLB**.
 
 Low-liquidity leagues and off-market sports are permanently excluded from automated routing to prevent the bot from becoming trapped in wide-spread or one-sided orderbooks.
 
@@ -52,11 +52,11 @@ The router inspects the current UTC month to determine active league priorities:
 flowchart TD
     Start([Market Discovery Request]) --> FetchMarkets[Fetch Eligible Markets Once via REST<br>fetch_eligible_markets]
     FetchMarkets --> RouteCheck{User Specified<br>Target Preference?}
-    
+
     RouteCheck -- "Exact Ticker (e.g. KXNFLGAME-...)" --> ExactCheck{Active Exact<br>Match Found?}
     ExactCheck -- "Yes & Has Quotes" --> SelectedMarket([Selected Market Locked In])
     ExactCheck -- "Excluded / Settled / Starved" --> DetectLeague[Route to League Suite e.g. KXNFL->NFL<br>or Seasonal Fallback]
-    
+
     RouteCheck -- "Specific League (e.g. NBA)" --> ManualOverride[Set Target League: e.g. NBA]
     RouteCheck -- "Default / SPORTS / None" --> Router[SportsSeasonRouter.get_in_season_leagues]
 
@@ -67,15 +67,15 @@ flowchart TD
 
     Matrix --> NextTier{Next Tier in<br>Waterfall?}
     NextTier -- Yes --> FilterSeries[Filter In-Memory Markets for Series<br>Tier 1A Moneylines -> 1B Spreads/Totals -> Tier 2 Props]
-    
+
     FilterSeries --> HasCandidates{Active Candidates<br>Found?}
     HasCandidates -- No --> NextTier
-    
+
     HasCandidates -- Yes --> ExcludeIneligible[Exclude Synthetic KXMVE & Excluded Tickers]
     ExcludeIneligible --> HorizonRank[Rank Candidates by Liquidity<br>+ Expiration Horizon Multiplier]
-    
+
     HorizonRank --> PreFlight[Pre-Flight Orderbook Verification<br>Probe up to 2 Candidates per Series<br>10 Probes Total Budget]
-    
+
     PreFlight --> HasTwoSidedQuotes{Two-Sided Quotes<br>Confirmed?}
     HasTwoSidedQuotes -- Yes --> SelectedMarket
     HasTwoSidedQuotes -- No --> NextTier

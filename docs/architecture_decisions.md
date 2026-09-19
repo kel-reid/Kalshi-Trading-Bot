@@ -4,8 +4,9 @@ This document records the critical architectural decisions made in the developme
 
 
 ## Algorithmic Quoting & Inventory Skewing
+
 ### Problem
-Prediction market contracts (specifically Kalshi's binary YES/NO contracts) resolve to either $0.00$ or $1.00$ at expiration. A market maker providing dual-sided liquidity (resting bids and asks) faces significant **inventory risk**. If the bot accumulates a large net-long YES position and the market moves against it, it faces catastrophic losses. 
+Prediction market contracts (specifically Kalshi's binary YES/NO contracts) resolve to either $0.00$ or $1.00$ at expiration. A market maker providing dual-sided liquidity (resting bids and asks) faces significant **inventory risk**. If the bot accumulates a large net-long YES position and the market moves against it, it faces catastrophic losses.
 
 ### Solution
 The bot implements a simplified **Avellaneda-Stoikov (A-S) Pricing Model**.
@@ -17,6 +18,7 @@ The bot implements a simplified **Avellaneda-Stoikov (A-S) Pricing Model**.
 
 
 ## Infrastructure: Single Host (DigitalOcean Droplet + Docker Compose)
+
 ### Problem
 A 24/7 trading bot requires reliable, cheap, and low-latency virtual compute. Orchestrating a full Kubernetes cluster or serverless configuration (like AWS ECS or GCP Cloud Run) introduces substantial networking overhead, cost, and complexity that is unnecessary for a single market-making stream.
 
@@ -27,6 +29,7 @@ A single **DigitalOcean Droplet** provisioned via Terraform and managed via **Do
 
 
 ## Persistent Storage: PostgreSQL Container
+
 ### Problem
 Trading bots generate transaction logs, order ID mapping states, fill records, and historical PnL logs. Storing this information in memory risks total data loss if the bot crashes. Storing it in flat files (like JSON or CSV) introduces file-locking and serialization limits.
 
@@ -37,6 +40,7 @@ A **PostgreSQL** database runs inside a container co-located with the bot.
 
 
 ## Secrets Management: Doppler
+
 ### Problem
 Algorithmic trading requires highly sensitive credentials (Kalshi API keys, private RSA keys to sign API requests, and Droplet deployment credentials). Storing these in `.env` files on disk, or committing dummy `.pem` private keys to version control, represents a massive security risk.
 
@@ -47,6 +51,7 @@ Algorithmic trading requires highly sensitive credentials (Kalshi API keys, priv
 
 
 ## Network Architecture: VPC & Strict Egress Filtering
+
 ### Problem
 If a trading bot VM or a third-party Python package gets compromised, attackers could attempt to scan the database, scan the private network, or exfiltrate private credentials via remote network calls.
 
@@ -62,6 +67,7 @@ A strict networking model is enforced in [main.tf](../infra/main.tf):
 
 
 ## Observability: Grafana Alloy & Grafana Cloud
+
 ### Problem
 Continuous 24/7 trading requires continuous verification. Developers need to know if the bot is experiencing elevated API latencies, losing money, or throwing rate-limiting exceptions.
 
@@ -73,6 +79,7 @@ Observability utilizes a decentralized scraping system:
 
 
 ## Concurrency Model: Python Asyncio
+
 ### Problem
 Trading bots must execute multiple tasks simultaneously: listening to millisecond-level WebSocket feeds (order books, execution fills), running strategy ticks, making HTTP REST requests (placing and canceling orders), and running background maintenance loops. Doing this synchronously would block execution and cause quotes to be outdated.
 
@@ -84,6 +91,7 @@ The bot is designed entirely around **Python Asyncio**.
 
 
 ## Operational Resiliency: State Reconciliation & Graceful Shutdowns
+
 ### Problem
 Network sockets drop packets, and API connections crash. If the bot crashes or misses a WebSocket "fill" event, its local representation of its balance or inventory drifts, which could lead to incorrect pricing skew calculations. If the bot terminates suddenly, resting limit orders might remain on the Kalshi exchange book, leaving exposure open.
 
@@ -95,6 +103,7 @@ Two primary safety patterns govern operational resiliency:
 
 
 ## Market Discovery: Dynamic Seasonal Sports Routing & v2 Liquidity
+
 ### Problem
 Production telemetry revealed that market discovery previously targeted distant multi-year future props (e.g. `KXNFLENDSTREAK-40NYJ-2627`) that carried cumulative historical volume but had zero active resting bids/asks. This caused the bot's quoting loop to starve in an idle state. Concurrently, Kalshi's v2 REST and WebSocket APIs deliver quotes and volume as string floats (`volume_fp`, `yes_bid_dollars`, `yes_dollars_fp`), which evaluated to 0 under legacy integer parsers. Furthermore, during sports off-seasons or midweek schedule lulls (e.g. NFL Tuesdays), the bot lacked a mechanism to pivot to active leagues.
 
