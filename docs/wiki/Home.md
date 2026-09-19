@@ -81,7 +81,7 @@ graph TD
      $$R = \text{MidPrice} - (q \times \gamma)$$
    - Places quotes symmetrically around reservation price:
      $$\text{Bid} = R - \frac{\text{Spread}}{2}, \quad \text{Ask} = R + \frac{\text{Spread}}{2}$$
-   - Enforces active inventory hedging thresholds ($\pm 5$ contracts) to aggressively cross the spread and de-risk.
+   - Enforces active inventory hedging thresholds (+/- 5 contracts) to aggressively cross the spread and de-risk.
 
 3. **Infrastructure & Observability**:
    - Hardened DigitalOcean Droplet managed via Terraform and Docker Compose.

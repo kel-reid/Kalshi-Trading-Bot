@@ -3,7 +3,7 @@
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
 
-> 📚 **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
+> **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
 
 ---
 
@@ -12,9 +12,9 @@
 This project is a production-grade algorithmic market-making trading bot built for the **Kalshi** prediction market exchange. It continuously provides dual-sided liquidity (bids and asks) using an asynchronous **Avellaneda-Stoikov** pricing model to capture the bid-ask spread while actively hedging inventory exposure.
 
 ### Key Capabilities
-* **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory ($q$) and risk aversion ($\gamma$).
-* **Active Inventory Hedging:** Halts adverse quoting and aggressively crosses the spread when inventory crosses $\pm 5$ contracts.
-* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds ($\le 8$ days).
+* **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory (`q`) and the risk aversion parameter (`gamma`).
+* **Active Inventory Hedging:** Halts adverse quoting and aggressively crosses the spread when inventory reaches +/- 5 contracts.
+* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
 * **Zero-Downtime Telemetry:** Emits real-time Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
 
 ---
@@ -27,7 +27,7 @@ The trading bot executes as an asynchronous event-driven system on a hardened Di
 * **Observability:** Telemetry scraped on loopback port `8000` via Grafana Alloy daemon and streamed to Grafana Cloud.
 * **Security:** Cryptographic RSA request signing and in-memory secret injection via Doppler.
 
-👉 **For the complete interactive system architecture diagram and component workflows, see the [Wiki: System Architecture](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture).**
+**For the complete interactive system architecture diagram and component workflows, see the [Wiki: System Architecture](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture).**
 
 ---
 
