@@ -42,6 +42,7 @@ The bot persists order lifecycle records in PostgreSQL and manages inventory exp
    - Account for exchange taker/maker fees where applicable.
 2. **Database Persistence**:
    - Add a `trades` or `pnl_snapshots` table in PostgreSQL capturing per-market execution history:
+
      ```sql
      CREATE TABLE pnl_attribution (
          id SERIAL PRIMARY KEY,

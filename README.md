@@ -38,6 +38,7 @@ The trading bot executes as an asynchronous event-driven system on a hardened Di
 * Git
 
 ### Setup & Testing
+
 ```bash
 # 1. Clone the repository
 git clone git@github.com:kel-reid/Kalshi-Trading-Bot.git
@@ -68,7 +69,7 @@ The bot loads configuration parameters dynamically from environment variables or
 | `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26SEP21NYGLAR-NYG`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to quote per side. |
 | `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
-| `RISK_GAMMA` | `float` | `0.5` | Risk-aversion parameter ($\gamma$) controlling the rate of inventory skewing. |
+| `RISK_GAMMA` | `float` | `0.5` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
 | `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Maximum contract expiration window (days) to enforce weekly liquidity and prevent capital lockup. |
 | `DB_HOST` | `string` | `localhost` | PostgreSQL host address (`db` inside Docker Compose). |
 | `DB_PORT` | `integer` | `5432` | PostgreSQL port. |
