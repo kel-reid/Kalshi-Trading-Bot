@@ -1337,6 +1337,39 @@ def test_market_discovery_missing_coverage_branches():
         assert res is None
 
 
+@pytest.mark.asyncio
+async def test_is_market_active_honors_check_market_status_override():
+    """Verify is_market_active and is_market_active_async consult check_market_status on market_discovery."""
+    import sys
+    from utils.market_discovery import is_market_active, is_market_active_async
+    import utils.market_api as ma
+
+    with patch("utils.market_discovery.check_market_status", return_value="closed") as mock_check:
+        # Direct sync call from utils.market_discovery
+        assert is_market_active("MOCK-TEST") is False
+        # Sync call through utils.market_api
+        assert ma.is_market_active("MOCK-TEST") is False
+        # Async call from utils.market_discovery
+        assert await is_market_active_async("MOCK-TEST") is False
+        assert mock_check.call_count == 3
+
+    # Test status is None branch
+    with patch("utils.market_discovery.check_market_status", return_value=None):
+        assert is_market_active("MOCK-TEST") is None
+        assert ma.is_market_active("MOCK-TEST") is None
+
+    # Test standalone fallback when utils.market_discovery is temporarily not in sys.modules
+    saved_md = sys.modules.pop("utils.market_discovery", None)
+    try:
+        checker = ma._get_market_status_checker()
+        assert callable(checker)
+    finally:
+        if saved_md is not None:
+            sys.modules["utils.market_discovery"] = saved_md
+
+
+
+
 
 
 
