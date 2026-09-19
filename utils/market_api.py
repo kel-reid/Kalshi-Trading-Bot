@@ -207,9 +207,20 @@ def check_market_status(ticker: str) -> Optional[str]:
         return None
 
 
+def _get_market_status_checker() -> Any:
+    """Retrieve check_market_status function, honoring any mock in utils.market_discovery."""
+    import sys
+    md = sys.modules.get("utils.market_discovery")
+    if md is not None and hasattr(md, "check_market_status"):
+        return getattr(md, "check_market_status")
+    return check_market_status
+
+
 def is_market_active(ticker: str) -> Optional[bool]:
     """Return True/False for confirmed market status, or None if the status could not be determined."""
-    status = check_market_status(ticker)
+    checker = _get_market_status_checker()
+    status = checker(ticker)
     if status is None:
         return None
     return status in ("open", "active")
+

@@ -31,7 +31,6 @@ from utils.market_api import (
     check_market_status,
     check_orderbook_has_quotes,
     fetch_eligible_markets,
-    is_market_active,
 )
 from utils.market_scoring import (
     DEFAULT_MAX_PROBES_PER_SERIES,
@@ -344,9 +343,18 @@ def discover_active_market(
     return None
 
 
+def is_market_active(ticker: str) -> Optional[bool]:
+    """Return True/False for confirmed market status, or None if the status could not be determined."""
+    status = check_market_status(ticker)
+    if status is None:
+        return None
+    return status in ("open", "active")
+
+
 # ============================================================================
 # Async Wrappers
 # ============================================================================
+
 
 async def discover_active_market_async(
     target_preference: str = "",
