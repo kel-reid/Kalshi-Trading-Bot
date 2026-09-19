@@ -497,8 +497,12 @@ def discover_active_market(
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
     budget_tracker: Dict[str, int] = {
-        "remaining": max_total_probes,
-        "targeted_fallbacks_remaining": min(max_targeted_series_fallbacks, max_total_probes),
+        "remaining": max(0, max_total_probes),
+        "targeted_fallbacks_remaining": (
+            max(0, min(max_targeted_series_fallbacks, max_total_probes))
+            if preflight_check
+            else max(0, max_targeted_series_fallbacks)
+        ),
     }
     if max_expiration_days is None:
         max_expiration_days = float(MAX_EXPIRATION_DAYS)
@@ -597,12 +601,15 @@ def discover_active_market(
         if series_key in queried_series:
             return []
 
-        # Bound targeted series queries under the shared probe budget and fallback limit
-        if budget_tracker["remaining"] <= 0 or budget_tracker["targeted_fallbacks_remaining"] <= 0:
+        # Bound targeted series queries under the shared probe budget (if probing) and fallback limit
+        if budget_tracker["targeted_fallbacks_remaining"] <= 0 or (
+            preflight_check and budget_tracker["remaining"] <= 0
+        ):
             logger.info(f"Probe budget exhausted or targeted fallback limit reached; skipping fallback fetch for series: {series}")
             return []
 
-        budget_tracker["remaining"] -= 1
+        if preflight_check:
+            budget_tracker["remaining"] -= 1
         budget_tracker["targeted_fallbacks_remaining"] -= 1
         queried_series.add(series_key)
 
