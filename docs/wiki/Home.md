@@ -6,17 +6,6 @@ This system provides continuous dual-sided liquidity (bids and asks) on the Kals
 
 ---
 
-## Documentation Directory
-
-| Guide | Description |
-| :--- | :--- |
-| **[[Architecture-Decisions\|Architecture Decisions]]** | In-depth Architectural Decision Records (ADRs) covering pricing math, storage, secrets, and concurrency. |
-| **[[Sports-Season-Router\|Sports Season Router]]** | Annual sports priority matrix (NFL, NBA, MLB), weekly contract horizon constraints, and preflight quote verification. |
-| **[[Feature-Roadmap\|Feature Roadmap]]** | Prioritized 5-phase engineering roadmap following the **Measure $\to$ Protect $\to$ Optimize $\to$ Scale** lifecycle. |
-| **[[Setup-Guide\|Setup & Operations Guide]]** | Complete server provisioning, Doppler secrets, droplet runtime commands, and Grafana Cloud observability. |
-
----
-
 ## System Architecture
 
 ```mermaid
