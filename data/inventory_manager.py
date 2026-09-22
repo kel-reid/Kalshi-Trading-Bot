@@ -10,13 +10,22 @@ import logging
 import requests
 import asyncio
 import certifi
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Provide required imports from our new module
 
 from config import BASE_URL
 from auth.kalshi_auth import get_auth_headers
-from utils.metrics import measure_latency
+from utils.metrics import (
+    measure_latency,
+    BOT_PNL_CENTS,
+    BOT_INVENTORY_NET_POSITION,
+    KALSHI_REALIZED_PNL_CENTS,
+    KALSHI_UNREALIZED_PNL_CENTS,
+    KALSHI_FEES_PAID_CENTS,
+    KALSHI_ROUND_TRIPS_TOTAL
+)
+from data.pnl_tracker import PnLTracker
 
 logger = logging.getLogger("InventoryManager")
 
@@ -24,13 +33,15 @@ class InventoryManager:
     """
     Maintains real-time tracking of current position sizes and USD balance.
     Hydrates initial state via REST and updates via WebSocket 'fill' events.
+    Integrates PnLTracker for FIFO trade matching and mark-to-market accounting.
     """
-    def __init__(self, ws_client):
+    def __init__(self, ws_client, pnl_tracker: Optional[PnLTracker] = None):
         self.ws_client = ws_client
         self.balance_cents: int = 0
         # self.positions[ticker] = position_size (positive means net 'yes', negative means net 'no' or just track absolute shares)
         # Kalshi usually tracks 'position' as an integer of contracts.
         self.positions: Dict[str, int] = {}
+        self.pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
         
         self.ws_client.add_message_handler(self._handle_message)
 
@@ -147,7 +158,59 @@ class InventoryManager:
         current_pos = self.positions.get(ticker, 0)
         self.positions[ticker] = current_pos + delta
         
-        logger.info(f"Fill processed for {ticker}: {action} {count} {side} @ {price}c. New Net Pos: {self.positions[ticker]}.")
+        # Track Realized and Unrealized PnL via FIFO lot matching
+        fee = float(fill_msg.get("fee_cents", fill_msg.get("fee", 0.0)))
+        pnl_impact = self.pnl_tracker.record_fill(
+            ticker=ticker,
+            action=action,
+            side=side,
+            count=count,
+            price_cents=price,
+            fee_cents=fee
+        )
+
+        # Update Prometheus metrics
+        try:
+            BOT_INVENTORY_NET_POSITION.labels(ticker=ticker).set(self.positions[ticker])
+            BOT_PNL_CENTS.labels(ticker=ticker).set(self.balance_cents)
+            KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_realized_pnl(ticker))
+            KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
+
+            if pnl_impact.get("matched_contracts", 0) > 0:
+                delta_pnl = pnl_impact.get("realized_delta_cents", 0.0)
+                outcome = "profit" if delta_pnl > 0.0001 else ("loss" if delta_pnl < -0.0001 else "scratch")
+                KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
+        except Exception as e:
+            logger.debug(f"Prometheus metric update skipped: {e}")
+
+        logger.info(
+            f"Fill processed for {ticker}: {action} {count} {side} @ {price}c. "
+            f"New Net Pos: {self.positions[ticker]} | Realized PnL: {self.pnl_tracker.get_realized_pnl(ticker):+.2f}c."
+        )
+
+    def update_orderbook_mid(self, ticker: str, mid_price: float) -> float:
+        """
+        Updates mark-to-market unrealized PnL against current mid price
+        and emits Prometheus telemetry.
+        """
+        unrealized = self.pnl_tracker.update_mid_price(ticker, mid_price)
+        try:
+            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(unrealized)
+        except Exception as e:
+            logger.debug(f"Prometheus unrealized metric update skipped: {e}")
+        return unrealized
+
+    def get_realized_pnl(self, ticker: str) -> float:
+        """Returns cumulative realized PnL in cents for a ticker."""
+        return self.pnl_tracker.get_realized_pnl(ticker)
+
+    def get_unrealized_pnl(self, ticker: str) -> float:
+        """Returns current unrealized mark-to-market PnL in cents for a ticker."""
+        return self.pnl_tracker.get_unrealized_pnl(ticker)
+
+    def get_pnl_summary(self, ticker: str) -> Dict[str, Any]:
+        """Returns a comprehensive PnL and trade attribution summary."""
+        return self.pnl_tracker.get_market_summary(ticker)
 
     def get_position(self, ticker: str) -> int:
         return self.positions.get(ticker, 0)

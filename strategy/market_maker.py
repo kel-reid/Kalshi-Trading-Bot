@@ -84,6 +84,10 @@ class AvellanedaStoikovBot:
         self._last_inactive_retry: float = 0.0
         self._inactive_retry_interval: float = 5.0
 
+        # Periodic PnL snapshot tracking
+        self._last_pnl_snapshot: float = time.time()
+        self._pnl_snapshot_interval: float = 60.0
+
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
         logger.info(f"Starting Market Maker for {self.ticker}")
@@ -137,6 +141,21 @@ class AvellanedaStoikovBot:
         
         balance = self.inv_manager.get_balance()
         BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
+
+        # Periodic PnL snapshot persistence to PostgreSQL (every 60s)
+        if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
+            self._last_pnl_snapshot = now
+            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+            asyncio.create_task(
+                self.om.record_pnl_snapshot_async(
+                    ticker=self.ticker,
+                    realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                    unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                    total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                    inventory=inventory,
+                    rotation_session_id=pnl_summary.get("rotation_session_id", "")
+                )
+            )
 
         # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
         if self._market_inactive:
@@ -255,14 +274,17 @@ class AvellanedaStoikovBot:
             # 1. Calculate Mid Price
             mid_price = (bid_price + ask_price) / 2.0
         
-        # 2. Get Inventory
+        # 2. Mark open inventory to market against current mid price
+        self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
+
+        # 3. Get Inventory
         # Convention: positive inventory = holding net YES
         
-        # 3. Calculate Reservation Price (R)
+        # 4. Calculate Reservation Price (R)
         # R = M - (q * gamma)
         reservation_price = mid_price - (inventory * self.gamma)
         
-        # 4. Calculate Optimal Bid/Ask
+        # 5. Calculate Optimal Bid/Ask
         optimal_bid = math.floor(reservation_price - (self.min_spread / 2.0))
         optimal_ask = math.ceil(reservation_price + (self.min_spread / 2.0))
         
@@ -288,16 +310,20 @@ class AvellanedaStoikovBot:
             if best_ask:
                 optimal_bid = max(1, min(best_ask[0], 98)) # Match the best ask to fill immediately
 
+        realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+        unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
         if optimal_bid is not None and optimal_ask is not None:
             logger.info(
                 f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | Gamma={self.gamma} | "
                 f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
-                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c"
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
+                f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
         else:
             logger.info(
                 f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | "
-                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged)"
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged) | "
+                f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
             
         # 5. Execute Output
@@ -402,6 +428,20 @@ class AvellanedaStoikovBot:
 
         logger.warning(f"Rotating target market from {old_ticker} to {new_ticker}...")
 
+        # Persist final PnL attribution snapshot for the market being rotated out
+        try:
+            pnl_summary = self.inv_manager.get_pnl_summary(old_ticker)
+            await self.om.record_pnl_snapshot_async(
+                ticker=old_ticker,
+                realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                inventory=self.inv_manager.get_position(old_ticker),
+                rotation_session_id=pnl_summary.get("rotation_session_id", "")
+            )
+        except Exception as e:
+            logger.error(f"Failed to record rotation PnL snapshot for {old_ticker}: {e}")
+
         # 1. Withdraw all active quotes on the previous ticker
         if not await self._cancel_all_quotes():
             logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
@@ -419,10 +459,25 @@ class AvellanedaStoikovBot:
         self._last_market_status_check = time.time()
         self._market_inactive = False
 
+        # Start a new tracking session for the new market ticker
+        self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
+
         logger.info(f"Market rotation complete. Now trading {new_ticker}.")
         await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
 
     async def stop(self):
         self.running = False
+        try:
+            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+            await self.om.record_pnl_snapshot_async(
+                ticker=self.ticker,
+                realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                inventory=self.inv_manager.get_position(self.ticker),
+                rotation_session_id=pnl_summary.get("rotation_session_id", "")
+            )
+        except Exception as e:
+            logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
         await self._cancel_all_quotes()

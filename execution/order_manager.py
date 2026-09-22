@@ -122,7 +122,75 @@ class OrderManager:
                         updated_at TIMESTAMPTZ
                     )
                 ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pnl_attribution (
+                        id SERIAL PRIMARY KEY,
+                        ticker VARCHAR(64) NOT NULL,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        realized_pnl_cents NUMERIC(12, 4) NOT NULL,
+                        unrealized_pnl_cents NUMERIC(12, 4) NOT NULL,
+                        total_fees_cents NUMERIC(12, 4) DEFAULT 0,
+                        inventory_at_snapshot INT NOT NULL,
+                        rotation_session_id VARCHAR(64) NOT NULL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_pnl_attribution_ticker_time 
+                    ON pnl_attribution(ticker, timestamp DESC)
+                ''')
                 conn.commit()
+
+    def record_pnl_snapshot(
+        self,
+        ticker: str,
+        realized_pnl_cents: float,
+        unrealized_pnl_cents: float,
+        total_fees_cents: float,
+        inventory: int,
+        rotation_session_id: str
+    ):
+        """Persists a real-time PnL attribution snapshot into PostgreSQL."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            with self._get_connection(allow_retries=False) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO pnl_attribution (
+                            ticker, timestamp, realized_pnl_cents, unrealized_pnl_cents,
+                            total_fees_cents, inventory_at_snapshot, rotation_session_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ''', (
+                        ticker,
+                        now,
+                        round(float(realized_pnl_cents), 4),
+                        round(float(unrealized_pnl_cents), 4),
+                        round(float(total_fees_cents), 4),
+                        int(inventory),
+                        str(rotation_session_id)
+                    ))
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to record PnL snapshot in DB for {ticker}: {e}")
+
+    async def record_pnl_snapshot_async(
+        self,
+        ticker: str,
+        realized_pnl_cents: float,
+        unrealized_pnl_cents: float,
+        total_fees_cents: float,
+        inventory: int,
+        rotation_session_id: str
+    ):
+        """Persists a real-time PnL attribution snapshot asynchronously without blocking the event loop."""
+        return await asyncio.to_thread(
+            self.record_pnl_snapshot,
+            ticker=ticker,
+            realized_pnl_cents=realized_pnl_cents,
+            unrealized_pnl_cents=unrealized_pnl_cents,
+            total_fees_cents=total_fees_cents,
+            inventory=inventory,
+            rotation_session_id=rotation_session_id
+        )
 
     def _update_db_order_status(self, client_order_id: str, status: str, kalshi_order_id: str = None, order_details: dict = None):
         """Updates or inserts an order record into the PostgreSQL database. Fails fast without blocking."""
