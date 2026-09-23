@@ -210,6 +210,14 @@ class TestMarkToMarketUnrealizedPnL:
         unrealized2 = tracker.update_mid_price(ticker, 70.0)
         assert unrealized2 == -50.0
 
+    def test_uncosted_inventory_mark_to_market_skipped(self):
+        """Uncosted lots are skipped in mark-to-market calculations."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-UNCOSTED-MTM"
+        tracker.seed_initial_inventory(ticker, 5, cost_basis_cents=None)
+        unrealized = tracker.update_mid_price(ticker, 55.0)
+        assert unrealized == 0.0
+
 
 class TestSessionAttributionAndRotation:
     """Tests session tracking across market rotations."""
@@ -411,14 +419,32 @@ class TestPnLCoverageEdgeCases:
         assert len(market.open_lots) == 1
         assert market.open_lots[0].price_cents == 42.5
 
-        # 4. Short position with fallback mid price
+        # 4. Short position with known mid price
         ticker_short = "KXTEST-SEED-SHORT"
+        short_market = tracker.get_or_create_market(ticker_short)
+        short_market.last_mid_price = 48.0
         tracker.seed_initial_inventory(ticker_short, -5, cost_basis_cents=None)
         assert tracker.get_open_inventory(ticker_short) == -5
-        short_market = tracker.get_or_create_market(ticker_short)
         assert len(short_market.open_lots) == 1
-        assert short_market.open_lots[0].price_cents == 50.0  # Fallback default
+        assert short_market.open_lots[0].price_cents == 48.0
+        assert short_market.open_lots[0].is_uncosted is False
         assert short_market.open_lots[0].action == "sell"
+
+        # 5. Position with unknown basis and unknown mid -> marks lot as is_uncosted=True, price_cents=None
+        ticker_uncosted = "KXTEST-SEED-UNCOSTED"
+        tracker.seed_initial_inventory(ticker_uncosted, 4, cost_basis_cents=None)
+        uncosted_market = tracker.get_or_create_market(ticker_uncosted)
+        assert len(uncosted_market.open_lots) == 1
+        assert uncosted_market.open_lots[0].is_uncosted is True
+        assert uncosted_market.open_lots[0].price_cents is None
+
+        # 6. Closing uncosted lot does not fabricate realized PnL or classify trade outcome
+        res = tracker.record_fill(ticker_uncosted, action="sell", side="yes", count=4, price_cents=60.0)
+        assert res["matched_contracts"] == 4
+        assert res["matched_outcomes"] == []
+        assert tracker.get_realized_pnl(ticker_uncosted) == 0.0
+        assert uncosted_market.winning_trades_count == 0
+        assert uncosted_market.losing_trades_count == 0
 
     def test_hydrate_positions_seeds_inventory(self):
         mock_ws = MagicMock()
@@ -438,7 +464,7 @@ class TestPnLCoverageEdgeCases:
 
         with patch("data.inventory_manager.requests.get", return_value=mock_resp), \
              patch("data.inventory_manager.get_auth_headers", return_value={}):
-            im._hydrate_positions()
+            im._hydrate_positions(is_startup=True)
 
         assert im.get_position("KXTEST-HYD1") == 10
         assert im.get_position("KXTEST-HYD2") == -5
@@ -447,6 +473,24 @@ class TestPnLCoverageEdgeCases:
         # Verify PnL tracker has lots seeded
         assert im.pnl_tracker.get_open_inventory("KXTEST-HYD1") == 10
         assert im.pnl_tracker.get_open_inventory("KXTEST-HYD2") == -5
+        # KXTEST-HYD2 has invalid exposure -> uncosted lot
+        lot2 = im.pnl_tracker.get_or_create_market("KXTEST-HYD2").open_lots[0]
+        assert lot2.is_uncosted is True
+        assert lot2.price_cents is None
+
+        # Verify periodic reconciliation (is_startup=False) does not seed lots
+        im.pnl_tracker.markets["KXTEST-RECON"] = MarketPnL(ticker="KXTEST-RECON")
+        mock_payload_recon = {
+            "market_positions": [{"ticker": "KXTEST-RECON", "position": 8}]
+        }
+        mock_resp.json.return_value = mock_payload_recon
+        with patch("data.inventory_manager.requests.get", return_value=mock_resp), \
+             patch("data.inventory_manager.get_auth_headers", return_value={}):
+            im._hydrate_positions(is_startup=False)
+
+        assert im.get_position("KXTEST-RECON") == 8
+        # PnL tracker must NOT have been seeded during periodic reconciliation
+        assert im.pnl_tracker.get_open_inventory("KXTEST-RECON") == 0
 
     def test_handle_fill_deducts_fees_from_balance(self):
         mock_ws = MagicMock()
@@ -502,7 +546,13 @@ class TestMarketMakerPnLLifecycle:
     async def test_tick_triggers_periodic_pnl_snapshot(self):
         from strategy.market_maker import AvellanedaStoikovBot
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-TICK", min_spread=2)
-        bot.om.record_pnl_snapshot_async = AsyncMock()
+        import asyncio
+        snapshot_event = asyncio.Event()
+
+        async def controlled_snapshot(**kwargs):
+            await snapshot_event.wait()
+
+        bot.om.record_pnl_snapshot_async = AsyncMock(side_effect=controlled_snapshot)
         bot.ob_manager.get_best_bid = MagicMock(return_value=(45, 10))
         bot.ob_manager.get_best_ask = MagicMock(return_value=(55, 10))
         bot._update_quotes = AsyncMock()
@@ -512,7 +562,17 @@ class TestMarketMakerPnLLifecycle:
         await bot._tick()
 
         bot.om.record_pnl_snapshot_async.assert_called_once()
-        assert len(bot._background_tasks) >= 0
+        # Task must be actively registered in _background_tasks while executing
+        assert len(bot._background_tasks) == 1
+        active_task = next(iter(bot._background_tasks))
+        assert not active_task.done()
+
+        # Release the event to complete snapshot
+        snapshot_event.set()
+        await active_task
+
+        # Task must be discarded from _background_tasks upon completion
+        assert len(bot._background_tasks) == 0
 
     @pytest.mark.asyncio
     async def test_tick_hedged_logging_with_pnl(self):
@@ -555,15 +615,17 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_records_pnl_and_handles_error(self):
         from strategy.market_maker import AvellanedaStoikovBot
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-STOP")
-        bot._cancel_all_quotes = AsyncMock()
-        bot.om.record_pnl_snapshot_async = AsyncMock()
+        call_order = []
+        bot._cancel_all_quotes = AsyncMock(side_effect=lambda: call_order.append("cancel"))
+        bot.om.record_pnl_snapshot_async = AsyncMock(side_effect=lambda **kwargs: call_order.append("snapshot"))
 
-        # Successful stop
+        # Successful stop: quotes cancelled first, then snapshot persisted
         await bot.stop()
-        bot.om.record_pnl_snapshot_async.assert_called_once()
+        assert call_order == ["cancel", "snapshot"]
         assert bot.running is False
 
         # Exception in stop snapshot should not prevent quote cancellation
+        call_order.clear()
         bot.om.record_pnl_snapshot_async.side_effect = Exception("Stop snapshot failed")
         await bot.stop()
-        assert bot._cancel_all_quotes.called
+        assert "cancel" in call_order

@@ -41,19 +41,11 @@ async def test_main_startup_retries_discovery_until_market_found():
 
 @pytest.mark.asyncio
 async def test_main_signal_shutdown():
-    """Verify SIGINT/SIGTERM triggers synchronous kill and records PnL snapshot."""
+    """Verify SIGINT/SIGTERM triggers synchronous kill and delegates clean shutdown to bot.stop()."""
     import signal
 
     mock_bot = MagicMock()
     mock_bot.ticker = "KXNFLGAME-TEST"
-    mock_bot.inv_manager.get_pnl_summary.return_value = {
-        "realized_pnl_cents": 120.0,
-        "unrealized_pnl_cents": 30.0,
-        "total_fees_cents": 5.0,
-        "rotation_session_id": "test-session-id"
-    }
-    mock_bot.inv_manager.get_position.return_value = 3
-    mock_bot.om.record_pnl_snapshot = MagicMock()
     mock_bot.stop = AsyncMock()
 
     mock_killer = MagicMock()
@@ -82,27 +74,20 @@ async def test_main_signal_shutdown():
         await main()
 
     mock_killer.trigger_synchronous.assert_called_once()
-    mock_bot.om.record_pnl_snapshot.assert_called_once_with(
-        ticker="KXNFLGAME-TEST",
-        realized_pnl_cents=120.0,
-        unrealized_pnl_cents=30.0,
-        total_fees_cents=5.0,
-        inventory=3,
-        rotation_session_id="test-session-id"
-    )
+    mock_bot.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_main_signal_shutdown_exception_handled():
-    """Verify exception during shutdown PnL snapshot persistence is gracefully caught."""
+async def test_main_sigterm_shutdown():
+    """Verify SIGTERM triggers synchronous kill and bot.stop()."""
     import signal
 
     mock_bot = MagicMock()
     mock_bot.ticker = "KXNFLGAME-TEST"
-    mock_bot.inv_manager.get_pnl_summary.side_effect = Exception("DB snapshot error")
     mock_bot.stop = AsyncMock()
 
     mock_killer = MagicMock()
+    mock_killer.trigger_synchronous = MagicMock()
 
     signal_handlers = {}
 
@@ -125,6 +110,7 @@ async def test_main_signal_shutdown_exception_handled():
         await main()
 
     mock_killer.trigger_synchronous.assert_called_once()
+    mock_bot.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio

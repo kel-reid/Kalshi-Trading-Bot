@@ -113,7 +113,7 @@ class AvellanedaStoikovBot:
         logger.info("WebSocket Connected. Hydrating state...")
         
         # 3. Hydrate initial inventory and subscribe to channels
-        await self.inv_manager.hydrate()
+        await self.inv_manager.hydrate(is_startup=True)
         
         # 3b. Launch the periodic reconciliation background task
         sync_task = asyncio.create_task(self.inv_manager._sync_loop())
@@ -477,6 +477,10 @@ class AvellanedaStoikovBot:
 
     async def stop(self):
         self.running = False
+        # 1. Withdraw resting quotes first to eliminate market risk immediately
+        await self._cancel_all_quotes()
+
+        # 2. Persist final shutdown snapshot after quotes are withdrawn
         try:
             pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
             await self.om.record_pnl_snapshot_async(
@@ -489,4 +493,3 @@ class AvellanedaStoikovBot:
             )
         except Exception as e:
             logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
-        await self._cancel_all_quotes()
