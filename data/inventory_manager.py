@@ -88,7 +88,12 @@ class InventoryManager:
                     if not isinstance(ticker, str) or not ticker.strip():
                         logger.error(f"Positions response contains malformed entry missing valid ticker: {entry}")
                         return None
-                    pos_val = entry.get("position_fp", entry.get("position", 0))
+                    pos_val = entry.get("position_fp")
+                    if pos_val is None:
+                        pos_val = entry.get("position")
+                    if pos_val is None:
+                        logger.error(f"Positions response entry missing position field: {entry}")
+                        return None
                     if isinstance(pos_val, bool):
                         logger.error(f"Positions response contains boolean position: {entry}")
                         return None
@@ -116,7 +121,12 @@ class InventoryManager:
             if not ticker or not isinstance(ticker, str) or not ticker.strip():
                 logger.error(f"Malformed position entry missing valid ticker: {pos}")
                 return False
-            pos_val = pos.get("position_fp", pos.get("position", 0))
+            pos_val = pos.get("position_fp")
+            if pos_val is None:
+                pos_val = pos.get("position")
+            if pos_val is None:
+                logger.error(f"Position entry missing position field for {ticker}: {pos}")
+                return False
             if isinstance(pos_val, bool):
                 logger.error(f"Malformed boolean position for {ticker}: {pos}")
                 return False
