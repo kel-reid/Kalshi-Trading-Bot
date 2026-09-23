@@ -709,13 +709,20 @@ class TestPnLCoverageEdgeCases:
             # Position should remain 8 (5 + 3 from fill), not overwritten with stale 5
             assert im.get_position("KXTEST-DRIFT") == 8
 
-        # Startup hydration (is_startup=True) should apply normally
+        # Startup hydration (is_startup=True) should ALSO detect in-flight fills and return False
         with patch.object(im, "_fetch_balance", return_value=6000), \
-             patch.object(im, "_fetch_positions", return_value=[{"ticker": "KXTEST-DRIFT", "position": 8}]):
+             patch.object(im, "_fetch_positions", side_effect=simulate_in_flight_fill):
+            applied_startup_concurrent = await im.hydrate(is_startup=True)
+            assert applied_startup_concurrent is False
+            assert im.get_position("KXTEST-DRIFT") == 11 # 8 + 3 from second simulated fill
+
+        # Startup hydration (is_startup=True) should apply normally when no concurrent fill occurs
+        with patch.object(im, "_fetch_balance", return_value=6000), \
+             patch.object(im, "_fetch_positions", return_value=[{"ticker": "KXTEST-DRIFT", "position": 11}]):
             applied_startup = await im.hydrate(is_startup=True)
             assert applied_startup is True
             assert im.balance_cents == 6000
-            assert im.get_position("KXTEST-DRIFT") == 8
+            assert im.get_position("KXTEST-DRIFT") == 11
 
     def test_apply_positions_publishes_prometheus_gauges(self):
         """Verify _apply_positions publishes Prometheus metrics for active and flattened tickers."""
@@ -901,6 +908,55 @@ class TestMarketMakerPnLLifecycle:
         assert bot.running is False
 
     @pytest.mark.asyncio
+    async def test_stop_escalates_to_emergency_kill_when_om_has_tracked_active_orders(self):
+        """Verify bot.stop() triggers emergency KillSwitch when om.active_orders is non-empty even if quote IDs are None."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-ACTIVE-ORDERS")
+        bot.current_bid_id = None
+        bot.current_ask_id = None
+        bot.om.active_orders = {"stray-order-1": {"kalshi_order_id": "k1"}}
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        async def mock_kill():
+            bot.om.active_orders.clear()
+
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock(side_effect=mock_kill)
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            result = await bot.stop()
+
+        mock_killer.trigger.assert_awaited_once()
+        assert result is True
+        assert len(bot.om.active_orders) == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_clears_quote_ids_and_returns_true_when_kill_switch_clears_active_orders(self):
+        """Verify bot.stop() resets current quote IDs and returns True if KillSwitch successfully cancels active orders."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-KILL-RECOVER")
+        bot.current_bid_id = "bid-order-1"
+        bot.current_bid_price = 45
+        bot.om.active_orders = {"bid-order-1": {"kalshi_order_id": "k-bid-1"}}
+        bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        async def mock_kill():
+            bot.om.active_orders.clear()
+
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock(side_effect=mock_kill)
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            result = await bot.stop()
+
+        mock_killer.trigger.assert_awaited_once()
+        assert result is True
+        assert bot.current_bid_id is None
+        assert bot.current_bid_price is None
+
+    @pytest.mark.asyncio
     async def test_market_maker_start_propagates_fatal_exception(self):
         from strategy.market_maker import AvellanedaStoikovBot
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-CRASH")
@@ -956,6 +1012,27 @@ class TestMarketMakerPnLLifecycle:
         # Negative count
         im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "buy", "side": "yes", "count": -5, "price": 50})
         im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "sell", "side": "yes", "count": -1, "price": 50})
+
+        assert im.balance_cents == 10000
+        assert im.get_position("KXTEST-REJECT") == 0
+        assert im._fill_count == initial_fill_count
+        assert im.get_realized_pnl("KXTEST-REJECT") == 0.0
+
+    def test_inventory_manager_rejects_invalid_action_and_side(self):
+        """Verify _handle_fill rejects invalid action and side values without mutating state or counters."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.balance_cents = 10000
+        initial_fill_count = im._fill_count
+
+        # Missing action
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "side": "yes", "count": 5, "price": 50})
+        # Invalid action
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "hold", "side": "yes", "count": 5, "price": 50})
+        # Missing side
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "buy", "count": 5, "price": 50})
+        # Invalid side
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "buy", "side": "maybe", "count": 5, "price": 50})
 
         assert im.balance_cents == 10000
         assert im.get_position("KXTEST-REJECT") == 0

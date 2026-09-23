@@ -23,7 +23,7 @@ async def test_main_startup_retries_discovery_until_market_found():
 
     mock_bot = MagicMock()
     mock_bot.start = AsyncMock(return_value=None)
-    mock_bot.stop = AsyncMock(return_value=None)
+    mock_bot.stop = AsyncMock(return_value=True)
     mock_bot.om = MagicMock()
 
     with patch("utils.market_discovery.discover_active_market_async", side_effect=mock_discover), \
@@ -245,5 +245,62 @@ async def test_main_signal_during_bot_construction():
     mock_bot.stop.assert_awaited_once()
     # bot.start() must NEVER be started
     mock_bot.start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_main_shutdown_failure_triggers_sync_kill_and_raises_runtime_error():
+    """Verify that if bot.stop() returns False during finally, killer.trigger_synchronous is called and RuntimeError is raised."""
+    mock_bot = MagicMock()
+    mock_bot.start = AsyncMock(return_value=None)
+    mock_bot.stop = AsyncMock(return_value=False)
+    mock_killer = MagicMock()
+    mock_killer.trigger_synchronous = MagicMock()
+
+    with patch("utils.market_discovery.discover_active_market_async", new_callable=AsyncMock, return_value="KXNFLGAME-TEST"), \
+         patch("main.AvellanedaStoikovBot", return_value=mock_bot), \
+         patch("main.KillSwitch", return_value=mock_killer):
+        with pytest.raises(RuntimeError, match="Shutdown failed: active orders could not be confirmed cancelled"):
+            await main()
+
+    mock_bot.stop.assert_awaited_once()
+    mock_killer.trigger_synchronous.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_main_shutdown_during_init_failure_triggers_sync_kill_and_raises():
+    """Verify that if shutdown occurs during bot construction and bot.stop() returns False, synchronous kill is triggered and RuntimeError is raised."""
+    import signal
+
+    signal_handlers = {}
+
+    def mock_signal(sig, handler):
+        signal_handlers[sig] = handler
+
+    mock_bot = MagicMock()
+    mock_bot.start = AsyncMock()
+    mock_bot.stop = AsyncMock(return_value=False)
+    mock_bot.om = MagicMock()
+
+    mock_killer = MagicMock()
+    mock_killer.trigger = AsyncMock()
+    mock_killer.trigger_synchronous = MagicMock()
+
+    def construct_bot(**kwargs):
+        handler = signal_handlers.get(signal.SIGINT)
+        assert handler is not None
+        handler(signal.SIGINT, None)
+        return mock_bot
+
+    with patch("utils.market_discovery.discover_active_market_async", new_callable=AsyncMock, return_value="KXNFLGAME-TEST"), \
+         patch("main.AvellanedaStoikovBot", side_effect=construct_bot), \
+         patch("main.KillSwitch", return_value=mock_killer), \
+         patch("main.signal.signal", side_effect=mock_signal):
+        with pytest.raises(RuntimeError, match="Shutdown failed: active orders could not be confirmed cancelled"):
+            await main()
+
+    mock_killer.trigger.assert_awaited_once()
+    mock_bot.stop.assert_awaited_once()
+    mock_killer.trigger_synchronous.assert_called_once()
+
 
 

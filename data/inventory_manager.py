@@ -137,9 +137,9 @@ class InventoryManager:
 
         # Concurrency guard: if a fill arrived while REST requests were in-flight,
         # the REST snapshot is stale and would overwrite real-time positions.
-        if not is_startup and self._fill_count != start_fill_count:
+        if self._fill_count != start_fill_count:
             logger.info(
-                f"Skipping periodic REST inventory reconciliation: {self._fill_count - start_fill_count} "
+                f"Skipping {'startup' if is_startup else 'periodic'} REST inventory reconciliation: {self._fill_count - start_fill_count} "
                 f"fill(s) received during REST fetch window. Real-time WebSocket state is authoritative."
             )
             return False
@@ -196,12 +196,12 @@ class InventoryManager:
         }
         """
         ticker = fill_msg.get("market_ticker")
-        action = fill_msg.get("action") # buy or sell
-        side = fill_msg.get("side") # yes or no
+        action = (fill_msg.get("action") or "").lower()
+        side = (fill_msg.get("side") or "").lower()
         count = fill_msg.get("count", 0)
         price = fill_msg.get("price", 0) # in cents
         
-        if not ticker or count <= 0:
+        if not ticker or count <= 0 or action not in ("buy", "sell") or side not in ("yes", "no"):
             return
             
         self._fill_count += 1
