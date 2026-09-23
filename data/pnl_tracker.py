@@ -64,6 +64,28 @@ class PnLTracker:
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
         return market.rotation_session_id
 
+    def seed_initial_inventory(self, ticker: str, position: int, cost_basis_cents: Optional[float] = None):
+        """
+        Seeds open inventory lots when hydrating an existing position on startup.
+        Prevents position distortion if the bot restarts with open contracts.
+        """
+        if position == 0:
+            return
+        market = self.get_or_create_market(ticker)
+        if not market.open_lots:
+            action = "buy" if position > 0 else "sell"
+            price = cost_basis_cents if cost_basis_cents is not None else (market.last_mid_price or 50.0)
+            lot = InventoryLot(
+                lot_id=f"init-{str(uuid.uuid4())[:6]}",
+                ticker=ticker,
+                action=action,
+                price_cents=float(price),
+                count=abs(position),
+                timestamp=time.time()
+            )
+            market.open_lots.append(lot)
+            logger.info(f"Seeded initial lot for {ticker}: {abs(position)} {action.upper()} @ {price:.1f}c.")
+
     @staticmethod
     def normalize_fill(action: str, side: str, price_cents: float) -> Tuple[str, float]:
         """
@@ -120,6 +142,8 @@ class PnLTracker:
 
         # FIFO matching against open lots
         new_open_lots: List[InventoryLot] = []
+        matched_lots_info: List[Tuple[int, float]] = []
+
         for lot in market.open_lots:
             if remaining_count > 0 and lot.action == target_close_action:
                 matched_count = min(remaining_count, lot.count)
@@ -131,14 +155,8 @@ class PnLTracker:
                     # We were short at lot.price_cents, now buying back at norm_price
                     trade_pnl = (lot.price_cents - norm_price) * matched_count
 
+                matched_lots_info.append((matched_count, trade_pnl))
                 realized_delta += trade_pnl
-                market.round_trips_count += 1
-                if trade_pnl > 0.0001:
-                    market.winning_trades_count += 1
-                elif trade_pnl < -0.0001:
-                    market.losing_trades_count += 1
-                else:
-                    market.scratch_trades_count += 1
 
                 lot.count -= matched_count
                 remaining_count -= matched_count
@@ -149,6 +167,23 @@ class PnLTracker:
                 new_open_lots.append(lot)
 
         market.open_lots = new_open_lots
+
+        # Classify outcomes net of transaction fees
+        total_matched_contracts = count - remaining_count
+        matched_outcomes: List[str] = []
+        for matched_count, gross_pnl in matched_lots_info:
+            lot_fee = (float(fee_cents) * matched_count / total_matched_contracts) if total_matched_contracts > 0 else 0.0
+            net_trade_pnl = gross_pnl - lot_fee
+            market.round_trips_count += 1
+            if net_trade_pnl > 0.0001:
+                market.winning_trades_count += 1
+                matched_outcomes.append("profit")
+            elif net_trade_pnl < -0.0001:
+                market.losing_trades_count += 1
+                matched_outcomes.append("loss")
+            else:
+                market.scratch_trades_count += 1
+                matched_outcomes.append("scratch")
 
         # Deduct fees from realized gain
         realized_delta -= float(fee_cents)
@@ -178,7 +213,9 @@ class PnLTracker:
 
         return {
             "ticker": ticker,
-            "matched_contracts": count - remaining_count,
+            "matched_contracts": total_matched_contracts,
+            "matched_lots_count": len(matched_outcomes),
+            "matched_outcomes": matched_outcomes,
             "new_contracts": remaining_count,
             "realized_delta_cents": realized_delta,
             "cumulative_realized_cents": market.realized_pnl_cents,

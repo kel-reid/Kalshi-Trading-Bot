@@ -390,6 +390,110 @@ class TestPnLCoverageEdgeCases:
             mock_labels.assert_called_with(ticker=ticker, outcome="scratch")
             mock_counter.inc.assert_called_once()
 
+    def test_seed_initial_inventory_branches(self):
+        tracker = PnLTracker()
+        ticker = "KXTEST-SEED"
+
+        # 1. Zero position does nothing
+        tracker.seed_initial_inventory(ticker, 0)
+        assert tracker.get_open_inventory(ticker) == 0
+
+        # 2. Long position with explicit cost basis
+        tracker.seed_initial_inventory(ticker, 10, cost_basis_cents=42.5)
+        assert tracker.get_open_inventory(ticker) == 10
+        market = tracker.get_or_create_market(ticker)
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].price_cents == 42.5
+        assert market.open_lots[0].action == "buy"
+
+        # 3. Already seeded / open lots exist -> does not overwrite
+        tracker.seed_initial_inventory(ticker, 20, cost_basis_cents=99.0)
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].price_cents == 42.5
+
+        # 4. Short position with fallback mid price
+        ticker_short = "KXTEST-SEED-SHORT"
+        tracker.seed_initial_inventory(ticker_short, -5, cost_basis_cents=None)
+        assert tracker.get_open_inventory(ticker_short) == -5
+        short_market = tracker.get_or_create_market(ticker_short)
+        assert len(short_market.open_lots) == 1
+        assert short_market.open_lots[0].price_cents == 50.0  # Fallback default
+        assert short_market.open_lots[0].action == "sell"
+
+    def test_hydrate_positions_seeds_inventory(self):
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+
+        mock_payload = {
+            "market_positions": [
+                {"ticker": "KXTEST-HYD1", "position_fp": "10.0", "market_exposure": 450.0},
+                {"ticker": "KXTEST-HYD2", "position": -5, "total_traded": "invalid"},
+                {"ticker": "KXTEST-ZERO", "position": 0}
+            ]
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_payload
+
+        with patch("data.inventory_manager.requests.get", return_value=mock_resp), \
+             patch("data.inventory_manager.get_auth_headers", return_value={}):
+            im._hydrate_positions()
+
+        assert im.get_position("KXTEST-HYD1") == 10
+        assert im.get_position("KXTEST-HYD2") == -5
+        assert "KXTEST-ZERO" not in im.positions
+
+        # Verify PnL tracker has lots seeded
+        assert im.pnl_tracker.get_open_inventory("KXTEST-HYD1") == 10
+        assert im.pnl_tracker.get_open_inventory("KXTEST-HYD2") == -5
+
+    def test_handle_fill_deducts_fees_from_balance(self):
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.balance_cents = 10000
+        ticker = "KXTEST-FEE-BAL"
+
+        # Buy 2 @ 40c with fee 1.8c -> total cost = 2*40 + 2 = 82c -> balance = 9918c
+        im._handle_fill({
+            "market_ticker": ticker,
+            "action": "buy",
+            "side": "yes",
+            "count": 2,
+            "price": 40,
+            "fee_cents": 1.8
+        })
+        assert im.balance_cents == 9918
+
+        # Sell 2 @ 60c with fee 1.2c -> proceeds = 2*60 - 1 = 119c -> balance = 10037c
+        im._handle_fill({
+            "market_ticker": ticker,
+            "action": "sell",
+            "side": "yes",
+            "count": 2,
+            "price": 60,
+            "fee_cents": 1.2
+        })
+        assert im.balance_cents == 10037
+
+    def test_fee_adjusted_outcome_classification(self):
+        tracker = PnLTracker()
+        ticker = "KXTEST-NET-FEE"
+
+        # Buy 2 @ 50c
+        tracker.record_fill(ticker, action="buy", side="yes", count=2, price_cents=50)
+
+        # Sell 2 @ 51c with fee of 3c:
+        # Gross gain = (51 - 50) * 2 = +2c
+        # Net gain = +2c - 3c = -1c -> Classified as LOSS because of fee
+        res = tracker.record_fill(ticker, action="sell", side="yes", count=2, price_cents=51, fee_cents=3.0)
+        assert res["matched_contracts"] == 2
+        assert res["matched_outcomes"] == ["loss"]
+        assert tracker.get_realized_pnl(ticker) == -1.0
+        summary = tracker.get_market_summary(ticker)
+        assert summary["winning_trades"] == 0
+        assert summary["losing_trades"] == 1
+
 
 class TestMarketMakerPnLLifecycle:
     """Verifies MarketMaker PnL snapshot triggers and error handling."""
