@@ -88,6 +88,9 @@ class AvellanedaStoikovBot:
         self._last_pnl_snapshot: float = time.time()
         self._pnl_snapshot_interval: float = 60.0
 
+        # Background task references to prevent garbage collection in asyncio
+        self._background_tasks = set()
+
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
         logger.info(f"Starting Market Maker for {self.ticker}")
@@ -99,7 +102,9 @@ class AvellanedaStoikovBot:
         await self.om.sync_and_recover_state()
         
         # 1. Start the WebSocket Connection
-        asyncio.create_task(self.ws_client.connect())
+        ws_task = asyncio.create_task(self.ws_client.connect())
+        self._background_tasks.add(ws_task)
+        ws_task.add_done_callback(self._background_tasks.discard)
         
         # 2. Wait for connection to establish
         while not self.ws_client.is_connected:
@@ -111,7 +116,9 @@ class AvellanedaStoikovBot:
         await self.inv_manager.hydrate()
         
         # 3b. Launch the periodic reconciliation background task
-        asyncio.create_task(self.inv_manager._sync_loop())
+        sync_task = asyncio.create_task(self.inv_manager._sync_loop())
+        self._background_tasks.add(sync_task)
+        sync_task.add_done_callback(self._background_tasks.discard)
         
         await self.inv_manager.subscribe()
         await self.ob_manager.subscribe([self.ticker])
@@ -146,7 +153,7 @@ class AvellanedaStoikovBot:
         if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
             self._last_pnl_snapshot = now
             pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
-            asyncio.create_task(
+            snap_task = asyncio.create_task(
                 self.om.record_pnl_snapshot_async(
                     ticker=self.ticker,
                     realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
@@ -156,6 +163,8 @@ class AvellanedaStoikovBot:
                     rotation_session_id=pnl_summary.get("rotation_session_id", "")
                 )
             )
+            self._background_tasks.add(snap_task)
+            snap_task.add_done_callback(self._background_tasks.discard)
 
         # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
         if self._market_inactive:
