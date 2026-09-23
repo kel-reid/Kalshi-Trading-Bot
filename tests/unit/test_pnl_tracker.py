@@ -1169,3 +1169,90 @@ class TestMarketMakerPnLLifecycle:
         assert tracker.get_realized_pnl(ticker) == 90.0
         assert tracker.get_unrealized_pnl(ticker) == 0.0
         assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 90.0
+
+    def test_inventory_manager_rejects_missing_non_numeric_and_negative_prices(self):
+        """Verify _handle_fill drops missing, non-numeric, zero, negative, or boolean prices without incrementing _fill_count."""
+        mock_ws = MagicMock()
+        im = InventoryManager(ws_client=mock_ws)
+        initial_balance = im.balance_cents
+
+        invalid_prices = [None, "", "invalid", 0, -10, -0.01, True, False, float("nan"), float("inf")]
+        for p in invalid_prices:
+            im._handle_fill({
+                "market_ticker": "KXTEST-PRICE",
+                "action": "buy",
+                "side": "yes",
+                "count": 5,
+                "price": p
+            })
+            assert im._fill_count == 0, f"Expected _fill_count == 0 for price {p!r}"
+            assert im.balance_cents == initial_balance
+            assert im.get_position("KXTEST-PRICE") == 0
+
+    def test_inventory_manager_rejects_invalid_fees_without_incrementing_counter(self):
+        """Verify _handle_fill drops non-numeric or negative fees without incrementing _fill_count or mutating balance."""
+        mock_ws = MagicMock()
+        im = InventoryManager(ws_client=mock_ws)
+        initial_balance = im.balance_cents
+
+        invalid_fees = ["bad-fee", -5.0, -0.001, float("nan"), float("inf")]
+        for f in invalid_fees:
+            im._handle_fill({
+                "market_ticker": "KXTEST-FEE",
+                "action": "buy",
+                "side": "yes",
+                "count": 5,
+                "price": 50,
+                "fee_cents": f
+            })
+            assert im._fill_count == 0, f"Expected _fill_count == 0 for fee {f!r}"
+            assert im.balance_cents == initial_balance
+            assert im.get_position("KXTEST-FEE") == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_untracked_quote_and_clears_id_only_on_confirmation(self):
+        """Verify stop() cancels untracked quotes via om.cancel_order and retains IDs/returns False if cancel fails."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-UNTRACKED")
+        bot.current_bid_id = "untracked-bid-999"
+        bot.current_bid_price = 45
+        bot.om.active_orders = {}  # Quote was never tracked in om.active_orders
+        bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        # Scenario 1: cancel_order fails on Kalshi
+        bot.om.cancel_order = AsyncMock(return_value=False)
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock()
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            res_fail = await bot.stop()
+
+        assert res_fail is False
+        assert bot.current_bid_id == "untracked-bid-999"
+        bot.om.cancel_order.assert_awaited_with("untracked-bid-999")
+
+        # Scenario 2: cancel_order succeeds on Kalshi
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            res_success = await bot.stop()
+
+        assert res_success is True
+        assert bot.current_bid_id is None
+        assert bot.current_bid_price is None
+
+    def test_market_summary_preserves_four_decimal_precision(self):
+        """Verify get_market_summary preserves 4-decimal precision matching NUMERIC(12,4) schema."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-PRECISION"
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=50.1234, fee_cents=1.5678)
+        tracker.update_mid_price(ticker, 55.4321)
+
+        summary = tracker.get_market_summary(ticker)
+        assert summary["realized_pnl_cents"] == 0.0
+        # (55.4321 - 50.1234) * 10 - 1.5678 = 53.0870 - 1.5678 = 51.5192
+        assert summary["unrealized_pnl_cents"] == 51.5192
+        assert summary["total_pnl_cents"] == 51.5192
+        assert summary["total_fees_cents"] == 1.5678
+        assert summary["total_pnl_cents"] == summary["realized_pnl_cents"] + summary["unrealized_pnl_cents"]
+

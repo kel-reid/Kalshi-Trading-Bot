@@ -9,6 +9,7 @@ It also runs a background reconciliation loop to prevent state drift.
 import logging
 import requests
 import asyncio
+import math
 import certifi
 from typing import Dict, Any, Optional, List
 
@@ -208,22 +209,47 @@ class InventoryManager:
         }
         """
         ticker = fill_msg.get("market_ticker")
-        action = (fill_msg.get("action") or "").lower()
-        side = (fill_msg.get("side") or "").lower()
-        count = fill_msg.get("count", 0)
-        price = fill_msg.get("price", 0) # in cents
-        
-        if not ticker or count <= 0 or action not in ("buy", "sell") or side not in ("yes", "no"):
+        action_raw = fill_msg.get("action")
+        side_raw = fill_msg.get("side")
+        count = fill_msg.get("count")
+        price = fill_msg.get("price")
+
+        # 1. Validate ticker
+        if not ticker or not isinstance(ticker, str) or not ticker.strip():
+            logger.warning(f"Dropping fill with missing or invalid ticker: {fill_msg}")
             return
-            
+        ticker = ticker.strip()
+
+        # 2. Validate action and side
+        action = action_raw.lower() if isinstance(action_raw, str) else ""
+        side = side_raw.lower() if isinstance(side_raw, str) else ""
+        if action not in ("buy", "sell") or side not in ("yes", "no"):
+            logger.warning(f"Dropping fill with invalid action/side ({action_raw!r}, {side_raw!r}): {fill_msg}")
+            return
+
+        # 3. Validate count (must be positive integer, not boolean)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            logger.warning(f"Dropping fill with invalid count ({count!r}): {fill_msg}")
+            return
+
+        # 4. Validate price (must be positive numeric, not boolean, non-NaN/inf)
+        if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or math.isnan(price) or math.isinf(price):
+            logger.warning(f"Dropping fill with invalid price ({price!r}): {fill_msg}")
+            return
+
+        # 5. Parse and validate fee safely
+        fee_val = fill_msg.get("fee_cents", fill_msg.get("fee", 0.0))
+        try:
+            fee = float(fee_val)
+            if fee < 0.0 or math.isnan(fee) or math.isinf(fee):
+                logger.warning(f"Dropping fill with invalid fee ({fee_val!r}): {fill_msg}")
+                return
+        except (TypeError, ValueError):
+            logger.warning(f"Dropping fill with non-numeric fee ({fee_val!r}): {fill_msg}")
+            return
+
+        # All preconditions validated; state mutation and counter increment can now safely occur
         self._fill_count += 1
-            
-        # Update balance
-        # If we buy, we spend (price * count) cents
-        # If we sell, we receive (price * count) cents
-        # Wait, selling "yes" might also include resolving risks or just earning the premium.
-        # But for simple inventory tracking, we just track the position delta.
-        fee = float(fill_msg.get("fee_cents", fill_msg.get("fee", 0.0)))
         fee_int = int(round(fee))
 
         # Adjust balance based on action (including fees)
