@@ -1171,12 +1171,12 @@ class TestMarketMakerPnLLifecycle:
         assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 90.0
 
     def test_inventory_manager_rejects_missing_non_numeric_and_negative_prices(self):
-        """Verify _handle_fill drops missing, non-numeric, zero, negative, or boolean prices without incrementing _fill_count."""
+        """Verify _handle_fill drops missing, non-numeric, zero, negative, out-of-range (>=100), or boolean prices without incrementing _fill_count."""
         mock_ws = MagicMock()
         im = InventoryManager(ws_client=mock_ws)
         initial_balance = im.balance_cents
 
-        invalid_prices = [None, "", "invalid", 0, -10, -0.01, True, False, float("nan"), float("inf")]
+        invalid_prices = [None, "", "invalid", 0, -10, -0.01, True, False, 100, 100.5, 150, float("nan"), float("inf")]
         for p in invalid_prices:
             im._handle_fill({
                 "market_ticker": "KXTEST-PRICE",
@@ -1255,4 +1255,51 @@ class TestMarketMakerPnLLifecycle:
         assert summary["total_pnl_cents"] == 51.5192
         assert summary["total_fees_cents"] == 1.5678
         assert summary["total_pnl_cents"] == summary["realized_pnl_cents"] + summary["unrealized_pnl_cents"]
+
+    def test_reconcile_inventory_conserves_gross_mtm_pnl_across_all_transitions(self):
+        """
+        Verify that when costed lots with unrealized mark-to-market PnL are reconciled
+        (partial trim, position reversal, or flattened to zero), net mark-to-market PnL
+        is realized so Total Strategy PnL is strictly conserved.
+        """
+        tracker = PnLTracker()
+        ticker = "KXTEST-RECON-CONSERVE"
+
+        # 1. Buy 10 @ 50c with 5.0c fee (0.5c/contract)
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=5.0)
+        # Mid rises to 60c: Gross MTM = (60-50)*10 = 100c. Net unrealized = 100 - 5 = 95.0c
+        tracker.update_mid_price(ticker, 60.0)
+        assert tracker.get_realized_pnl(ticker) == 0.0
+        assert tracker.get_unrealized_pnl(ticker) == 95.0
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
+
+        # 2. Partial trim: 10 -> 6 (trim 4 contracts)
+        # 4 trimmed contracts: gross MTM = (60-50)*4 = 40c, entry fee = 2c -> net realized = 38.0c
+        # 6 remaining contracts: gross MTM = (60-50)*6 = 60c, entry fee = 3c -> net unrealized = 57.0c
+        tracker.reconcile_inventory(ticker, 6)
+        assert tracker.get_open_inventory(ticker) == 6
+        assert tracker.get_realized_pnl(ticker) == 38.0
+        assert tracker.get_unrealized_pnl(ticker) == 57.0
+        # Total PnL strictly conserved: 38 + 57 = 95.0c!
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
+
+        # 3. Position sign reversal: 6 -> -4
+        # All 6 remaining contracts removed: net realized = 57.0c -> cumulative realized = 38 + 57 = 95.0c
+        # New 4 short contracts are uncosted -> net unrealized = 0.0c
+        tracker.reconcile_inventory(ticker, -4)
+        assert tracker.get_open_inventory(ticker) == -4
+        assert tracker.get_realized_pnl(ticker) == 95.0
+        assert tracker.get_unrealized_pnl(ticker) == 0.0
+        # Total PnL strictly conserved: 95.0 + 0 = 95.0c!
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
+
+        # 4. Flatten to zero: -4 -> 0
+        # 4 uncosted short contracts cleared: realized delta = 0.0c
+        tracker.reconcile_inventory(ticker, 0)
+        assert tracker.get_open_inventory(ticker) == 0
+        assert tracker.get_realized_pnl(ticker) == 95.0
+        assert tracker.get_unrealized_pnl(ticker) == 0.0
+        # Total PnL strictly conserved: 95.0c!
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
+
 
