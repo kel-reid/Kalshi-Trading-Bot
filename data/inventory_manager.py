@@ -232,9 +232,9 @@ class InventoryManager:
             logger.warning(f"Dropping fill with invalid count ({count!r}): {fill_msg}")
             return
 
-        # 4. Validate price (must be positive numeric, not boolean, non-NaN/inf)
-        if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or math.isnan(price) or math.isinf(price):
-            logger.warning(f"Dropping fill with invalid price ({price!r}): {fill_msg}")
+        # 4. Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
+        if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or price >= 100 or math.isnan(price) or math.isinf(price):
+            logger.warning(f"Dropping fill with invalid/out-of-range price ({price!r}): {fill_msg}")
             return
 
         # 5. Parse and validate fee safely

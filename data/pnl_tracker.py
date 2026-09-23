@@ -105,10 +105,30 @@ class PnLTracker:
             else:
                 logger.info(f"Seeded initial lot for {ticker}: {abs(position)} {action.upper()} @ {price:.1f}c.")
 
+    @staticmethod
+    def _calculate_lot_mtm(lot: InventoryLot, count: int, mid_price: Optional[float]) -> float:
+        """
+        Calculates the net mark-to-market PnL contribution for `count` contracts of `lot`.
+        Deducts allocated entry fees so net MTM equals: gross_mtm - allocated_entry_fee.
+        If the lot is uncosted, or mid_price is unknown, only the entry fee is known.
+        """
+        allocated_fee = lot.entry_fee_per_contract * count
+        if lot.is_uncosted or lot.price_cents is None or mid_price is None:
+            return -allocated_fee
+        if lot.action == "buy":
+            gross = (mid_price - lot.price_cents) * count
+        elif lot.action == "sell":
+            gross = (lot.price_cents - mid_price) * count
+        else:
+            gross = 0.0
+        return gross - allocated_fee
+
     def reconcile_inventory(self, ticker: str, target_position: int):
         """
-        Reconciles open inventory lots to an authoritative target position (e.g. from periodic REST sync).
-        Adjusts lots using uncosted lots or FIFO trimming without fabricating realized PnL.
+        Reconciles the tracker's lot-based inventory against authoritative REST portfolio positions.
+        - Trims or flattens lots if authoritative position is smaller.
+        - Realizes net mark-to-market PnL (including deferred entry fees) on removed costed lots so Total Strategy PnL is conserved.
+        - Appends an uncosted lot if position has expanded or flipped across zero.
         """
         market = self.get_or_create_market(ticker)
         current_position = self.get_open_inventory(ticker)
@@ -123,12 +143,15 @@ class PnLTracker:
         )
 
         if target_position == 0:
-            removed_entry_fees = sum(lot.entry_fee_per_contract * lot.count for lot in market.open_lots)
-            if removed_entry_fees > 0:
-                market.realized_pnl_cents -= removed_entry_fees
+            reconciled_mtm = sum(
+                self._calculate_lot_mtm(lot, lot.count, market.last_mid_price)
+                for lot in market.open_lots
+            )
+            if reconciled_mtm != 0.0:
+                market.realized_pnl_cents += reconciled_mtm
                 logger.warning(
-                    f"Reconciled position to 0 for {ticker}: preserved {removed_entry_fees:.2f}c in "
-                    f"deferred entry fees on {len(market.open_lots)} closed lots into realized PnL."
+                    f"Reconciled position to 0 for {ticker}: realized {reconciled_mtm:+.2f}c in "
+                    f"net mark-to-market PnL on {len(market.open_lots)} closed lots."
                 )
             market.open_lots.clear()
         elif current_position == 0:
@@ -163,11 +186,11 @@ class PnLTracker:
             else:
                 trim_needed = abs(delta)
                 new_lots = []
-                trimmed_fees = 0.0
+                reconciled_mtm = 0.0
                 for lot in market.open_lots:
                     if trim_needed > 0:
                         trimmed_count = min(lot.count, trim_needed)
-                        trimmed_fees += lot.entry_fee_per_contract * trimmed_count
+                        reconciled_mtm += self._calculate_lot_mtm(lot, trimmed_count, market.last_mid_price)
                         trim_needed -= trimmed_count
                         remaining = lot.count - trimmed_count
                         if remaining > 0:
@@ -176,19 +199,22 @@ class PnLTracker:
                     else:
                         new_lots.append(lot)
                 market.open_lots = new_lots
-                if trimmed_fees > 0:
-                    market.realized_pnl_cents -= trimmed_fees
+                if reconciled_mtm != 0.0:
+                    market.realized_pnl_cents += reconciled_mtm
                     logger.warning(
                         f"Trimmed {abs(delta)} contracts during reconciliation for {ticker}: "
-                        f"preserved {trimmed_fees:.2f}c in deferred entry fees into realized PnL."
+                        f"realized {reconciled_mtm:+.2f}c in net mark-to-market PnL."
                     )
         else:
-            removed_entry_fees = sum(lot.entry_fee_per_contract * lot.count for lot in market.open_lots)
-            if removed_entry_fees > 0:
-                market.realized_pnl_cents -= removed_entry_fees
+            reconciled_mtm = sum(
+                self._calculate_lot_mtm(lot, lot.count, market.last_mid_price)
+                for lot in market.open_lots
+            )
+            if reconciled_mtm != 0.0:
+                market.realized_pnl_cents += reconciled_mtm
                 logger.warning(
-                    f"Reconciled position reversal for {ticker}: preserved {removed_entry_fees:.2f}c in "
-                    f"deferred entry fees on {len(market.open_lots)} closed lots into realized PnL."
+                    f"Reconciled position reversal for {ticker}: realized {reconciled_mtm:+.2f}c in "
+                    f"net mark-to-market PnL on {len(market.open_lots)} closed lots."
                 )
             market.open_lots = [
                 InventoryLot(
