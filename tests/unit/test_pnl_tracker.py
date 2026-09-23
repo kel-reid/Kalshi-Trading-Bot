@@ -479,7 +479,7 @@ class TestPnLCoverageEdgeCases:
         assert lot2.is_uncosted is True
         assert lot2.price_cents is None
 
-        # Verify periodic reconciliation (is_startup=False) does not seed lots
+        # Verify periodic reconciliation (is_startup=False) reconciles inventory drift as uncosted lots
         im.pnl_tracker.markets["KXTEST-RECON"] = MarketPnL(ticker="KXTEST-RECON")
         mock_payload_recon = {
             "market_positions": [{"ticker": "KXTEST-RECON", "position": 8}]
@@ -490,7 +490,18 @@ class TestPnLCoverageEdgeCases:
             im._hydrate_positions(is_startup=False)
 
         assert im.get_position("KXTEST-RECON") == 8
-        # PnL tracker must NOT have been seeded during periodic reconciliation
+        # PnL tracker is reconciled to REST position with an uncosted delta lot
+        assert im.pnl_tracker.get_open_inventory("KXTEST-RECON") == 8
+        recon_lot = im.pnl_tracker.get_or_create_market("KXTEST-RECON").open_lots[0]
+        assert recon_lot.is_uncosted is True
+        assert recon_lot.price_cents is None
+
+        # Subsequent periodic reconciliation showing flat position reconciles tracker to 0
+        mock_resp.json.return_value = {"market_positions": []}
+        with patch("data.inventory_manager.requests.get", return_value=mock_resp), \
+             patch("data.inventory_manager.get_auth_headers", return_value={}):
+            im._hydrate_positions(is_startup=False)
+        assert im.get_position("KXTEST-RECON") == 0
         assert im.pnl_tracker.get_open_inventory("KXTEST-RECON") == 0
 
     def test_handle_fill_deducts_fees_from_balance(self):
@@ -538,6 +549,76 @@ class TestPnLCoverageEdgeCases:
         summary = tracker.get_market_summary(ticker)
         assert summary["winning_trades"] == 0
         assert summary["losing_trades"] == 1
+
+    def test_entry_fee_adjusted_outcome_classification(self):
+        """Verify that allocated entry fees are included when classifying matched outcomes."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-ENTRY-FEE"
+
+        # Buy 1 @ 50c with 2c entry fee
+        tracker.record_fill(ticker, action="buy", side="yes", count=1, price_cents=50, fee_cents=2.0)
+
+        # Sell 1 @ 51c with 0c closing fee
+        # Gross gain = +1c, Entry fee = 2c, Closing fee = 0c -> Net gain = -1c (Loss)
+        res1 = tracker.record_fill(ticker, action="sell", side="yes", count=1, price_cents=51, fee_cents=0.0)
+        assert res1["matched_outcomes"] == ["loss"]
+        summary1 = tracker.get_market_summary(ticker)
+        assert summary1["winning_trades"] == 0
+        assert summary1["losing_trades"] == 1
+
+        # Another round trip: Buy 1 @ 50c with 1c entry fee, sell @ 53c with 1c closing fee
+        # Gross gain = +3c, Entry fee = 1c, Closing fee = 1c -> Net gain = +1c (Profit)
+        tracker.record_fill(ticker, action="buy", side="yes", count=1, price_cents=50, fee_cents=1.0)
+        res2 = tracker.record_fill(ticker, action="sell", side="yes", count=1, price_cents=53, fee_cents=1.0)
+        assert res2["matched_outcomes"] == ["profit"]
+        summary2 = tracker.get_market_summary(ticker)
+        assert summary2["winning_trades"] == 1
+        assert summary2["losing_trades"] == 1
+
+    def test_reconcile_inventory_branches(self):
+        """Verify reconcile_inventory handles drift expansion, reduction, flipping, and clearing."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-RECON-BRANCHES"
+
+        # 1. Delta == 0 does nothing
+        tracker.reconcile_inventory(ticker, 0)
+        assert tracker.get_open_inventory(ticker) == 0
+
+        # 2. Flat to positive (seed uncosted)
+        tracker.reconcile_inventory(ticker, 5)
+        assert tracker.get_open_inventory(ticker) == 5
+        market = tracker.get_or_create_market(ticker)
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].is_uncosted is True
+
+        # 3. Expansion: 5 -> 8 -> 10 (adds lots of 3 and 2)
+        tracker.reconcile_inventory(ticker, 8)
+        tracker.reconcile_inventory(ticker, 10)
+        assert tracker.get_open_inventory(ticker) == 10
+        assert len(market.open_lots) == 3
+
+        # 4. Reduction: 10 -> 4 (FIFO trims lot 0 of 5, trims 1 from lot 1 leaving 2, preserves lot 2 of 2)
+        market.last_mid_price = 45.0
+        pnl_before = tracker.get_realized_pnl(ticker)
+        tracker.reconcile_inventory(ticker, 4)
+        assert tracker.get_open_inventory(ticker) == 4
+        assert len(market.open_lots) == 2
+        assert market.open_lots[0].count == 2
+        assert market.open_lots[1].count == 2
+        assert tracker.get_realized_pnl(ticker) == pnl_before
+
+        # 5. Position flipped: 4 -> -3 (clears old lots, opens uncosted short lot of 3)
+        tracker.reconcile_inventory(ticker, -3)
+        assert tracker.get_open_inventory(ticker) == -3
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].action == "sell"
+        assert market.open_lots[0].count == 3
+        assert market.open_lots[0].is_uncosted is True
+
+        # 6. Cleared to 0
+        tracker.reconcile_inventory(ticker, 0)
+        assert tracker.get_open_inventory(ticker) == 0
+        assert len(market.open_lots) == 0
 
 
 class TestMarketMakerPnLLifecycle:
@@ -638,3 +719,25 @@ class TestMarketMakerPnLLifecycle:
         await bot.stop()
         assert dummy_task.cancelled()
         assert len(bot._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_market_maker_start_propagates_fatal_exception(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-CRASH")
+        bot.om.sync_and_recover_state = AsyncMock()
+        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.is_connected = True
+        bot.inv_manager.hydrate = AsyncMock()
+        bot.inv_manager._sync_loop = AsyncMock()
+        bot.inv_manager.subscribe = AsyncMock()
+        bot.ob_manager.subscribe = AsyncMock()
+
+        # Make _tick raise a fatal exception
+        bot._tick = AsyncMock(side_effect=RuntimeError("Fatal quoting error"))
+
+        with patch("strategy.market_maker.start_metrics_server"), \
+             patch("strategy.market_maker.send_alert", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError, match="Fatal quoting error"):
+                await bot.start()
+
+        assert bot.running is False

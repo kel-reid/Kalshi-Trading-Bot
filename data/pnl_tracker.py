@@ -26,6 +26,7 @@ class InventoryLot:
     count: int
     timestamp: float
     is_uncosted: bool = False
+    entry_fee_per_contract: float = 0.0
 
 
 @dataclass
@@ -104,6 +105,86 @@ class PnLTracker:
             else:
                 logger.info(f"Seeded initial lot for {ticker}: {abs(position)} {action.upper()} @ {price:.1f}c.")
 
+    def reconcile_inventory(self, ticker: str, target_position: int):
+        """
+        Reconciles open inventory lots to an authoritative target position (e.g. from periodic REST sync).
+        Adjusts lots using uncosted lots or FIFO trimming without fabricating realized PnL.
+        """
+        market = self.get_or_create_market(ticker)
+        current_position = self.get_open_inventory(ticker)
+        delta = target_position - current_position
+
+        if delta == 0:
+            return
+
+        logger.warning(
+            f"Reconciling inventory drift for {ticker}: tracker has {current_position}, "
+            f"authoritative REST has {target_position} (delta={delta:+d}). Adjusting lots."
+        )
+
+        if target_position == 0:
+            market.open_lots.clear()
+        elif current_position == 0:
+            action = "buy" if target_position > 0 else "sell"
+            market.open_lots.append(
+                InventoryLot(
+                    lot_id=f"recon-{str(uuid.uuid4())[:6]}",
+                    ticker=ticker,
+                    action=action,
+                    price_cents=None,
+                    count=abs(target_position),
+                    timestamp=time.time(),
+                    is_uncosted=True,
+                    entry_fee_per_contract=0.0,
+                )
+            )
+        elif (current_position > 0 and target_position > 0) or (current_position < 0 and target_position < 0):
+            if abs(target_position) > abs(current_position):
+                action = "buy" if target_position > 0 else "sell"
+                market.open_lots.append(
+                    InventoryLot(
+                        lot_id=f"recon-{str(uuid.uuid4())[:6]}",
+                        ticker=ticker,
+                        action=action,
+                        price_cents=None,
+                        count=abs(delta),
+                        timestamp=time.time(),
+                        is_uncosted=True,
+                        entry_fee_per_contract=0.0,
+                    )
+                )
+            else:
+                trim_needed = abs(delta)
+                new_lots = []
+                for lot in market.open_lots:
+                    if trim_needed > 0:
+                        if lot.count <= trim_needed:
+                            trim_needed -= lot.count
+                        else:
+                            lot.count -= trim_needed
+                            trim_needed = 0
+                            new_lots.append(lot)
+                    else:
+                        new_lots.append(lot)
+                market.open_lots = new_lots
+        else:
+            market.open_lots = [
+                InventoryLot(
+                    lot_id=f"recon-{str(uuid.uuid4())[:6]}",
+                    ticker=ticker,
+                    action="buy" if target_position > 0 else "sell",
+                    price_cents=None,
+                    count=abs(target_position),
+                    timestamp=time.time(),
+                    is_uncosted=True,
+                    entry_fee_per_contract=0.0,
+                )
+            ]
+
+        if market.last_mid_price is not None:
+            self.update_mid_price(ticker, market.last_mid_price)
+
+
     @staticmethod
     def normalize_fill(action: str, side: str, price_cents: float) -> Tuple[str, float]:
         """
@@ -160,7 +241,7 @@ class PnLTracker:
 
         # FIFO matching against open lots
         new_open_lots: List[InventoryLot] = []
-        matched_lots_info: List[Tuple[int, float, bool]] = []
+        matched_lots_info: List[Tuple[int, float, bool, float]] = []
 
         for lot in market.open_lots:
             if remaining_count > 0 and lot.action == target_close_action:
@@ -183,7 +264,7 @@ class PnLTracker:
                     trade_pnl = (lot.price_cents - norm_price) * matched_count
                     is_uncosted = False
 
-                matched_lots_info.append((matched_count, trade_pnl, is_uncosted))
+                matched_lots_info.append((matched_count, trade_pnl, is_uncosted, lot.entry_fee_per_contract))
                 realized_delta += trade_pnl
 
                 lot.count -= matched_count
@@ -196,15 +277,16 @@ class PnLTracker:
 
         market.open_lots = new_open_lots
 
-        # Classify outcomes net of transaction fees
+        # Classify outcomes net of transaction fees (accounting for both entry and closing fees)
         total_matched_contracts = count - remaining_count
         matched_outcomes: List[str] = []
-        for matched_count, gross_pnl, is_uncosted in matched_lots_info:
+        for matched_count, gross_pnl, is_uncosted, entry_fee_per_contract in matched_lots_info:
             if is_uncosted:
                 # Do not classify trade outcome as win/loss since true cost was unknown
                 continue
-            lot_fee = (float(fee_cents) * matched_count / total_matched_contracts) if total_matched_contracts > 0 else 0.0
-            net_trade_pnl = gross_pnl - lot_fee
+            closing_lot_fee = (float(fee_cents) * matched_count / total_matched_contracts) if total_matched_contracts > 0 else 0.0
+            entry_lot_fee = entry_fee_per_contract * matched_count
+            net_trade_pnl = gross_pnl - (closing_lot_fee + entry_lot_fee)
             market.round_trips_count += 1
             if net_trade_pnl > 0.0001:
                 market.winning_trades_count += 1
@@ -222,13 +304,16 @@ class PnLTracker:
 
         # If any contracts remain after closing existing lots, open a new lot
         if remaining_count > 0:
+            entry_fee_per_contract = (float(fee_cents) / count) if count > 0 else 0.0
             new_lot = InventoryLot(
                 lot_id=str(uuid.uuid4())[:8],
                 ticker=ticker,
                 action=norm_action,
                 price_cents=norm_price,
                 count=remaining_count,
-                timestamp=now
+                timestamp=now,
+                is_uncosted=False,
+                entry_fee_per_contract=entry_fee_per_contract,
             )
             market.open_lots.append(new_lot)
 

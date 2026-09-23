@@ -34,7 +34,7 @@ async def main():
         print(f"\n\n>>> Signal {signum} received. Initiating graceful shutdown... <<<")
         if killer is not None:
             killer.trigger_synchronous()
-        loop.call_soon_threadsafe(shutdown_event.set)
+        shutdown_event.set()
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -63,7 +63,7 @@ async def main():
             except asyncio.CancelledError:
                 break
 
-    if not ticker:
+    if not ticker or shutdown_event.is_set():
         print("Startup aborted before an active market was locked in.")
         return
         

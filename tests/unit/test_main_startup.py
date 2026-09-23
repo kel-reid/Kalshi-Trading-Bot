@@ -148,11 +148,11 @@ async def test_main_startup_shutdown_signal_during_discovery():
         signal_handlers[sig] = handler
 
     async def mock_discover(**kwargs):
-        # Fire signal during discovery
+        # Fire signal during discovery and return valid ticker
         handler = signal_handlers.get(signal.SIGINT)
         assert handler is not None
         handler(signal.SIGINT, None)
-        return None
+        return "KXNFLGAME-DISCOVERED"
 
     mock_bot_cls = MagicMock()
 

@@ -137,6 +137,7 @@ class AvellanedaStoikovBot:
             logger.error(f"Fatal error in trading loop: {e}", exc_info=True)
             await send_alert(f"Fatal error in trading loop for {self.ticker}: {e}")
             self.running = False
+            raise
 
     async def _tick(self):
         """The core logic evaluated every cycle."""
