@@ -81,8 +81,12 @@ class InventoryManager:
                 return None
             if isinstance(data, dict) and "market_positions" in data and isinstance(data["market_positions"], list):
                 for entry in data["market_positions"]:
-                    if not isinstance(entry, dict) or not entry.get("ticker"):
+                    if not isinstance(entry, dict):
                         logger.error(f"Positions response contains malformed entry: {entry}")
+                        return None
+                    ticker = entry.get("ticker")
+                    if not isinstance(ticker, str) or not ticker.strip():
+                        logger.error(f"Positions response contains malformed entry missing valid ticker: {entry}")
                         return None
                     pos_val = entry.get("position_fp", entry.get("position", 0))
                     if isinstance(pos_val, bool):
@@ -100,27 +104,27 @@ class InventoryManager:
             logger.error(f"Failed to fetch positions: {response.text}")
             return None
 
-    def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False):
+    def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False) -> bool:
         """Applies REST positions to state, running on the event loop thread."""
         # Atomically validate and parse all entries before mutating state or PnL lots
         validated_entries = []
         for pos in market_positions:
             if not isinstance(pos, dict):
                 logger.error(f"Malformed position entry: {pos}")
-                return
+                return False
             ticker = pos.get("ticker")
             if not ticker or not isinstance(ticker, str) or not ticker.strip():
                 logger.error(f"Malformed position entry missing valid ticker: {pos}")
-                return
+                return False
             pos_val = pos.get("position_fp", pos.get("position", 0))
             if isinstance(pos_val, bool):
                 logger.error(f"Malformed boolean position for {ticker}: {pos}")
-                return
+                return False
             try:
                 position = int(float(pos_val))
             except (ValueError, TypeError):
                 logger.error(f"Malformed position value ({pos_val!r}) for {ticker}: {pos}")
-                return
+                return False
             validated_entries.append((ticker.strip(), position, pos))
 
         new_positions = {}
@@ -162,6 +166,8 @@ class InventoryManager:
                 KALSHI_FEES_PAID_CENTS.labels(ticker=t).set(self.pnl_tracker.get_total_fees(t))
             except Exception as e:
                 logger.debug(f"Prometheus metric update skipped for {t}: {e}")
+
+        return True
 
     def _hydrate_balance(self):
         """Fetch initial balance via REST synchronously."""
@@ -208,15 +214,16 @@ class InventoryManager:
             self.balance_cents = bal
             logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
 
+        positions_applied = True
         if market_positions is not None:
-            self._apply_positions(market_positions, is_startup=is_startup)
+            positions_applied = self._apply_positions(market_positions, is_startup=is_startup)
 
-        # On startup, both are guaranteed present here.
+        # On startup, both are guaranteed present here and must have successfully applied.
         if is_startup:
-            return True
+            return positions_applied
 
-        # For periodic reconciliation, return True if at least one snapshot succeeded.
-        return bal is not None or market_positions is not None
+        # For periodic reconciliation, return True if at least one snapshot succeeded and positions applied.
+        return (bal is not None or market_positions is not None) and positions_applied
 
     async def _sync_loop(self):
         """
@@ -283,11 +290,17 @@ class InventoryManager:
         price = fill_msg.get("price")
         if price is None:
             if side == "yes":
-                price = fill_msg.get("yes_price", fill_msg.get("no_price"))
+                if fill_msg.get("yes_price") is not None:
+                    price = fill_msg.get("yes_price")
+                elif fill_msg.get("no_price") is not None:
+                    opp = fill_msg.get("no_price")
+                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) else None
             elif side == "no":
-                price = fill_msg.get("no_price", fill_msg.get("yes_price"))
-            else:
-                price = fill_msg.get("yes_price", fill_msg.get("no_price"))
+                if fill_msg.get("no_price") is not None:
+                    price = fill_msg.get("no_price")
+                elif fill_msg.get("yes_price") is not None:
+                    opp = fill_msg.get("yes_price")
+                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) else None
 
         # 4. Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
         if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or price >= 100 or math.isnan(price) or math.isinf(price):
