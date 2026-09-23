@@ -42,6 +42,7 @@ class InventoryManager:
         # Kalshi usually tracks 'position' as an integer of contracts.
         self.positions: Dict[str, int] = {}
         self.pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
+        self._fill_count: int = 0
         
         self.ws_client.add_message_handler(self._handle_message)
 
@@ -112,17 +113,30 @@ class InventoryManager:
         if market_positions is not None:
             self._apply_positions(market_positions, is_startup=is_startup)
 
-    async def hydrate(self, is_startup: bool = False):
+    async def hydrate(self, is_startup: bool = False) -> bool:
         """Run hydration asynchronously to avoid blocking the event loop."""
         logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
+        start_fill_count = self._fill_count
         bal = await asyncio.to_thread(self._fetch_balance)
+        market_positions = await asyncio.to_thread(self._fetch_positions)
+
+        # Concurrency guard: if a fill arrived while REST requests were in-flight,
+        # the REST snapshot is stale and would overwrite real-time positions.
+        if not is_startup and self._fill_count != start_fill_count:
+            logger.info(
+                f"Skipping periodic REST inventory reconciliation: {self._fill_count - start_fill_count} "
+                f"fill(s) received during REST fetch window. Real-time WebSocket state is authoritative."
+            )
+            return False
+
         if bal is not None:
             self.balance_cents = bal
             logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
 
-        market_positions = await asyncio.to_thread(self._fetch_positions)
         if market_positions is not None:
             self._apply_positions(market_positions, is_startup=is_startup)
+            return True
+        return False
 
     async def _sync_loop(self):
         """
@@ -169,6 +183,8 @@ class InventoryManager:
         
         if not ticker or count == 0:
             return
+            
+        self._fill_count += 1
             
         # Update balance
         # If we buy, we spend (price * count) cents

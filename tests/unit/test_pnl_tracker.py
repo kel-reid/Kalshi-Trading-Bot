@@ -620,6 +620,86 @@ class TestPnLCoverageEdgeCases:
         assert tracker.get_open_inventory(ticker) == 0
         assert len(market.open_lots) == 0
 
+    def test_reversal_fill_fee_attribution_proportional_and_no_double_counting(self):
+        """Verify that position reversal fills divide fee by total fill count, avoiding double-counting."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-REV-FEE"
+
+        # 1. Buy 4 @ 50c with 2.0c fee -> entry fee per contract = 0.5c
+        tracker.record_fill(ticker, action="buy", side="yes", count=4, price_cents=50, fee_cents=2.0)
+        market = tracker.get_or_create_market(ticker)
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].entry_fee_per_contract == 0.5
+
+        # 2. Sell 10 @ 60c with 10.0c fee (overshoot / reversal)
+        # Matched contracts: 4. Gross pnl = (60 - 50) * 4 = +40.0c
+        # Closing fee for matched 4 contracts = 10.0c * (4 / 10) = 4.0c (NOT 10.0c!)
+        # Entry fee for matched 4 contracts = 0.5c * 4 = 2.0c
+        # Net trade pnl = 40.0c - (4.0c + 2.0c) = +34.0c (PROFIT)
+        res = tracker.record_fill(ticker, action="sell", side="yes", count=10, price_cents=60, fee_cents=10.0)
+        assert res["matched_outcomes"] == ["profit"]
+        assert market.round_trips_count == 1
+        assert market.winning_trades_count == 1
+
+        # The new opened short lot of 6 contracts must carry entry fee = 10.0c / 10 = 1.0c/contract
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].count == 6
+        assert market.open_lots[0].action == "sell"
+        assert market.open_lots[0].entry_fee_per_contract == 1.0
+
+        # 3. Buy back the 6 short contracts @ 55c with 6.0c fee
+        # Matched contracts: 6. Gross pnl = (60 - 55) * 6 = +30.0c
+        # Closing fee = 6.0c * (6 / 6) = 6.0c
+        # Entry fee = 1.0c * 6 = 6.0c
+        # Net trade pnl = 30.0c - (6.0c + 6.0c) = +18.0c (PROFIT)
+        res2 = tracker.record_fill(ticker, action="buy", side="yes", count=6, price_cents=55, fee_cents=6.0)
+        assert res2["matched_outcomes"] == ["profit"]
+        assert market.round_trips_count == 2
+        assert market.winning_trades_count == 2
+        assert len(market.open_lots) == 0
+
+        # Total realized pnl check:
+        # Gross gain = 40c + 30c = 70c
+        # Total fees paid = 2c + 10c + 6c = 18c
+        # Net realized pnl = 70c - 18c = +52c
+        assert tracker.get_realized_pnl(ticker) == 52.0
+
+    @pytest.mark.asyncio
+    async def test_inventory_manager_reconciliation_skips_when_fill_arrives_in_flight(self):
+        """Verify that periodic REST reconciliation skips when a WebSocket fill arrives in flight."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.positions["KXTEST-DRIFT"] = 5
+        im.balance_cents = 5000
+
+        # Simulate a fill arriving while _fetch_positions is executing
+        def simulate_in_flight_fill():
+            im._handle_fill({
+                "market_ticker": "KXTEST-DRIFT",
+                "action": "buy",
+                "side": "yes",
+                "count": 3,
+                "price": 50,
+                "fee_cents": 1.0
+            })
+            return [{"ticker": "KXTEST-DRIFT", "position": 5}] # Stale REST response
+
+        with patch.object(im, "_fetch_balance", return_value=5000), \
+             patch.object(im, "_fetch_positions", side_effect=simulate_in_flight_fill):
+            # Periodic reconciliation (is_startup=False) must detect the in-flight fill and abort
+            applied = await im.hydrate(is_startup=False)
+            assert applied is False
+            # Position should remain 8 (5 + 3 from fill), not overwritten with stale 5
+            assert im.get_position("KXTEST-DRIFT") == 8
+
+        # Startup hydration (is_startup=True) should apply normally
+        with patch.object(im, "_fetch_balance", return_value=6000), \
+             patch.object(im, "_fetch_positions", return_value=[{"ticker": "KXTEST-DRIFT", "position": 8}]):
+            applied_startup = await im.hydrate(is_startup=True)
+            assert applied_startup is True
+            assert im.balance_cents == 6000
+            assert im.get_position("KXTEST-DRIFT") == 8
+
 
 class TestMarketMakerPnLLifecycle:
     """Verifies MarketMaker PnL snapshot triggers and error handling."""
