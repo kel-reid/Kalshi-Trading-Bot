@@ -76,6 +76,15 @@ class InventoryManager:
                 position = int(float(pos.get("position_fp", pos.get("position", 0))))
                 if ticker and position != 0:
                     new_positions[ticker] = position
+                    # Seed PnLTracker with existing position if no lots exist
+                    exposure = pos.get("market_exposure", pos.get("total_traded", 0))
+                    cost_basis = None
+                    try:
+                        if exposure and position != 0:
+                            cost_basis = abs(float(exposure) / float(position))
+                    except Exception:
+                        cost_basis = None
+                    self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
             
             self.positions = new_positions
             logger.info(f"Hydrated {len(self.positions)} active positions: {self.positions}")
@@ -139,10 +148,14 @@ class InventoryManager:
         # If we sell, we receive (price * count) cents
         # Wait, selling "yes" might also include resolving risks or just earning the premium.
         # But for simple inventory tracking, we just track the position delta.
+        fee = float(fill_msg.get("fee_cents", fill_msg.get("fee", 0.0)))
+        fee_int = int(round(fee))
+
+        # Adjust balance based on action (including fees)
         if action == "buy":
-            self.balance_cents -= (price * count)
+            self.balance_cents -= (price * count + fee_int)
         elif action == "sell":
-            self.balance_cents += (price * count)
+            self.balance_cents += (price * count - fee_int)
             
         # Update positions
         # Standard convention: + for 'yes' shares, - for 'no' shares (or tracked separately)
@@ -159,7 +172,6 @@ class InventoryManager:
         self.positions[ticker] = current_pos + delta
         
         # Track Realized and Unrealized PnL via FIFO lot matching
-        fee = float(fill_msg.get("fee_cents", fill_msg.get("fee", 0.0)))
         pnl_impact = self.pnl_tracker.record_fill(
             ticker=ticker,
             action=action,
@@ -176,9 +188,7 @@ class InventoryManager:
             KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_realized_pnl(ticker))
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
 
-            if pnl_impact.get("matched_contracts", 0) > 0:
-                delta_pnl = pnl_impact.get("realized_delta_cents", 0.0)
-                outcome = "profit" if delta_pnl > 0.0001 else ("loss" if delta_pnl < -0.0001 else "scratch")
+            for outcome in pnl_impact.get("matched_outcomes", []):
                 KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
         except Exception as e:
             logger.debug(f"Prometheus metric update skipped: {e}")

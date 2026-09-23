@@ -170,14 +170,14 @@ Create a dashboard in Grafana Cloud with the following PromQL queries:
 
 | Panel Title | Metric Query | Visualization | Description |
 | :--- | :--- | :--- | :--- |
-| **Total Orders Placed** | `sum(kalshi_orders_placed_total)` | Stat | Total limit orders submitted and accepted by the exchange. |
-| **Buy Orders Placed** | `sum(kalshi_orders_placed_total{action="buy"})` | Stat | Total buy orders submitted and accepted. |
-| **Sell Orders Placed** | `sum(kalshi_orders_placed_total{action="sell"})` | Stat | Total sell orders submitted and accepted. |
+| **Total Orders Placed** | `sum(orders_placed_total)` | Stat | Total limit orders submitted and accepted by the exchange. |
+| **Buy Orders Placed** | `sum(orders_placed_total{action="buy"})` | Stat | Total buy orders submitted and accepted. |
+| **Sell Orders Placed** | `sum(orders_placed_total{action="sell"})` | Stat | Total sell orders submitted and accepted. |
 | **Realized PnL ($)** | `kalshi_realized_pnl_cents / 100` | Stat / Time Series | Net profit/loss locked in from closed round trips minus fees. |
 | **Unrealized MTM PnL ($)** | `kalshi_unrealized_pnl_cents / 100` | Stat / Time Series | Floating mark-to-market gain/loss on open lots vs orderbook mid. |
 | **Total Strategy PnL ($)** | `(kalshi_realized_pnl_cents + kalshi_unrealized_pnl_cents) / 100` | Stat / Time Series | Total economic performance across open and closed inventory. |
 | **Total Exchange Fees ($)** | `kalshi_total_fees_cents / 100` | Stat | Total trading transaction fees paid to Kalshi. |
 | **Round Trip Trade Outcomes** | `kalshi_round_trips_total` | Bar Chart / Pie Chart | Total completed round trips categorized by profit, loss, or scratch. |
-| **Cash Balance ($)** | `kalshi_bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from exchange REST hydration. |
-| **Net Inventory Position** | `kalshi_bot_inventory_net_position` | Time Series | Net contract exposure on active market (`q`). |
+| **Cash Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from exchange REST hydration. |
+| **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market (`q`). |
 | **Kalshi API Latency** | `rate(kalshi_api_latency_seconds_sum[1m]) / rate(kalshi_api_latency_seconds_count[1m]) * 1000` | Time Series | Rolling REST execution roundtrip latency (ms). |

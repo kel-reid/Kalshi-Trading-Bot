@@ -437,7 +437,12 @@ class AvellanedaStoikovBot:
 
         logger.warning(f"Rotating target market from {old_ticker} to {new_ticker}...")
 
-        # Persist final PnL attribution snapshot for the market being rotated out
+        # 1. Withdraw all active quotes on the previous ticker
+        if not await self._cancel_all_quotes():
+            logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
+            return False
+
+        # Persist final PnL attribution snapshot for the market being rotated out (after resting quotes are confirmed cancelled)
         try:
             pnl_summary = self.inv_manager.get_pnl_summary(old_ticker)
             await self.om.record_pnl_snapshot_async(
@@ -450,11 +455,6 @@ class AvellanedaStoikovBot:
             )
         except Exception as e:
             logger.error(f"Failed to record rotation PnL snapshot for {old_ticker}: {e}")
-
-        # 1. Withdraw all active quotes on the previous ticker
-        if not await self._cancel_all_quotes():
-            logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
-            return False
 
         # 2. Swap orderbook subscription
         await self.ob_manager.unsubscribe([old_ticker])

@@ -69,6 +69,18 @@ async def main():
         print(f"\n\n>>> Signal {signum} received. Safety Kill Switch Triggered <<<")
         # Instantly scrub local execution layer 
         killer.trigger_synchronous()
+        try:
+            pnl_summary = bot.inv_manager.get_pnl_summary(bot.ticker)
+            bot.om.record_pnl_snapshot(
+                ticker=bot.ticker,
+                realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                inventory=bot.inv_manager.get_position(bot.ticker),
+                rotation_session_id=pnl_summary.get("rotation_session_id", "")
+            )
+        except Exception as e:
+            print(f"Error persisting shutdown PnL snapshot: {e}")
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -80,6 +92,8 @@ async def main():
         print(f"Bot crashed: {e}")
         # Always trigger safety on crash
         await killer.trigger()
+    finally:
+        await bot.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

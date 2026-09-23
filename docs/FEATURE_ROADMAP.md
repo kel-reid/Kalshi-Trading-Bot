@@ -56,10 +56,11 @@ The bot persists order lifecycle records in PostgreSQL and manages inventory exp
      );
      ```
 3. **Grafana Cloud Telemetry**:
-   - Expose Prometheus gauges via `utils/metrics.py`:
-     - `kalshi_realized_pnl_cents` (gauge by market ticker)
-     - `kalshi_unrealized_pnl_cents` (gauge by market ticker)
-     - `kalshi_cumulative_pnl_cents` (counter of net realized profit)
+   - Expose Prometheus metrics via `utils/metrics.py`:
+     - `kalshi_realized_pnl_cents` (gauge by market ticker; net realized profit after fees)
+     - `kalshi_unrealized_pnl_cents` (gauge by market ticker; live mark-to-market against mid)
+     - `kalshi_total_fees_cents` (gauge by market ticker)
+     - `kalshi_round_trips_total` (counter by market ticker and outcome: profit, loss, scratch)
    - Add dedicated panels to the Grafana Cloud dashboard for instantaneous balance and PnL monitoring.
 
 ### Acceptance Criteria
