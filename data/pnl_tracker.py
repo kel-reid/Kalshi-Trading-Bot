@@ -414,15 +414,18 @@ class PnLTracker:
     def get_market_summary(self, ticker: str) -> Dict[str, Any]:
         """Returns a complete performance summary for a market."""
         market = self.get_or_create_market(ticker)
-        total_pnl = market.realized_pnl_cents + market.unrealized_pnl_cents
+        realized = round(market.realized_pnl_cents, 4)
+        unrealized = round(market.unrealized_pnl_cents, 4)
+        total_pnl = round(realized + unrealized, 4)
+        total_fees = round(market.total_fees_cents, 4)
         net_inventory = self.get_open_inventory(ticker)
 
         return {
             "ticker": ticker,
-            "realized_pnl_cents": round(market.realized_pnl_cents, 2),
-            "unrealized_pnl_cents": round(market.unrealized_pnl_cents, 2),
-            "total_pnl_cents": round(total_pnl, 2),
-            "total_fees_cents": round(market.total_fees_cents, 2),
+            "realized_pnl_cents": realized,
+            "unrealized_pnl_cents": unrealized,
+            "total_pnl_cents": total_pnl,
+            "total_fees_cents": total_fees,
             "net_inventory": net_inventory,
             "open_lots_count": len(market.open_lots),
             "round_trips_count": market.round_trips_count,
