@@ -1302,4 +1302,93 @@ class TestMarketMakerPnLLifecycle:
         # Total PnL strictly conserved: 95.0c!
         assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
 
+    def test_fetch_balance_rejects_missing_or_invalid_balance_field(self):
+        """Verify _fetch_balance returns None when 'balance' is missing or non-numeric/boolean."""
+        im = InventoryManager(ws_client=MagicMock())
+
+        invalid_responses = [
+            {},
+            {"other_key": 5000},
+            {"balance": None},
+            {"balance": "5000"},
+            {"balance": True},
+            {"balance": False},
+        ]
+        for invalid_json in invalid_responses:
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = invalid_json
+            with patch("requests.get", return_value=mock_resp):
+                assert im._fetch_balance() is None, f"Expected None for invalid payload: {invalid_json}"
+
+        # Valid balance returns integer cents
+        valid_resp = MagicMock(status_code=200)
+        valid_resp.json.return_value = {"balance": 12500}
+        with patch("requests.get", return_value=valid_resp):
+            assert im._fetch_balance() == 12500
+
+    def test_fetch_positions_rejects_missing_or_invalid_positions_field(self):
+        """Verify _fetch_positions returns None when 'market_positions' is missing or not a list."""
+        im = InventoryManager(ws_client=MagicMock())
+
+        invalid_responses = [
+            {},
+            {"other_key": []},
+            {"market_positions": None},
+            {"market_positions": "invalid"},
+            {"market_positions": 123},
+        ]
+        for invalid_json in invalid_responses:
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = invalid_json
+            with patch("requests.get", return_value=mock_resp):
+                assert im._fetch_positions() is None, f"Expected None for invalid payload: {invalid_json}"
+
+        # Valid positions returns the list
+        valid_resp = MagicMock(status_code=200)
+        valid_resp.json.return_value = {"market_positions": [{"ticker": "KXTEST", "position": 5}]}
+        with patch("requests.get", return_value=valid_resp):
+            assert im._fetch_positions() == [{"ticker": "KXTEST", "position": 5}]
+
+    def test_handle_fill_supports_raw_vendor_yes_and_no_price_payloads(self):
+        """Verify _handle_fill parses real Kalshi vendor fill messages carrying yes_price and no_price."""
+        im = InventoryManager(ws_client=MagicMock())
+        im.balance_cents = 10000
+
+        # 1. Raw Kalshi YES fill payload with yes_price=45, no_price=55
+        raw_yes_fill = {
+            "trade_id": "t-1",
+            "market_ticker": "KXTEST-VENDOR",
+            "action": "buy",
+            "side": "yes",
+            "count": 10,
+            "yes_price": 45,
+            "no_price": 55,
+            "fee_cents": 2.0
+        }
+        im._handle_fill(raw_yes_fill)
+        assert im._fill_count == 1
+        assert im.get_position("KXTEST-VENDOR") == 10
+        # Paid (45 * 10) + 2 fee = 452c
+        assert im.balance_cents == 10000 - 452
+        assert im.get_realized_pnl("KXTEST-VENDOR") == 0.0
+
+        # 2. Raw Kalshi NO fill payload with yes_price=45, no_price=55
+        raw_no_fill = {
+            "trade_id": "t-2",
+            "market_ticker": "KXTEST-VENDOR-NO",
+            "action": "buy",
+            "side": "no",
+            "count": 5,
+            "yes_price": 45,
+            "no_price": 55,
+            "fee_cents": 1.0
+        }
+        im._handle_fill(raw_no_fill)
+        assert im._fill_count == 2
+        # Bought NO -> Net YES position is -5
+        assert im.get_position("KXTEST-VENDOR-NO") == -5
+        # Paid (55 * 5) + 1 fee = 276c
+        assert im.balance_cents == (10000 - 452) - 276
+
+
 
