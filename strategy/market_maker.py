@@ -476,10 +476,20 @@ class AvellanedaStoikovBot:
         await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
 
-    async def stop(self):
+    async def stop(self) -> bool:
         self.running = False
         # 1. Withdraw resting quotes first to eliminate market risk immediately
-        await self._cancel_all_quotes()
+        quotes_cancelled = await self._cancel_all_quotes()
+        if not quotes_cancelled:
+            logger.error("Quote cancellation failed during shutdown. Escalating to emergency kill switch...")
+            try:
+                from execution.kill_switch import KillSwitch
+                killer = KillSwitch(self.om)
+                await killer.trigger()
+                quotes_cancelled = not (self.current_bid_id or self.current_ask_id or self.om.active_orders)
+            except Exception as e:
+                logger.critical(f"Emergency kill switch failed during shutdown: {e}")
+                quotes_cancelled = False
 
         # 2. Persist final shutdown snapshot after quotes are withdrawn
         try:
@@ -501,3 +511,5 @@ class AvellanedaStoikovBot:
             task.cancel()
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        return quotes_cancelled
