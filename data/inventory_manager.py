@@ -54,7 +54,15 @@ class InventoryManager:
         with measure_latency("GET", "/trade-api/v2/portfolio/balance"):
             response = requests.get(BASE_URL + sign_path, headers=headers, timeout=10, verify=certifi.where())
         if response.status_code == 200:
-            return response.json().get("balance", 0)
+            try:
+                data = response.json()
+            except Exception as e:
+                logger.error(f"Failed to parse balance JSON: {e}")
+                return None
+            if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], (int, float)) and not isinstance(data["balance"], bool):
+                return int(round(data["balance"]))
+            logger.error(f"Balance response missing or invalid 'balance' field: {data}")
+            return None
         else:
             logger.error(f"Failed to fetch balance: {response.text}")
             return None
@@ -66,7 +74,15 @@ class InventoryManager:
         with measure_latency("GET", "/trade-api/v2/portfolio/positions"):
             response = requests.get(BASE_URL + sign_path, headers=headers, params={"limit": 200}, timeout=10, verify=certifi.where())
         if response.status_code == 200:
-            return response.json().get("market_positions", [])
+            try:
+                data = response.json()
+            except Exception as e:
+                logger.error(f"Failed to parse positions JSON: {e}")
+                return None
+            if isinstance(data, dict) and "market_positions" in data and isinstance(data["market_positions"], list):
+                return data["market_positions"]
+            logger.error(f"Positions response missing or invalid 'market_positions' field: {data}")
+            return None
         else:
             logger.error(f"Failed to fetch positions: {response.text}")
             return None
@@ -231,6 +247,16 @@ class InventoryManager:
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             logger.warning(f"Dropping fill with invalid count ({count!r}): {fill_msg}")
             return
+
+        # Resolve fill execution price from generic 'price' or vendor side-specific fields ('yes_price' / 'no_price')
+        price = fill_msg.get("price")
+        if price is None:
+            if side == "yes":
+                price = fill_msg.get("yes_price", fill_msg.get("no_price"))
+            elif side == "no":
+                price = fill_msg.get("no_price", fill_msg.get("yes_price"))
+            else:
+                price = fill_msg.get("yes_price", fill_msg.get("no_price"))
 
         # 4. Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
         if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or price >= 100 or math.isnan(price) or math.isinf(price):
