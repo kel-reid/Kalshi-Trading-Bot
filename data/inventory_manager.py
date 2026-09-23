@@ -79,10 +79,10 @@ class InventoryManager:
             if ticker and position != 0:
                 new_positions[ticker] = position
                 if is_startup:
-                    exposure = pos.get("market_exposure", pos.get("total_traded", 0))
+                    exposure = pos.get("market_exposure")
                     cost_basis = None
                     try:
-                        if exposure and position != 0:
+                        if exposure is not None and float(exposure) != 0 and position != 0:
                             cost_basis = abs(float(exposure) / float(position))
                     except Exception:
                         cost_basis = None

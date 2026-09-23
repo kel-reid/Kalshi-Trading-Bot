@@ -5,6 +5,7 @@ Tests FIFO lot matching, YES/NO normalization, fees accounting,
 mark-to-market unrealized PnL, trade classification, and market rotation attribution.
 """
 
+import asyncio
 import pytest
 import uuid
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -419,15 +420,15 @@ class TestPnLCoverageEdgeCases:
         assert len(market.open_lots) == 1
         assert market.open_lots[0].price_cents == 42.5
 
-        # 4. Short position with known mid price
+        # 4. Short position with known mid price but missing cost basis -> strictly uncosted (never treat mid as entry basis)
         ticker_short = "KXTEST-SEED-SHORT"
         short_market = tracker.get_or_create_market(ticker_short)
         short_market.last_mid_price = 48.0
         tracker.seed_initial_inventory(ticker_short, -5, cost_basis_cents=None)
         assert tracker.get_open_inventory(ticker_short) == -5
         assert len(short_market.open_lots) == 1
-        assert short_market.open_lots[0].price_cents == 48.0
-        assert short_market.open_lots[0].is_uncosted is False
+        assert short_market.open_lots[0].price_cents is None
+        assert short_market.open_lots[0].is_uncosted is True
         assert short_market.open_lots[0].action == "sell"
 
         # 5. Position with unknown basis and unknown mid -> marks lot as is_uncosted=True, price_cents=None
@@ -453,7 +454,7 @@ class TestPnLCoverageEdgeCases:
         mock_payload = {
             "market_positions": [
                 {"ticker": "KXTEST-HYD1", "position_fp": "10.0", "market_exposure": 450.0},
-                {"ticker": "KXTEST-HYD2", "position": -5, "total_traded": "invalid"},
+                {"ticker": "KXTEST-HYD2", "position": -5, "market_exposure": "invalid"},
                 {"ticker": "KXTEST-ZERO", "position": 0}
             ]
         }
@@ -629,3 +630,11 @@ class TestMarketMakerPnLLifecycle:
         bot.om.record_pnl_snapshot_async.side_effect = Exception("Stop snapshot failed")
         await bot.stop()
         assert "cancel" in call_order
+
+        # Background tasks are cancelled and awaited upon stop
+        dummy_task = asyncio.create_task(asyncio.sleep(10))
+        bot._background_tasks.add(dummy_task)
+        dummy_task.add_done_callback(bot._background_tasks.discard)
+        await bot.stop()
+        assert dummy_task.cancelled()
+        assert len(bot._background_tasks) == 0
