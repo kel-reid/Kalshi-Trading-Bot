@@ -123,6 +123,13 @@ class PnLTracker:
         )
 
         if target_position == 0:
+            removed_entry_fees = sum(lot.entry_fee_per_contract * lot.count for lot in market.open_lots)
+            if removed_entry_fees > 0:
+                market.realized_pnl_cents -= removed_entry_fees
+                logger.warning(
+                    f"Reconciled position to 0 for {ticker}: preserved {removed_entry_fees:.2f}c in "
+                    f"deferred entry fees on {len(market.open_lots)} closed lots into realized PnL."
+                )
             market.open_lots.clear()
         elif current_position == 0:
             action = "buy" if target_position > 0 else "sell"
@@ -156,18 +163,33 @@ class PnLTracker:
             else:
                 trim_needed = abs(delta)
                 new_lots = []
+                trimmed_fees = 0.0
                 for lot in market.open_lots:
                     if trim_needed > 0:
-                        if lot.count <= trim_needed:
-                            trim_needed -= lot.count
-                        else:
-                            lot.count -= trim_needed
-                            trim_needed = 0
+                        trimmed_count = min(lot.count, trim_needed)
+                        trimmed_fees += lot.entry_fee_per_contract * trimmed_count
+                        trim_needed -= trimmed_count
+                        remaining = lot.count - trimmed_count
+                        if remaining > 0:
+                            lot.count = remaining
                             new_lots.append(lot)
                     else:
                         new_lots.append(lot)
                 market.open_lots = new_lots
+                if trimmed_fees > 0:
+                    market.realized_pnl_cents -= trimmed_fees
+                    logger.warning(
+                        f"Trimmed {abs(delta)} contracts during reconciliation for {ticker}: "
+                        f"preserved {trimmed_fees:.2f}c in deferred entry fees into realized PnL."
+                    )
         else:
+            removed_entry_fees = sum(lot.entry_fee_per_contract * lot.count for lot in market.open_lots)
+            if removed_entry_fees > 0:
+                market.realized_pnl_cents -= removed_entry_fees
+                logger.warning(
+                    f"Reconciled position reversal for {ticker}: preserved {removed_entry_fees:.2f}c in "
+                    f"deferred entry fees on {len(market.open_lots)} closed lots into realized PnL."
+                )
             market.open_lots = [
                 InventoryLot(
                     lot_id=f"recon-{str(uuid.uuid4())[:6]}",

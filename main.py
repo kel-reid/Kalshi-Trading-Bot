@@ -97,6 +97,7 @@ async def main():
     bot_task = asyncio.create_task(bot.start())
     stop_waiter = asyncio.create_task(shutdown_event.wait())
 
+    task_exception = None
     try:
         done, pending = await asyncio.wait(
             [bot_task, stop_waiter],
@@ -107,6 +108,7 @@ async def main():
             if exc:
                 print(f"Bot crashed: {exc}")
                 await killer.trigger()
+                task_exception = exc
         else:
             bot.running = False
             bot_task.cancel()
@@ -114,12 +116,16 @@ async def main():
     except Exception as e:
         print(f"Bot crashed: {e}")
         await killer.trigger()
+        task_exception = e
     finally:
         stop_waiter.cancel()
         shutdown_clean = await bot.stop()
         if not shutdown_clean:
             killer.trigger_synchronous()
             raise RuntimeError("Shutdown failed: active orders could not be confirmed cancelled on exchange.")
+
+    if task_exception:
+        raise task_exception
 
 if __name__ == "__main__":
     asyncio.run(main())

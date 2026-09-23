@@ -131,7 +131,8 @@ async def test_main_bot_crash_triggers_safety_and_stop():
          patch("main.AvellanedaStoikovBot", return_value=mock_bot), \
          patch("main.KillSwitch", return_value=mock_killer):
         
-        await main()
+        with pytest.raises(RuntimeError, match="Unexpected MM loop crash"):
+            await main()
 
     mock_killer.trigger.assert_awaited_once()
     mock_bot.stop.assert_awaited_once()

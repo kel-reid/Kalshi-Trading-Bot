@@ -144,6 +144,18 @@ class InventoryManager:
             )
             return False
 
+        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # Boundary precondition check: reject immediately without mutating state if either is missing.
+        if is_startup:
+            if bal is None or market_positions is None:
+                logger.error(
+                    f"Startup portfolio hydration failed: missing required ground truth "
+                    f"(balance={'ok' if bal is not None else 'failed'}, "
+                    f"positions={'ok' if market_positions is not None else 'failed'}). "
+                    f"Aborting without mutating portfolio state."
+                )
+                return False
+
         if bal is not None:
             self.balance_cents = bal
             logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
@@ -151,9 +163,9 @@ class InventoryManager:
         if market_positions is not None:
             self._apply_positions(market_positions, is_startup=is_startup)
 
-        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # On startup, both are guaranteed present here.
         if is_startup:
-            return bal is not None and market_positions is not None
+            return True
 
         # For periodic reconciliation, return True if at least one snapshot succeeded.
         return bal is not None or market_positions is not None

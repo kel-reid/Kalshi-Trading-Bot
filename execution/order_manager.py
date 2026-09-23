@@ -131,7 +131,7 @@ class OrderManager:
                         unrealized_pnl_cents NUMERIC(12, 4) NOT NULL,
                         total_fees_cents NUMERIC(12, 4) DEFAULT 0,
                         inventory_at_snapshot INT NOT NULL,
-                        rotation_session_id VARCHAR(64) NOT NULL
+                        rotation_session_id UUID NOT NULL
                     )
                 ''')
                 cursor.execute('''
@@ -150,6 +150,12 @@ class OrderManager:
         rotation_session_id: str
     ):
         """Persists a real-time PnL attribution snapshot into PostgreSQL."""
+        try:
+            valid_uuid = str(uuid.UUID(str(rotation_session_id)))
+        except (ValueError, AttributeError, TypeError) as err:
+            logger.error(f"Invalid rotation_session_id {rotation_session_id!r} for {ticker}: {err}")
+            raise ValueError(f"Invalid rotation_session_id: {rotation_session_id!r}. Expected a valid UUID.") from err
+
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             with self._get_connection(allow_retries=False) as conn:
@@ -166,7 +172,7 @@ class OrderManager:
                         round(float(unrealized_pnl_cents), 4),
                         round(float(total_fees_cents), 4),
                         int(inventory),
-                        str(rotation_session_id)
+                        valid_uuid
                     ))
                     conn.commit()
         except Exception as e:

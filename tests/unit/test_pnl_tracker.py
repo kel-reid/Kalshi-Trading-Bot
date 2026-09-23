@@ -307,7 +307,7 @@ class TestOrderManagerPnLPersistence:
                 unrealized_pnl_cents=32.00,
                 total_fees_cents=8.50,
                 inventory=5,
-                rotation_session_id="test-session-123"
+                rotation_session_id="11111111-2222-3333-4444-555555555555"
             )
 
             assert mock_cursor.execute.called
@@ -320,8 +320,20 @@ class TestOrderManagerPnLPersistence:
             assert call_args[3] == 32.0
             assert call_args[4] == 8.5
             assert call_args[5] == 5
-            assert call_args[6] == "test-session-123"
+            assert call_args[6] == "11111111-2222-3333-4444-555555555555"
             assert mock_conn.commit.called
+
+    def test_record_pnl_snapshot_rejects_invalid_uuid(self):
+        om = OrderManager()
+        with pytest.raises(ValueError, match="Invalid rotation_session_id"):
+            om.record_pnl_snapshot(
+                ticker="KXTEST-BAD-UUID",
+                realized_pnl_cents=0.0,
+                unrealized_pnl_cents=0.0,
+                total_fees_cents=0.0,
+                inventory=0,
+                rotation_session_id="not-a-valid-uuid"
+            )
 
     @pytest.mark.asyncio
     async def test_record_pnl_snapshot_async(self):
@@ -333,7 +345,7 @@ class TestOrderManagerPnLPersistence:
                 unrealized_pnl_cents=10.0,
                 total_fees_cents=2.0,
                 inventory=2,
-                rotation_session_id="async-uuid"
+                rotation_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             )
             mock_record.assert_called_once_with(
                 ticker="KXTEST-26SEP-ASYNC",
@@ -341,7 +353,7 @@ class TestOrderManagerPnLPersistence:
                 unrealized_pnl_cents=10.0,
                 total_fees_cents=2.0,
                 inventory=2,
-                rotation_session_id="async-uuid"
+                rotation_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             )
 
     def test_record_pnl_snapshot_exception_handled(self):
@@ -354,7 +366,7 @@ class TestOrderManagerPnLPersistence:
                 unrealized_pnl_cents=5.0,
                 total_fees_cents=1.0,
                 inventory=1,
-                rotation_session_id="err-session"
+                rotation_session_id="22222222-3333-4444-5555-666666666666"
             )
 
 
@@ -636,6 +648,36 @@ class TestPnLCoverageEdgeCases:
         tracker.reconcile_inventory(ticker, 0)
         assert tracker.get_open_inventory(ticker) == 0
         assert len(market.open_lots) == 0
+
+    def test_reconcile_inventory_preserves_deferred_entry_fees_in_realized_pnl(self):
+        """Verify reconcile_inventory realizes deferred entry fees when open lots are trimmed or cleared."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-RECON-FEES"
+
+        # Buy 10 @ 50c with 5c fee (0.5c/contract entry fee)
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=5.0)
+        assert tracker.get_realized_pnl(ticker) == 0.0
+        assert tracker.update_mid_price(ticker, 50.0) == -5.0
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == -5.0
+
+        # Partial reconciliation trim: 10 -> 6 (trims 4 contracts, entry fee = 4 * 0.5 = 2.0c)
+        tracker.reconcile_inventory(ticker, 6)
+        assert tracker.get_open_inventory(ticker) == 6
+        # Realized PnL now reflects the 2.0c entry fee of trimmed contracts
+        assert tracker.get_realized_pnl(ticker) == -2.0
+        # Remaining 6 lots carry 3.0c deferred entry fee -> Unrealized at mid 50c is -3.0c
+        assert tracker.get_unrealized_pnl(ticker) == -3.0
+        # Total PnL conserved: -2.0c + -3.0c = -5.0c!
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == -5.0
+
+        # Flattened to 0 by reconciliation: remaining 6 contracts cleared, entry fee = 6 * 0.5 = 3.0c
+        tracker.reconcile_inventory(ticker, 0)
+        assert tracker.get_open_inventory(ticker) == 0
+        # All 5.0c fees now realized into realized PnL
+        assert tracker.get_realized_pnl(ticker) == -5.0
+        assert tracker.get_unrealized_pnl(ticker) == 0.0
+        # Total PnL strictly conserved: -5.0c!
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == -5.0
 
     def test_reversal_fill_fee_attribution_proportional_and_no_double_counting(self):
         """Verify that position reversal fills divide fee by total fill count, avoiding double-counting."""
@@ -1045,20 +1087,25 @@ class TestMarketMakerPnLLifecycle:
         mock_ws = MagicMock()
         im = InventoryManager(mock_ws)
 
-        # 1. Balance succeeds, positions fails -> Startup must return False
+        # 1. Balance succeeds, positions fails -> Startup must return False and NOT mutate balance_cents
+        im.balance_cents = 0
         with patch.object(im, "_fetch_balance", return_value=5000), \
              patch.object(im, "_fetch_positions", return_value=None):
             assert await im.hydrate(is_startup=True) is False
+            assert im.balance_cents == 0
 
-        # 2. Balance fails, positions succeeds -> Startup must return False
+        # 2. Balance fails, positions succeeds -> Startup must return False and NOT seed positions/lots
         with patch.object(im, "_fetch_balance", return_value=None), \
-             patch.object(im, "_fetch_positions", return_value=[]):
+             patch.object(im, "_fetch_positions", return_value=[{"ticker": "KXTEST-FAIL", "position": 10}]):
             assert await im.hydrate(is_startup=True) is False
+            assert im.get_position("KXTEST-FAIL") == 0
+            assert len(im.pnl_tracker.get_or_create_market("KXTEST-FAIL").open_lots) == 0
 
-        # 3. Both succeed -> Startup returns True
+        # 3. Both succeed -> Startup returns True and mutates state
         with patch.object(im, "_fetch_balance", return_value=5000), \
              patch.object(im, "_fetch_positions", return_value=[]):
             assert await im.hydrate(is_startup=True) is True
+            assert im.balance_cents == 5000
 
     @pytest.mark.asyncio
     async def test_hydrate_periodic_allows_partial_success(self):
