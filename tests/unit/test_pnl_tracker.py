@@ -536,10 +536,10 @@ class TestPnLCoverageEdgeCases:
     def test_handle_fill_deducts_fees_from_balance(self):
         mock_ws = MagicMock()
         im = InventoryManager(mock_ws)
-        im.balance_cents = 10000
+        im.balance_cents = 10000.0
         ticker = "KXTEST-FEE-BAL"
 
-        # Buy 2 @ 40c with fee 1.8c -> total cost = 2*40 + 2 = 82c -> balance = 9918c
+        # Buy 2 @ 40c with fee 1.8c -> total cost = 2*40 + 1.8 = 81.8c -> balance = 9918.2c
         im._handle_fill({
             "market_ticker": ticker,
             "action": "buy",
@@ -548,9 +548,9 @@ class TestPnLCoverageEdgeCases:
             "price": 40,
             "fee_cents": 1.8
         })
-        assert im.balance_cents == 9918
+        assert im.balance_cents == 9918.2
 
-        # Sell 2 @ 60c with fee 1.2c -> proceeds = 2*60 - 1 = 119c -> balance = 10037c
+        # Sell 2 @ 60c with fee 1.2c -> proceeds = 2*60 - 1.2 = 118.8c -> balance = 9918.2 + 118.8 = 10037.0c
         im._handle_fill({
             "market_ticker": ticker,
             "action": "sell",
@@ -559,7 +559,10 @@ class TestPnLCoverageEdgeCases:
             "price": 60,
             "fee_cents": 1.2
         })
-        assert im.balance_cents == 10037
+        assert im.balance_cents == 10037.0
+        # Balance delta strictly reconciles with Strategy Realized PnL: 10037.0 - 10000 = +37.0c
+        assert im.get_realized_pnl(ticker) == 37.0
+        assert im.balance_cents - 10000.0 == im.get_realized_pnl(ticker)
 
     def test_fee_adjusted_outcome_classification(self):
         tracker = PnLTracker()
@@ -1389,6 +1392,39 @@ class TestMarketMakerPnLLifecycle:
         assert im.get_position("KXTEST-VENDOR-NO") == -5
         # Paid (55 * 5) + 1 fee = 276c
         assert im.balance_cents == (10000 - 452) - 276
+
+    def test_apply_positions_atomically_rejects_malformed_entries_without_partial_mutation(self):
+        """Verify _apply_positions rejects malformed snapshots upfront without partially mutating state or PnL lots."""
+        im = InventoryManager(ws_client=MagicMock())
+        im.positions = {"KXTEST-EXISTING": 5}
+
+        # 1. Non-dict entry in market_positions
+        malformed_snapshot_1 = [
+            {"ticker": "KXTEST-NEW", "position": 10},
+            "not-a-dict"
+        ]
+        im._apply_positions(malformed_snapshot_1, is_startup=True)
+        assert im.positions == {"KXTEST-EXISTING": 5}
+        assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
+        # 2. Malformed non-numeric position_fp value
+        malformed_snapshot_2 = [
+            {"ticker": "KXTEST-NEW", "position": 10},
+            {"ticker": "KXTEST-BAD", "position_fp": "invalid-pos"}
+        ]
+        im._apply_positions(malformed_snapshot_2, is_startup=True)
+        assert im.positions == {"KXTEST-EXISTING": 5}
+        assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
+        # 3. Missing ticker
+        malformed_snapshot_3 = [
+            {"ticker": "KXTEST-NEW", "position": 10},
+            {"position": 5}
+        ]
+        im._apply_positions(malformed_snapshot_3, is_startup=False)
+        assert im.positions == {"KXTEST-EXISTING": 5}
+        assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
 
 
 
