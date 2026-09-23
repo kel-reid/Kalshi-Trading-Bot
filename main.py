@@ -87,7 +87,10 @@ async def main():
         print("Shutdown requested during bot initialization; cleaning up resting quotes and aborting startup.")
         if not sync_kill_executed:
             await killer.trigger()
-        await bot.stop()
+        shutdown_clean = await bot.stop()
+        if not shutdown_clean:
+            killer.trigger_synchronous()
+            raise RuntimeError("Shutdown failed: active orders could not be confirmed cancelled on exchange.")
         return
 
     # 3. Start Market Maker Loop with cancellation coordination
@@ -113,7 +116,10 @@ async def main():
         await killer.trigger()
     finally:
         stop_waiter.cancel()
-        await bot.stop()
+        shutdown_clean = await bot.stop()
+        if not shutdown_clean:
+            killer.trigger_synchronous()
+            raise RuntimeError("Shutdown failed: active orders could not be confirmed cancelled on exchange.")
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -484,13 +484,20 @@ class AvellanedaStoikovBot:
         self.running = False
         # 1. Withdraw resting quotes first to eliminate market risk immediately
         quotes_cancelled = await self._cancel_all_quotes()
-        if not quotes_cancelled:
-            logger.error("Quote cancellation failed during shutdown. Escalating to emergency kill switch...")
+        has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        if not quotes_cancelled or has_active_orders:
+            logger.error("Active orders remain or quote cancellation failed during shutdown. Escalating to emergency kill switch...")
             try:
                 from execution.kill_switch import KillSwitch
                 killer = KillSwitch(self.om)
                 await killer.trigger()
-                quotes_cancelled = not (self.current_bid_id or self.current_ask_id or self.om.active_orders)
+                if self.current_bid_id and self.current_bid_id not in self.om.active_orders:
+                    self.current_bid_id = None
+                    self.current_bid_price = None
+                if self.current_ask_id and self.current_ask_id not in self.om.active_orders:
+                    self.current_ask_id = None
+                    self.current_ask_price = None
+                quotes_cancelled = not bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
             except Exception as e:
                 logger.critical(f"Emergency kill switch failed during shutdown: {e}")
                 quotes_cancelled = False
