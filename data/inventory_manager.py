@@ -244,6 +244,7 @@ class InventoryManager:
             BOT_INVENTORY_NET_POSITION.labels(ticker=ticker).set(self.positions[ticker])
             BOT_PNL_CENTS.labels(ticker=ticker).set(self.balance_cents)
             KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_realized_pnl(ticker))
+            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_unrealized_pnl(ticker))
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
 
             for outcome in pnl_impact.get("matched_outcomes", []):

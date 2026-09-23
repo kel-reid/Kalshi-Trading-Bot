@@ -732,6 +732,38 @@ class TestPnLCoverageEdgeCases:
         assert BOT_INVENTORY_NET_POSITION.labels(ticker=ticker)._value.get() == 0
         assert KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 0.0
 
+    def test_handle_fill_publishes_unrealized_pnl_gauge(self):
+        """Verify _handle_fill publishes KALSHI_UNREALIZED_PNL_CENTS after fill recalculation."""
+        from utils.metrics import KALSHI_UNREALIZED_PNL_CENTS
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        ticker = "KXTEST-FILL-UNREALIZED"
+
+        # 1. Seed mid price at 50c
+        im.update_orderbook_mid(ticker, 50.0)
+
+        # 2. Buy 5 @ 40c -> unrealized PnL = (50 - 40) * 5 = +50c
+        im._handle_fill({
+            "market_ticker": ticker,
+            "action": "buy",
+            "side": "yes",
+            "count": 5,
+            "price": 40,
+            "fee_cents": 0.0
+        })
+        assert KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 50.0
+
+        # 3. Sell 5 @ 50c -> position becomes 0 -> unrealized PnL drops to 0.0 immediately
+        im._handle_fill({
+            "market_ticker": ticker,
+            "action": "sell",
+            "side": "yes",
+            "count": 5,
+            "price": 50,
+            "fee_cents": 0.0
+        })
+        assert KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 0.0
+
 
 
 class TestMarketMakerPnLLifecycle:
@@ -832,6 +864,24 @@ class TestMarketMakerPnLLifecycle:
         await bot.stop()
         assert dummy_task.cancelled()
         assert len(bot._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_escalates_to_emergency_kill_on_cancel_failure(self):
+        """Verify bot.stop() escalates to emergency KillSwitch when _cancel_all_quotes fails."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-FAIL-CANCEL")
+        bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock()
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            result = await bot.stop()
+
+        mock_killer.trigger.assert_awaited_once()
+        assert result is True
+        assert bot.running is False
 
     @pytest.mark.asyncio
     async def test_market_maker_start_propagates_fatal_exception(self):
