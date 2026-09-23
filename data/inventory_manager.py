@@ -97,8 +97,23 @@ class InventoryManager:
                 if active_ticker not in new_positions:
                     self.pnl_tracker.reconcile_inventory(active_ticker, 0)
 
+        # Identify all tickers affected by this hydration/reconciliation
+        all_affected_tickers = set(new_positions.keys()) | (set(self.positions.keys()) if not is_startup else set())
+
         self.positions = new_positions
         logger.info(f"Hydrated {len(self.positions)} active positions: {self.positions}")
+
+        # Publish Prometheus metrics immediately so dashboards reflect state without waiting for fills/ticks
+        for t in all_affected_tickers:
+            pos_val = self.positions.get(t, 0)
+            try:
+                BOT_INVENTORY_NET_POSITION.labels(ticker=t).set(pos_val)
+                BOT_PNL_CENTS.labels(ticker=t).set(self.balance_cents)
+                KALSHI_REALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_realized_pnl(t))
+                KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_unrealized_pnl(t))
+                KALSHI_FEES_PAID_CENTS.labels(ticker=t).set(self.pnl_tracker.get_total_fees(t))
+            except Exception as e:
+                logger.debug(f"Prometheus metric update skipped for {t}: {e}")
 
     def _hydrate_balance(self):
         """Fetch initial balance via REST synchronously."""

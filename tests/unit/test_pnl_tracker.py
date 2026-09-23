@@ -700,6 +700,39 @@ class TestPnLCoverageEdgeCases:
             assert im.balance_cents == 6000
             assert im.get_position("KXTEST-DRIFT") == 8
 
+    def test_apply_positions_publishes_prometheus_gauges(self):
+        """Verify _apply_positions publishes Prometheus metrics for active and flattened tickers."""
+        from utils.metrics import (
+            BOT_INVENTORY_NET_POSITION,
+            BOT_PNL_CENTS,
+            KALSHI_REALIZED_PNL_CENTS,
+            KALSHI_UNREALIZED_PNL_CENTS,
+            KALSHI_FEES_PAID_CENTS,
+        )
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.balance_cents = 7500
+        ticker = "KXTEST-GAUGES"
+
+        # 1. Startup hydration with active position
+        market_positions = [
+            {"ticker": ticker, "position": 10, "market_exposure": "500"}
+        ]
+        im._apply_positions(market_positions, is_startup=True)
+
+        assert im.get_position(ticker) == 10
+        assert BOT_INVENTORY_NET_POSITION.labels(ticker=ticker)._value.get() == 10
+        assert BOT_PNL_CENTS.labels(ticker=ticker)._value.get() == 7500
+        assert KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 0.0
+        assert KALSHI_FEES_PAID_CENTS.labels(ticker=ticker)._value.get() == 0.0
+
+        # 2. Periodic reconciliation flattens position to 0
+        im._apply_positions([], is_startup=False)
+        assert im.get_position(ticker) == 0
+        assert BOT_INVENTORY_NET_POSITION.labels(ticker=ticker)._value.get() == 0
+        assert KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 0.0
+
+
 
 class TestMarketMakerPnLLifecycle:
     """Verifies MarketMaker PnL snapshot triggers and error handling."""

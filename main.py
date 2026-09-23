@@ -25,15 +25,17 @@ async def main():
     shutdown_event = asyncio.Event()
     killer = None
     shutdown_in_progress = False
+    sync_kill_executed = False
 
     def handle_shutdown(signum, frame=None):
-        nonlocal shutdown_in_progress
+        nonlocal shutdown_in_progress, sync_kill_executed
         if shutdown_in_progress:
             return
         shutdown_in_progress = True
         print(f"\n\n>>> Signal {signum} received. Initiating graceful shutdown... <<<")
         if killer is not None:
             killer.trigger_synchronous()
+            sync_kill_executed = True
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -79,7 +81,15 @@ async def main():
         target_preference=TARGET_TICKER,
     )
     killer = KillSwitch(bot.om)
-    
+
+    # Reconcile pending-shutdown state if a signal arrived during bot construction
+    if shutdown_event.is_set():
+        print("Shutdown requested during bot initialization; cleaning up resting quotes and aborting startup.")
+        if not sync_kill_executed:
+            await killer.trigger()
+        await bot.stop()
+        return
+
     # 3. Start Market Maker Loop with cancellation coordination
     bot_task = asyncio.create_task(bot.start())
     stop_waiter = asyncio.create_task(shutdown_event.wait())
