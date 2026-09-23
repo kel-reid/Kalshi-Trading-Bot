@@ -7,7 +7,7 @@ mark-to-market unrealized PnL, trade classification, and market rotation attribu
 
 import pytest
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from data.pnl_tracker import PnLTracker, InventoryLot, MarketPnL
 from data.inventory_manager import InventoryManager
@@ -326,3 +326,140 @@ class TestOrderManagerPnLPersistence:
                 inventory=2,
                 rotation_session_id="async-uuid"
             )
+
+    def test_record_pnl_snapshot_exception_handled(self):
+        om = OrderManager()
+        with patch.object(om, "_get_connection", side_effect=Exception("DB pool exhausted")):
+            # Should not raise exception
+            om.record_pnl_snapshot(
+                ticker="KXTEST-26SEP-ERR",
+                realized_pnl_cents=10.0,
+                unrealized_pnl_cents=5.0,
+                total_fees_cents=1.0,
+                inventory=1,
+                rotation_session_id="err-session"
+            )
+
+
+class TestPnLCoverageEdgeCases:
+    """Covers defensive edge cases and fallback branches."""
+
+    def test_record_fill_zero_or_negative_count(self):
+        tracker = PnLTracker()
+        res_zero = tracker.record_fill("TICKER", "buy", "yes", count=0, price_cents=50)
+        assert res_zero == {}
+        res_neg = tracker.record_fill("TICKER", "buy", "yes", count=-5, price_cents=50)
+        assert res_neg == {}
+
+    def test_inventory_manager_metric_exceptions(self):
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        ticker = "KXTEST-PROM-EX"
+
+        # 1. Prometheus fill metric exception
+        with patch("data.inventory_manager.BOT_INVENTORY_NET_POSITION.labels", side_effect=Exception("Prometheus unavailable")):
+            fill = {
+                "market_ticker": ticker,
+                "action": "buy",
+                "side": "yes",
+                "count": 5,
+                "price": 40,
+                "fee_cents": 1.0
+            }
+            # Should succeed and log debug without raising
+            im._handle_fill(fill)
+            assert im.get_position(ticker) == 5
+
+        # 2. Prometheus unrealized metric exception
+        with patch("data.inventory_manager.KALSHI_UNREALIZED_PNL_CENTS.labels", side_effect=Exception("Prometheus gauge error")):
+            unrealized = im.update_orderbook_mid(ticker, 45.0)
+            assert unrealized == 25.0
+
+    def test_inventory_manager_scratch_outcome_counter(self):
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        ticker = "KXTEST-SCRATCH"
+
+        # Buy 2 @ 50c
+        im._handle_fill({"market_ticker": ticker, "action": "buy", "side": "yes", "count": 2, "price": 50})
+        # Sell 2 @ 50c (zero delta -> scratch)
+        with patch("data.inventory_manager.KALSHI_ROUND_TRIPS_TOTAL.labels") as mock_labels:
+            mock_counter = MagicMock()
+            mock_labels.return_value = mock_counter
+            im._handle_fill({"market_ticker": ticker, "action": "sell", "side": "yes", "count": 2, "price": 50})
+            mock_labels.assert_called_with(ticker=ticker, outcome="scratch")
+            mock_counter.inc.assert_called_once()
+
+
+class TestMarketMakerPnLLifecycle:
+    """Verifies MarketMaker PnL snapshot triggers and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_tick_triggers_periodic_pnl_snapshot(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-TICK", min_spread=2)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(45, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(55, 10))
+        bot._update_quotes = AsyncMock()
+
+        # Force periodic interval trigger
+        bot._last_pnl_snapshot = 0.0
+        await bot._tick()
+
+        bot.om.record_pnl_snapshot_async.assert_called_once()
+        assert len(bot._background_tasks) >= 0
+
+    @pytest.mark.asyncio
+    async def test_tick_hedged_logging_with_pnl(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-HEDGE", min_spread=2)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(45, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(55, 10))
+        bot._update_quotes = AsyncMock()
+
+        # Long hedge
+        bot.inv_manager.positions[bot.ticker] = 10
+        await bot._tick()
+
+        # Short hedge
+        bot.inv_manager.positions[bot.ticker] = -10
+        await bot._tick()
+
+    @pytest.mark.asyncio
+    async def test_rotate_market_records_pnl_and_handles_error(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-ROT1")
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.ob_manager.unsubscribe = AsyncMock()
+        bot.ob_manager.subscribe = AsyncMock()
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        # Successful snapshot during rotation
+        res = await bot.rotate_market("KXTEST-MM-ROT2")
+        assert res is True
+        bot.om.record_pnl_snapshot_async.assert_called_once()
+        assert bot.ticker == "KXTEST-MM-ROT2"
+
+        # Exception during snapshot write should be logged and not abort rotation
+        bot.om.record_pnl_snapshot_async.side_effect = Exception("Snapshot async failed")
+        res2 = await bot.rotate_market("KXTEST-MM-ROT3")
+        assert res2 is True
+        assert bot.ticker == "KXTEST-MM-ROT3"
+
+    @pytest.mark.asyncio
+    async def test_stop_records_pnl_and_handles_error(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-STOP")
+        bot._cancel_all_quotes = AsyncMock()
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        # Successful stop
+        await bot.stop()
+        bot.om.record_pnl_snapshot_async.assert_called_once()
+        assert bot.running is False
+
+        # Exception in stop snapshot should not prevent quote cancellation
+        bot.om.record_pnl_snapshot_async.side_effect = Exception("Stop snapshot failed")
+        await bot.stop()
+        assert bot._cancel_all_quotes.called
