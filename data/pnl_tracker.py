@@ -284,7 +284,7 @@ class PnLTracker:
             if is_uncosted:
                 # Do not classify trade outcome as win/loss since true cost was unknown
                 continue
-            closing_lot_fee = (float(fee_cents) * matched_count / total_matched_contracts) if total_matched_contracts > 0 else 0.0
+            closing_lot_fee = (float(fee_cents) * matched_count / count) if count > 0 else 0.0
             entry_lot_fee = entry_fee_per_contract * matched_count
             net_trade_pnl = gross_pnl - (closing_lot_fee + entry_lot_fee)
             market.round_trips_count += 1
