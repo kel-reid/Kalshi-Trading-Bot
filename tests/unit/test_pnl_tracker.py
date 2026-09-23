@@ -260,7 +260,8 @@ class TestInventoryManagerPnLIntegration:
 
         # Mid price update
         im.update_orderbook_mid(ticker, 35.0)
-        assert im.get_unrealized_pnl(ticker) == 20.0  # (35 - 30) * 4
+        # Unrealized: (35 - 30) * 4 - 2.0 (entry fee) = 18.0c
+        assert im.get_unrealized_pnl(ticker) == 18.0
 
         # Sell fill (closing half)
         fill_sell = {
@@ -282,6 +283,9 @@ class TestInventoryManagerPnLIntegration:
         summary = im.get_pnl_summary(ticker)
         assert summary["ticker"] == ticker
         assert summary["realized_pnl_cents"] == 18.0
+        # 2 remaining open contracts marked to 35c: (35 - 30) * 2 - 1.0 entry fee = 9.0c
+        assert summary["unrealized_pnl_cents"] == 9.0
+        assert summary["total_pnl_cents"] == 27.0
         assert summary["net_inventory"] == 2
 
 
@@ -386,7 +390,7 @@ class TestPnLCoverageEdgeCases:
         # 2. Prometheus unrealized metric exception
         with patch("data.inventory_manager.KALSHI_UNREALIZED_PNL_CENTS.labels", side_effect=Exception("Prometheus gauge error")):
             unrealized = im.update_orderbook_mid(ticker, 45.0)
-            assert unrealized == 25.0
+            assert unrealized == 24.0  # (45 - 40) * 5 - 1.0 (entry fee)
 
     def test_inventory_manager_scratch_outcome_counter(self):
         mock_ws = MagicMock()
@@ -450,6 +454,15 @@ class TestPnLCoverageEdgeCases:
         assert tracker.get_realized_pnl(ticker_uncosted) == 0.0
         assert uncosted_market.winning_trades_count == 0
         assert uncosted_market.losing_trades_count == 0
+
+        # 7. Closing uncosted lot with a fee deducts the closing fee from realized PnL
+        ticker_uncosted_fee = "KXTEST-SEED-UNCOSTED-FEE"
+        tracker.seed_initial_inventory(ticker_uncosted_fee, 2, cost_basis_cents=None)
+        res_fee = tracker.record_fill(ticker_uncosted_fee, action="sell", side="yes", count=2, price_cents=50.0, fee_cents=3.0)
+        assert res_fee["matched_contracts"] == 2
+        assert res_fee["matched_outcomes"] == []
+        assert tracker.get_realized_pnl(ticker_uncosted_fee) == -3.0  # Closing fee accounted for exactly
+        assert tracker.get_total_fees(ticker_uncosted_fee) == 3.0
 
     def test_hydrate_positions_seeds_inventory(self):
         mock_ws = MagicMock()
@@ -894,7 +907,7 @@ class TestMarketMakerPnLLifecycle:
         bot.om.sync_and_recover_state = AsyncMock()
         bot.ws_client.connect = AsyncMock()
         bot.ws_client.is_connected = True
-        bot.inv_manager.hydrate = AsyncMock()
+        bot.inv_manager.hydrate = AsyncMock(return_value=True)
         bot.inv_manager._sync_loop = AsyncMock()
         bot.inv_manager.subscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()
@@ -930,3 +943,105 @@ class TestMarketMakerPnLLifecycle:
         assert bot.running is False
         mock_alert.assert_awaited_once()
         assert "Startup Aborted" in mock_alert.await_args[0][0]
+
+    def test_inventory_manager_rejects_non_positive_fill_counts(self):
+        """Verify _handle_fill rejects count <= 0 at the ingress boundary without mutating any state."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.balance_cents = 10000
+        initial_fill_count = im._fill_count
+
+        # Zero count
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "buy", "side": "yes", "count": 0, "price": 50})
+        # Negative count
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "buy", "side": "yes", "count": -5, "price": 50})
+        im._handle_fill({"market_ticker": "KXTEST-REJECT", "action": "sell", "side": "yes", "count": -1, "price": 50})
+
+        assert im.balance_cents == 10000
+        assert im.get_position("KXTEST-REJECT") == 0
+        assert im._fill_count == initial_fill_count
+        assert im.get_realized_pnl("KXTEST-REJECT") == 0.0
+
+    @pytest.mark.asyncio
+    async def test_hydrate_startup_requires_both_balance_and_positions(self):
+        """Verify startup hydration fails if either balance or positions fetch fails, and succeeds only when both exist."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+
+        # 1. Balance succeeds, positions fails -> Startup must return False
+        with patch.object(im, "_fetch_balance", return_value=5000), \
+             patch.object(im, "_fetch_positions", return_value=None):
+            assert await im.hydrate(is_startup=True) is False
+
+        # 2. Balance fails, positions succeeds -> Startup must return False
+        with patch.object(im, "_fetch_balance", return_value=None), \
+             patch.object(im, "_fetch_positions", return_value=[]):
+            assert await im.hydrate(is_startup=True) is False
+
+        # 3. Both succeed -> Startup returns True
+        with patch.object(im, "_fetch_balance", return_value=5000), \
+             patch.object(im, "_fetch_positions", return_value=[]):
+            assert await im.hydrate(is_startup=True) is True
+
+    @pytest.mark.asyncio
+    async def test_hydrate_periodic_allows_partial_success(self):
+        """Verify periodic reconciliation applies whichever snapshot succeeded and only returns False if both fail."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+
+        # 1. Balance succeeds, positions fails -> Periodic returns True
+        with patch.object(im, "_fetch_balance", return_value=5500), \
+             patch.object(im, "_fetch_positions", return_value=None):
+            assert await im.hydrate(is_startup=False) is True
+            assert im.balance_cents == 5500
+
+        # 2. Balance fails, positions succeeds -> Periodic returns True
+        with patch.object(im, "_fetch_balance", return_value=None), \
+             patch.object(im, "_fetch_positions", return_value=[{"ticker": "KXTEST-PARTIAL", "position": 2}]):
+            assert await im.hydrate(is_startup=False) is True
+            assert im.get_position("KXTEST-PARTIAL") == 2
+
+        # 3. Both fail -> Periodic returns False
+        with patch.object(im, "_fetch_balance", return_value=None), \
+             patch.object(im, "_fetch_positions", return_value=None):
+            assert await im.hydrate(is_startup=False) is False
+
+    def test_unrealized_pnl_accounts_for_entry_fees_and_conserves_total_pnl(self):
+        """Verify that open lot entry fees are deducted from unrealized PnL, conserving Total PnL across all phases."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-FEE-CONSERVE"
+
+        # Buy 10 @ 50c with 5c entry fee (0.5c / contract)
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=5.0)
+        assert tracker.get_realized_pnl(ticker) == 0.0
+
+        # Mark to mid = 50c: price change is 0, but 5c fee was paid -> Unrealized = -5.0c, Total = -5.0c
+        unrealized = tracker.update_mid_price(ticker, 50.0)
+        assert unrealized == -5.0
+        summary = tracker.get_market_summary(ticker)
+        assert summary["realized_pnl_cents"] == 0.0
+        assert summary["unrealized_pnl_cents"] == -5.0
+        assert summary["total_pnl_cents"] == -5.0
+
+        # Mid rises to 60c: Gross unrealized = (60-50)*10 = 100c. Net unrealized = 100 - 5 = 95.0c
+        unrealized2 = tracker.update_mid_price(ticker, 60.0)
+        assert unrealized2 == 95.0
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 95.0
+
+        # Close half (Sell 5 @ 60c with 2.5c exit fee)
+        # Closed 5: Gross = (60-50)*5 = 50c. Entry fee = 2.5c, Exit fee = 2.5c -> Net realized = 45.0c
+        # Remaining 5: Gross = (60-50)*5 = 50c. Entry fee = 2.5c -> Net unrealized = 47.5c
+        # Total PnL = 45.0 + 47.5 = 92.5c (100c total gross - 7.5c total fees paid so far)
+        res_close_half = tracker.record_fill(ticker, action="sell", side="yes", count=5, price_cents=60, fee_cents=2.5)
+        assert res_close_half["realized_delta_cents"] == 45.0
+        assert tracker.get_realized_pnl(ticker) == 45.0
+        assert tracker.get_unrealized_pnl(ticker) == 47.5
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 92.5
+
+        # Close remainder (Sell 5 @ 60c with 2.5c exit fee)
+        # Closed final 5: Net realized = 45.0c -> Cumulative realized = 90.0c
+        # Unrealized = 0.0c (no open lots) -> Total PnL = 90.0c (100c gross - 10c total fees)
+        res_close_all = tracker.record_fill(ticker, action="sell", side="yes", count=5, price_cents=60, fee_cents=2.5)
+        assert tracker.get_realized_pnl(ticker) == 90.0
+        assert tracker.get_unrealized_pnl(ticker) == 0.0
+        assert tracker.get_market_summary(ticker)["total_pnl_cents"] == 90.0

@@ -150,8 +150,13 @@ class InventoryManager:
 
         if market_positions is not None:
             self._apply_positions(market_positions, is_startup=is_startup)
-            return True
-        return False
+
+        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        if is_startup:
+            return bal is not None and market_positions is not None
+
+        # For periodic reconciliation, return True if at least one snapshot succeeded.
+        return bal is not None or market_positions is not None
 
     async def _sync_loop(self):
         """
@@ -196,7 +201,7 @@ class InventoryManager:
         count = fill_msg.get("count", 0)
         price = fill_msg.get("price", 0) # in cents
         
-        if not ticker or count == 0:
+        if not ticker or count <= 0:
             return
             
         self._fill_count += 1

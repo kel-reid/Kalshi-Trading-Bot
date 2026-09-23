@@ -280,10 +280,12 @@ class PnLTracker:
         total_matched_contracts = count - remaining_count
         matched_outcomes: List[str] = []
         for matched_count, gross_pnl, is_uncosted, entry_fee_per_contract in matched_lots_info:
-            if is_uncosted:
-                # Do not classify trade outcome as win/loss since true cost was unknown
-                continue
             closing_lot_fee = (float(fee_cents) * matched_count / count) if count > 0 else 0.0
+            if is_uncosted:
+                # Deduct closing fees actually incurred, but do not fabricate gross trading PnL or win/loss classification
+                realized_delta -= closing_lot_fee
+                continue
+
             entry_lot_fee = entry_fee_per_contract * matched_count
             net_trade_pnl = gross_pnl - (closing_lot_fee + entry_lot_fee)
             realized_delta += net_trade_pnl
@@ -350,12 +352,13 @@ class PnLTracker:
         for lot in market.open_lots:
             if lot.is_uncosted or lot.price_cents is None:
                 continue
+            lot_entry_fee = lot.entry_fee_per_contract * lot.count
             if lot.action == "buy":
-                # Long position marked to mid
-                unrealized += (mid_price - lot.price_cents) * lot.count
+                # Long position marked to mid net of allocated entry fee
+                unrealized += (mid_price - lot.price_cents) * lot.count - lot_entry_fee
             elif lot.action == "sell":
-                # Short position marked to mid
-                unrealized += (lot.price_cents - mid_price) * lot.count
+                # Short position marked to mid net of allocated entry fee
+                unrealized += (lot.price_cents - mid_price) * lot.count - lot_entry_fee
 
         market.unrealized_pnl_cents = unrealized
         return unrealized
