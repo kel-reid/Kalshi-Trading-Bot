@@ -45,38 +45,40 @@ class InventoryManager:
         
         self.ws_client.add_message_handler(self._handle_message)
 
-    def _hydrate_balance(self):
-        """Fetch initial balance via REST."""
+    def _fetch_balance(self) -> Optional[int]:
+        """Fetch cash balance via REST."""
         sign_path = "/trade-api/v2/portfolio/balance"
         headers = get_auth_headers(method="GET", sign_path=sign_path)
-        
         with measure_latency("GET", "/trade-api/v2/portfolio/balance"):
             response = requests.get(BASE_URL + sign_path, headers=headers, timeout=10, verify=certifi.where())
-            
         if response.status_code == 200:
-            self.balance_cents = response.json().get("balance", 0)
-            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
+            return response.json().get("balance", 0)
         else:
             logger.error(f"Failed to fetch balance: {response.text}")
+            return None
 
-    def _hydrate_positions(self):
-        """Fetch initial positions via REST."""
+    def _fetch_positions(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch positions via REST."""
         sign_path = "/trade-api/v2/portfolio/positions"
         headers = get_auth_headers(method="GET", sign_path=sign_path)
-        
         with measure_latency("GET", "/trade-api/v2/portfolio/positions"):
             response = requests.get(BASE_URL + sign_path, headers=headers, params={"limit": 200}, timeout=10, verify=certifi.where())
-            
         if response.status_code == 200:
-            market_positions = response.json().get("market_positions", [])
-            new_positions = {}
-            for pos in market_positions:
-                ticker = pos.get("ticker")
-                # Kalshi V2 API returns position as 'position_fp' (float string) or 'position' (int)
-                position = int(float(pos.get("position_fp", pos.get("position", 0))))
-                if ticker and position != 0:
-                    new_positions[ticker] = position
-                    # Seed PnLTracker with existing position if no lots exist
+            return response.json().get("market_positions", [])
+        else:
+            logger.error(f"Failed to fetch positions: {response.text}")
+            return None
+
+    def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False):
+        """Applies REST positions to state, running on the event loop thread."""
+        new_positions = {}
+        for pos in market_positions:
+            ticker = pos.get("ticker")
+            # Kalshi V2 API returns position as 'position_fp' (float string) or 'position' (int)
+            position = int(float(pos.get("position_fp", pos.get("position", 0))))
+            if ticker and position != 0:
+                new_positions[ticker] = position
+                if is_startup:
                     exposure = pos.get("market_exposure", pos.get("total_traded", 0))
                     cost_basis = None
                     try:
@@ -85,18 +87,34 @@ class InventoryManager:
                     except Exception:
                         cost_basis = None
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
-            
-            self.positions = new_positions
-            logger.info(f"Hydrated {len(self.positions)} active positions: {self.positions}")
-        else:
-            logger.error(f"Failed to fetch positions: {response.text}")
+        self.positions = new_positions
+        logger.info(f"Hydrated {len(self.positions)} active positions: {self.positions}")
 
-    async def hydrate(self):
+    def _hydrate_balance(self):
+        """Fetch initial balance via REST synchronously."""
+        bal = self._fetch_balance()
+        if bal is not None:
+            self.balance_cents = bal
+            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
+
+    def _hydrate_positions(self, is_startup: bool = False):
+        """Fetch initial positions via REST synchronously."""
+        market_positions = self._fetch_positions()
+        if market_positions is not None:
+            self._apply_positions(market_positions, is_startup=is_startup)
+
+    async def hydrate(self, is_startup: bool = False):
         """Run hydration asynchronously to avoid blocking the event loop."""
-        logger.info("Hydrating inventory state from REST API...")
-        await asyncio.to_thread(self._hydrate_balance)
-        await asyncio.to_thread(self._hydrate_positions)
-        
+        logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
+        bal = await asyncio.to_thread(self._fetch_balance)
+        if bal is not None:
+            self.balance_cents = bal
+            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
+
+        market_positions = await asyncio.to_thread(self._fetch_positions)
+        if market_positions is not None:
+            self._apply_positions(market_positions, is_startup=is_startup)
+
     async def _sync_loop(self):
         """
         Continuously runs in the background. Every 5 minutes, 
@@ -108,7 +126,7 @@ class InventoryManager:
             await asyncio.sleep(300) # 5 minutes
             try:
                 logger.info("Running periodic inventory reconciliation to fix state drift...")
-                await self.hydrate()
+                await self.hydrate(is_startup=False)
             except Exception as e:
                 logger.error(f"Error during periodic inventory reconciliation: {e}")
 

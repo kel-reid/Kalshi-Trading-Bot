@@ -22,9 +22,10 @@ class InventoryLot:
     lot_id: str
     ticker: str
     action: str  # "buy" (long) or "sell" (short)
-    price_cents: float
+    price_cents: Optional[float]  # None if cost basis is uncosted/unknown
     count: int
     timestamp: float
+    is_uncosted: bool = False
 
 
 @dataclass
@@ -59,7 +60,10 @@ class PnLTracker:
         return self.markets[ticker]
 
     def reset_market_session(self, ticker: str, new_session_id: Optional[str] = None) -> str:
-        """Starts a new tracking session for a market (e.g. upon rotation)."""
+        """
+        Resets session-level attribution for a market upon rotation.
+        Generates a new rotation session UUID while preserving cumulative market totals.
+        """
         market = self.get_or_create_market(ticker)
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
         return market.rotation_session_id
@@ -68,23 +72,40 @@ class PnLTracker:
         """
         Seeds open inventory lots when hydrating an existing position on startup.
         Prevents position distortion if the bot restarts with open contracts.
+        Never fabricates an arbitrary price if true cost basis cannot be determined.
         """
         if position == 0:
             return
         market = self.get_or_create_market(ticker)
         if not market.open_lots:
             action = "buy" if position > 0 else "sell"
-            price = cost_basis_cents if cost_basis_cents is not None else (market.last_mid_price or 50.0)
+            if cost_basis_cents is not None:
+                price = float(cost_basis_cents)
+                is_uncosted = False
+            elif market.last_mid_price is not None:
+                price = float(market.last_mid_price)
+                is_uncosted = False
+            else:
+                price = None
+                is_uncosted = True
+
             lot = InventoryLot(
                 lot_id=f"init-{str(uuid.uuid4())[:6]}",
                 ticker=ticker,
                 action=action,
-                price_cents=float(price),
+                price_cents=price,
                 count=abs(position),
-                timestamp=time.time()
+                timestamp=time.time(),
+                is_uncosted=is_uncosted,
             )
             market.open_lots.append(lot)
-            logger.info(f"Seeded initial lot for {ticker}: {abs(position)} {action.upper()} @ {price:.1f}c.")
+            if is_uncosted:
+                logger.warning(
+                    f"Seeded uncosted initial lot for {ticker}: {abs(position)} {action.upper()}. "
+                    f"Cost basis could not be determined; closing trades will not fabricate realized PnL."
+                )
+            else:
+                logger.info(f"Seeded initial lot for {ticker}: {abs(position)} {action.upper()} @ {price:.1f}c.")
 
     @staticmethod
     def normalize_fill(action: str, side: str, price_cents: float) -> Tuple[str, float]:
@@ -142,20 +163,30 @@ class PnLTracker:
 
         # FIFO matching against open lots
         new_open_lots: List[InventoryLot] = []
-        matched_lots_info: List[Tuple[int, float]] = []
+        matched_lots_info: List[Tuple[int, float, bool]] = []
 
         for lot in market.open_lots:
             if remaining_count > 0 and lot.action == target_close_action:
                 matched_count = min(remaining_count, lot.count)
 
-                if lot.action == "buy":
+                if lot.is_uncosted or lot.price_cents is None:
+                    # Cost basis unknown; cannot calculate real PnL without fabricating numbers
+                    trade_pnl = 0.0
+                    is_uncosted = True
+                    logger.warning(
+                        f"Closing {matched_count} uncosted contracts from seeded lot {lot.lot_id} on {ticker}; "
+                        f"cost basis was indeterminate, so no realized PnL is fabricated."
+                    )
+                elif lot.action == "buy":
                     # We were long at lot.price_cents, now selling at norm_price
                     trade_pnl = (norm_price - lot.price_cents) * matched_count
+                    is_uncosted = False
                 else:
                     # We were short at lot.price_cents, now buying back at norm_price
                     trade_pnl = (lot.price_cents - norm_price) * matched_count
+                    is_uncosted = False
 
-                matched_lots_info.append((matched_count, trade_pnl))
+                matched_lots_info.append((matched_count, trade_pnl, is_uncosted))
                 realized_delta += trade_pnl
 
                 lot.count -= matched_count
@@ -171,7 +202,10 @@ class PnLTracker:
         # Classify outcomes net of transaction fees
         total_matched_contracts = count - remaining_count
         matched_outcomes: List[str] = []
-        for matched_count, gross_pnl in matched_lots_info:
+        for matched_count, gross_pnl, is_uncosted in matched_lots_info:
+            if is_uncosted:
+                # Do not classify trade outcome as win/loss since true cost was unknown
+                continue
             lot_fee = (float(fee_cents) * matched_count / total_matched_contracts) if total_matched_contracts > 0 else 0.0
             net_trade_pnl = gross_pnl - lot_fee
             market.round_trips_count += 1
@@ -233,6 +267,8 @@ class PnLTracker:
 
         unrealized = 0.0
         for lot in market.open_lots:
+            if lot.is_uncosted or lot.price_cents is None:
+                continue
             if lot.action == "buy":
                 # Long position marked to mid
                 unrealized += (mid_price - lot.price_cents) * lot.count
