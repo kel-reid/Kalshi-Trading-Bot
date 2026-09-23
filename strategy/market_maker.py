@@ -113,7 +113,11 @@ class AvellanedaStoikovBot:
         logger.info("WebSocket Connected. Hydrating state...")
         
         # 3. Hydrate initial inventory and subscribe to channels
-        await self.inv_manager.hydrate(is_startup=True)
+        if not await self.inv_manager.hydrate(is_startup=True):
+            logger.critical("Failed to hydrate initial inventory state from REST API on startup. Aborting startup.")
+            await send_alert(f"Startup Aborted: Failed to hydrate initial portfolio inventory for {self.ticker}.")
+            self.running = False
+            raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
         
         # 3b. Launch the periodic reconciliation background task
         sync_task = asyncio.create_task(self.inv_manager._sync_loop())

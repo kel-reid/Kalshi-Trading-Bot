@@ -265,7 +265,6 @@ class PnLTracker:
                     is_uncosted = False
 
                 matched_lots_info.append((matched_count, trade_pnl, is_uncosted, lot.entry_fee_per_contract))
-                realized_delta += trade_pnl
 
                 lot.count -= matched_count
                 remaining_count -= matched_count
@@ -287,6 +286,8 @@ class PnLTracker:
             closing_lot_fee = (float(fee_cents) * matched_count / count) if count > 0 else 0.0
             entry_lot_fee = entry_fee_per_contract * matched_count
             net_trade_pnl = gross_pnl - (closing_lot_fee + entry_lot_fee)
+            realized_delta += net_trade_pnl
+
             market.round_trips_count += 1
             if net_trade_pnl > 0.0001:
                 market.winning_trades_count += 1
@@ -298,8 +299,6 @@ class PnLTracker:
                 market.scratch_trades_count += 1
                 matched_outcomes.append("scratch")
 
-        # Deduct fees from realized gain
-        realized_delta -= float(fee_cents)
         market.realized_pnl_cents += realized_delta
 
         # If any contracts remain after closing existing lots, open a new lot
