@@ -87,6 +87,15 @@ class InventoryManager:
                     except Exception:
                         cost_basis = None
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
+                else:
+                    self.pnl_tracker.reconcile_inventory(ticker, position)
+
+        # For any previously tracked market that is now flat (not in REST active positions)
+        if not is_startup:
+            for active_ticker in list(self.positions.keys()):
+                if active_ticker not in new_positions:
+                    self.pnl_tracker.reconcile_inventory(active_ticker, 0)
+
         self.positions = new_positions
         logger.info(f"Hydrated {len(self.positions)} active positions: {self.positions}")
 
