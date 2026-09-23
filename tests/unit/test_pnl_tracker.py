@@ -171,10 +171,10 @@ class TestPnLTrackerNormalizationAndFees:
         # Buy 10 @ 50c, fee = 5c
         tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=5.0)
         assert tracker.get_total_fees(ticker) == 5.0
-        # Fee on entry is deducted immediately
-        assert tracker.get_realized_pnl(ticker) == -5.0
+        # Entry fee is attached to open lots and deferred until matching; realized PnL remains 0.0
+        assert tracker.get_realized_pnl(ticker) == 0.0
 
-        # Sell 10 @ 60c, fee = 5c -> gross profit 100c - 5c fee = +95c delta
+        # Sell 10 @ 60c, fee = 5c -> gross profit 100c - 10c total fees = +90c delta
         tracker.record_fill(ticker, action="sell", side="yes", count=10, price_cents=60, fee_cents=5.0)
         assert tracker.get_total_fees(ticker) == 10.0
         assert tracker.get_realized_pnl(ticker) == 90.0  # 100 gross - 10 total fees
@@ -255,7 +255,8 @@ class TestInventoryManagerPnLIntegration:
         }
         im._handle_fill(fill_buy)
         assert im.get_position(ticker) == 4
-        assert im.get_realized_pnl(ticker) == -2.0  # Entry fee deducted
+        # Opening fill: entry fee is attached to inventory lots; realized PnL remains 0.0 until closed
+        assert im.get_realized_pnl(ticker) == 0.0
 
         # Mid price update
         im.update_orderbook_mid(ticker, 35.0)
@@ -272,12 +273,15 @@ class TestInventoryManagerPnLIntegration:
         }
         im._handle_fill(fill_sell)
         assert im.get_position(ticker) == 2
-        # Realized: -2.0 (entry fee) + (40 - 30) * 2 - 1.0 (exit fee) = 17.0c
-        assert im.get_realized_pnl(ticker) == 17.0
+        # Realized for 2 closed contracts:
+        # Gross gain = (40 - 30) * 2 = 20.0c
+        # Closing fee = 1.0c, Entry fee allocated to closed 2 contracts = (2.0 / 4) * 2 = 1.0c
+        # Net realized = 20.0 - 1.0 - 1.0 = 18.0c
+        assert im.get_realized_pnl(ticker) == 18.0
 
         summary = im.get_pnl_summary(ticker)
         assert summary["ticker"] == ticker
-        assert summary["realized_pnl_cents"] == 17.0
+        assert summary["realized_pnl_cents"] == 18.0
         assert summary["net_inventory"] == 2
 
 
@@ -904,3 +908,25 @@ class TestMarketMakerPnLLifecycle:
                 await bot.start()
 
         assert bot.running is False
+
+    @pytest.mark.asyncio
+    async def test_market_maker_start_aborts_on_startup_hydration_failure(self):
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-MM-HYDRATE-FAIL")
+        bot.om.sync_and_recover_state = AsyncMock()
+        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.is_connected = True
+        # Simulate startup hydration returning False (e.g. REST API timeout/error)
+        bot.inv_manager.hydrate = AsyncMock(return_value=False)
+        bot.inv_manager._sync_loop = AsyncMock()
+        bot.inv_manager.subscribe = AsyncMock()
+        bot.ob_manager.subscribe = AsyncMock()
+
+        with patch("strategy.market_maker.start_metrics_server"), \
+             patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+            with pytest.raises(RuntimeError, match="Startup hydration failed"):
+                await bot.start()
+
+        assert bot.running is False
+        mock_alert.assert_awaited_once()
+        assert "Startup Aborted" in mock_alert.await_args[0][0]
