@@ -1421,9 +1421,76 @@ class TestMarketMakerPnLLifecycle:
             {"ticker": "KXTEST-NEW", "position": 10},
             {"position": 5}
         ]
-        im._apply_positions(malformed_snapshot_3, is_startup=False)
+        assert im._apply_positions(malformed_snapshot_3, is_startup=False) is False
         assert im.positions == {"KXTEST-EXISTING": 5}
         assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
+    def test_fetch_positions_rejects_non_string_and_blank_tickers(self):
+        """Verify _fetch_positions rejects truthy non-string tickers (int, bool) and blank strings."""
+        im = InventoryManager(ws_client=MagicMock())
+
+        # 1. Non-string integer ticker
+        resp_int = MagicMock(status_code=200)
+        resp_int.json.return_value = {"market_positions": [{"ticker": 123, "position": 5}]}
+        with patch("requests.get", return_value=resp_int):
+            assert im._fetch_positions() is None
+
+        # 2. Blank whitespace ticker
+        resp_blank = MagicMock(status_code=200)
+        resp_blank.json.return_value = {"market_positions": [{"ticker": "   ", "position": 5}]}
+        with patch("requests.get", return_value=resp_blank):
+            assert im._fetch_positions() is None
+
+        # 3. Boolean ticker
+        resp_bool = MagicMock(status_code=200)
+        resp_bool.json.return_value = {"market_positions": [{"ticker": True, "position": 5}]}
+        with patch("requests.get", return_value=resp_bool):
+            assert im._fetch_positions() is None
+
+    @pytest.mark.asyncio
+    async def test_hydrate_startup_aborts_if_apply_positions_fails(self):
+        """Verify hydrate(is_startup=True) returns False and aborts safely if _apply_positions fails."""
+        im = InventoryManager(ws_client=MagicMock())
+        im.positions = {"EXISTING": 1}
+
+        with patch.object(im, "_fetch_balance", return_value=5000), \
+             patch.object(im, "_fetch_positions", return_value=[{"ticker": "NEW", "position": 10}]), \
+             patch.object(im, "_apply_positions", return_value=False):
+            success = await im.hydrate(is_startup=True)
+            assert success is False
+
+    def test_handle_fill_complements_opposite_side_price(self):
+        """Verify _handle_fill calculates 100c complement when only opposite-side price is provided."""
+        im = InventoryManager(ws_client=MagicMock())
+        im.balance_cents = 10000.0
+
+        # 1. YES fill with only no_price=55 -> YES price must be 100 - 55 = 45c
+        im._handle_fill({
+            "market_ticker": "KXTEST-COMP",
+            "action": "buy",
+            "side": "yes",
+            "count": 10,
+            "no_price": 55,
+            "fee_cents": 1.0
+        })
+        assert im.get_position("KXTEST-COMP") == 10
+        # Cost: 10 * 45c + 1c fee = 451c -> balance = 10000 - 451 = 9549.0
+        assert im.balance_cents == 9549.0
+
+        # 2. NO fill with only yes_price=40 -> NO price must be 100 - 40 = 60c
+        im._handle_fill({
+            "market_ticker": "KXTEST-COMP-NO",
+            "action": "buy",
+            "side": "no",
+            "count": 5,
+            "yes_price": 40,
+            "fee_cents": 1.5
+        })
+        # Buying NO -> Net YES position is -5
+        assert im.get_position("KXTEST-COMP-NO") == -5
+        # Cost: 5 * 60c + 1.5c fee = 301.5c -> balance = 9549.0 - 301.5 = 9247.5
+        assert im.balance_cents == 9247.5
+
 
 
 
