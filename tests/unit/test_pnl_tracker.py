@@ -1425,8 +1425,17 @@ class TestMarketMakerPnLLifecycle:
         assert im.positions == {"KXTEST-EXISTING": 5}
         assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
 
+        # 4. Missing position field (neither position_fp nor position provided)
+        malformed_snapshot_4 = [
+            {"ticker": "KXTEST-NEW", "position": 10},
+            {"ticker": "KXTEST-NOPOS", "market_exposure": 500}
+        ]
+        assert im._apply_positions(malformed_snapshot_4, is_startup=False) is False
+        assert im.positions == {"KXTEST-EXISTING": 5}
+        assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
     def test_fetch_positions_rejects_non_string_and_blank_tickers(self):
-        """Verify _fetch_positions rejects truthy non-string tickers (int, bool) and blank strings."""
+        """Verify _fetch_positions rejects truthy non-string tickers (int, bool), blank strings, and missing position fields."""
         im = InventoryManager(ws_client=MagicMock())
 
         # 1. Non-string integer ticker
@@ -1445,6 +1454,12 @@ class TestMarketMakerPnLLifecycle:
         resp_bool = MagicMock(status_code=200)
         resp_bool.json.return_value = {"market_positions": [{"ticker": True, "position": 5}]}
         with patch("requests.get", return_value=resp_bool):
+            assert im._fetch_positions() is None
+
+        # 4. Missing position and position_fp fields
+        resp_nopos = MagicMock(status_code=200)
+        resp_nopos.json.return_value = {"market_positions": [{"ticker": "KXTEST-NOPOS", "market_exposure": 500}]}
+        with patch("requests.get", return_value=resp_nopos):
             assert im._fetch_positions() is None
 
     @pytest.mark.asyncio
