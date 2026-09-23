@@ -205,3 +205,45 @@ async def test_main_signal_idempotent():
     mock_killer.trigger_synchronous.assert_called_once()
     mock_bot.stop.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_main_signal_during_bot_construction():
+    """Verify that a signal arriving during bot construction triggers async kill and aborts before bot.start()."""
+    import signal
+
+    signal_handlers = {}
+
+    def mock_signal(sig, handler):
+        signal_handlers[sig] = handler
+
+    mock_bot = MagicMock()
+    mock_bot.start = AsyncMock()
+    mock_bot.stop = AsyncMock()
+    mock_bot.om = MagicMock()
+
+    mock_killer = MagicMock()
+    mock_killer.trigger = AsyncMock()
+    mock_killer.trigger_synchronous = MagicMock()
+
+    def construct_bot(**kwargs):
+        # Fire signal while constructor is running (killer is still None in main)
+        handler = signal_handlers.get(signal.SIGINT)
+        assert handler is not None
+        handler(signal.SIGINT, None)
+        return mock_bot
+
+    with patch("utils.market_discovery.discover_active_market_async", new_callable=AsyncMock, return_value="KXNFLGAME-TEST"), \
+         patch("main.AvellanedaStoikovBot", side_effect=construct_bot), \
+         patch("main.KillSwitch", return_value=mock_killer), \
+         patch("main.signal.signal", side_effect=mock_signal):
+        await main()
+
+    # Synchronous kill could not run during construction because killer was None
+    mock_killer.trigger_synchronous.assert_not_called()
+    # Reconciled after arming kill switch: async kill and stop called
+    mock_killer.trigger.assert_awaited_once()
+    mock_bot.stop.assert_awaited_once()
+    # bot.start() must NEVER be started
+    mock_bot.start.assert_not_called()
+
+
