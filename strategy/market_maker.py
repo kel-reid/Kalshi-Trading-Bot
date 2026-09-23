@@ -493,3 +493,10 @@ class AvellanedaStoikovBot:
             )
         except Exception as e:
             logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
+
+        # 3. Cancel and await all active background tasks
+        tasks_to_cancel = [t for t in list(self._background_tasks) if not t.done()]
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)

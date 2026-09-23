@@ -82,9 +82,6 @@ class PnLTracker:
             if cost_basis_cents is not None:
                 price = float(cost_basis_cents)
                 is_uncosted = False
-            elif market.last_mid_price is not None:
-                price = float(market.last_mid_price)
-                is_uncosted = False
             else:
                 price = None
                 is_uncosted = True
