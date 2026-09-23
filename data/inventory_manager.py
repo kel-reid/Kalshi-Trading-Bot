@@ -10,7 +10,7 @@ import logging
 import requests
 import asyncio
 import certifi
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # Provide required imports from our new module
 
