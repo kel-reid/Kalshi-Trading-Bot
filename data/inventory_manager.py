@@ -38,7 +38,7 @@ class InventoryManager:
     """
     def __init__(self, ws_client, pnl_tracker: Optional[PnLTracker] = None):
         self.ws_client = ws_client
-        self.balance_cents: int = 0
+        self.balance_cents: float = 0.0
         # self.positions[ticker] = position_size (positive means net 'yes', negative means net 'no' or just track absolute shares)
         # Kalshi usually tracks 'position' as an integer of contracts.
         self.positions: Dict[str, int] = {}
@@ -80,6 +80,19 @@ class InventoryManager:
                 logger.error(f"Failed to parse positions JSON: {e}")
                 return None
             if isinstance(data, dict) and "market_positions" in data and isinstance(data["market_positions"], list):
+                for entry in data["market_positions"]:
+                    if not isinstance(entry, dict) or not entry.get("ticker"):
+                        logger.error(f"Positions response contains malformed entry: {entry}")
+                        return None
+                    pos_val = entry.get("position_fp", entry.get("position", 0))
+                    if isinstance(pos_val, bool):
+                        logger.error(f"Positions response contains boolean position: {entry}")
+                        return None
+                    try:
+                        float(pos_val)
+                    except (ValueError, TypeError):
+                        logger.error(f"Positions response contains non-numeric position: {entry}")
+                        return None
                 return data["market_positions"]
             logger.error(f"Positions response missing or invalid 'market_positions' field: {data}")
             return None
@@ -89,12 +102,30 @@ class InventoryManager:
 
     def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False):
         """Applies REST positions to state, running on the event loop thread."""
-        new_positions = {}
+        # Atomically validate and parse all entries before mutating state or PnL lots
+        validated_entries = []
         for pos in market_positions:
+            if not isinstance(pos, dict):
+                logger.error(f"Malformed position entry: {pos}")
+                return
             ticker = pos.get("ticker")
-            # Kalshi V2 API returns position as 'position_fp' (float string) or 'position' (int)
-            position = int(float(pos.get("position_fp", pos.get("position", 0))))
-            if ticker and position != 0:
+            if not ticker or not isinstance(ticker, str) or not ticker.strip():
+                logger.error(f"Malformed position entry missing valid ticker: {pos}")
+                return
+            pos_val = pos.get("position_fp", pos.get("position", 0))
+            if isinstance(pos_val, bool):
+                logger.error(f"Malformed boolean position for {ticker}: {pos}")
+                return
+            try:
+                position = int(float(pos_val))
+            except (ValueError, TypeError):
+                logger.error(f"Malformed position value ({pos_val!r}) for {ticker}: {pos}")
+                return
+            validated_entries.append((ticker.strip(), position, pos))
+
+        new_positions = {}
+        for ticker, position, pos in validated_entries:
+            if position != 0:
                 new_positions[ticker] = position
                 if is_startup:
                     exposure = pos.get("market_exposure")
@@ -276,13 +307,13 @@ class InventoryManager:
 
         # All preconditions validated; state mutation and counter increment can now safely occur
         self._fill_count += 1
-        fee_int = int(round(fee))
+        fee = round(fee, 4)
 
-        # Adjust balance based on action (including fees)
+        # Adjust balance based on action, preserving sub-cent precision to reconcile with PnLTracker
         if action == "buy":
-            self.balance_cents -= (price * count + fee_int)
+            self.balance_cents = round(self.balance_cents - (price * count + fee), 4)
         elif action == "sell":
-            self.balance_cents += (price * count - fee_int)
+            self.balance_cents = round(self.balance_cents + (price * count - fee), 4)
             
         # Update positions
         # Standard convention: + for 'yes' shares, - for 'no' shares (or tracked separately)
