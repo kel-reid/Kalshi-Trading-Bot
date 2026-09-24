@@ -1316,6 +1316,9 @@ class TestMarketMakerPnLLifecycle:
             {"balance": "5000"},
             {"balance": True},
             {"balance": False},
+            {"balance": float("nan")},
+            {"balance": float("inf")},
+            {"balance": float("-inf")},
         ]
         for invalid_json in invalid_responses:
             mock_resp = MagicMock(status_code=200)
@@ -1434,6 +1437,15 @@ class TestMarketMakerPnLLifecycle:
         assert im.positions == {"KXTEST-EXISTING": 5}
         assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
 
+        # 5. Malformed non-finite position
+        malformed_snapshot_5 = [
+            {"ticker": "KXTEST-NEW", "position": 10},
+            {"ticker": "KXTEST-NAN", "position_fp": "nan"}
+        ]
+        assert im._apply_positions(malformed_snapshot_5, is_startup=False) is False
+        assert im.positions == {"KXTEST-EXISTING": 5}
+        assert len(im.pnl_tracker.get_or_create_market("KXTEST-NEW").open_lots) == 0
+
     def test_fetch_positions_rejects_non_string_and_blank_tickers(self):
         """Verify _fetch_positions rejects truthy non-string tickers (int, bool), blank strings, and missing position fields."""
         im = InventoryManager(ws_client=MagicMock())
@@ -1461,6 +1473,36 @@ class TestMarketMakerPnLLifecycle:
         resp_nopos.json.return_value = {"market_positions": [{"ticker": "KXTEST-NOPOS", "market_exposure": 500}]}
         with patch("requests.get", return_value=resp_nopos):
             assert im._fetch_positions() is None
+
+        # 5. Non-finite position values
+        resp_nan = MagicMock(status_code=200)
+        resp_nan.json.return_value = {"market_positions": [{"ticker": "KXTEST-NAN", "position_fp": "nan"}]}
+        with patch("requests.get", return_value=resp_nan):
+            assert im._fetch_positions() is None
+
+        resp_inf = MagicMock(status_code=200)
+        resp_inf.json.return_value = {"market_positions": [{"ticker": "KXTEST-INF", "position": float("inf")}]}
+        with patch("requests.get", return_value=resp_inf):
+            assert im._fetch_positions() is None
+
+    def test_apply_positions_startup_ignores_non_finite_exposure(self):
+        """Verify startup hydration ignores non-finite exposure (leaves lot uncosted) without error."""
+        im = InventoryManager(ws_client=MagicMock())
+        snapshot = [
+            {"ticker": "KXTEST-NAN-EXP", "position": 10, "market_exposure": "nan"},
+            {"ticker": "KXTEST-INF-EXP", "position": 5, "market_exposure": float("inf")},
+            {"ticker": "KXTEST-ZERO-EXP", "position": 4, "market_exposure": 0},
+            {"ticker": "KXTEST-VALID-EXP", "position": 2, "market_exposure": 80.0},
+        ]
+        assert im._apply_positions(snapshot, is_startup=True) is True
+        # Uncosted lots:
+        assert im.pnl_tracker.get_or_create_market("KXTEST-NAN-EXP").open_lots[0].is_uncosted is True
+        assert im.pnl_tracker.get_or_create_market("KXTEST-INF-EXP").open_lots[0].is_uncosted is True
+        assert im.pnl_tracker.get_or_create_market("KXTEST-ZERO-EXP").open_lots[0].is_uncosted is True
+        # Costed lot: 80 / 2 = 40.0c
+        valid_lot = im.pnl_tracker.get_or_create_market("KXTEST-VALID-EXP").open_lots[0]
+        assert valid_lot.is_uncosted is False
+        assert valid_lot.price_cents == 40.0
 
     @pytest.mark.asyncio
     async def test_hydrate_startup_aborts_if_apply_positions_fails(self):

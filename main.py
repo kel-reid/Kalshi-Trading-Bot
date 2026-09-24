@@ -45,7 +45,26 @@ async def main():
     retry_interval = 30
     ticker = None
     while not ticker and not shutdown_event.is_set():
-        ticker = await discover_active_market_async(target_preference=TARGET_TICKER)
+        discovery_task = asyncio.create_task(discover_active_market_async(target_preference=TARGET_TICKER))
+        wait_task = asyncio.create_task(shutdown_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                [discovery_task, wait_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if wait_task in done or shutdown_event.is_set():
+                break
+            ticker = discovery_task.result()
+        except asyncio.CancelledError:
+            discovery_task.cancel()
+            wait_task.cancel()
+            await asyncio.gather(discovery_task, wait_task, return_exceptions=True)
+            break
+
         if not ticker:
             print(
                 f"No active in-season sports markets with two-sided quotes currently found on {ENVIRONMENT.capitalize()}. "
@@ -60,6 +79,8 @@ async def main():
                 )
                 for p in pending:
                     p.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 if wait_task in done:
                     break
             except asyncio.CancelledError:
