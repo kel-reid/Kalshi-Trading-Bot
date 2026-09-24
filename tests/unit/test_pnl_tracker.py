@@ -1731,6 +1731,105 @@ class TestMarketMakerPnLLifecycle:
         assert snapshot_args[0]["ticker"] == "NEW-TICKER"
         assert snapshot_args[0]["inventory"] == 3
 
+    @pytest.mark.asyncio
+    async def test_startup_hydration_commits_balance_only_after_positions_validate_atomically(self):
+        """Verify startup hydration does not mutate balance if positions validation fails."""
+        mock_ws = MagicMock()
+        im = InventoryManager(mock_ws)
+        im.balance_cents = 1234
+
+        # Malformed positions payload (missing ticker)
+        bad_positions = [{"position": 5, "fees_paid": 0}]
+        with patch.object(im, "_fetch_balance", return_value=99999), \
+             patch.object(im, "_fetch_positions", return_value=bad_positions):
+            success = await im.hydrate(is_startup=True)
+            assert success is False
+            # Balance must NOT be mutated if positions fail validation
+            assert im.balance_cents == 1234
+
+        # Valid payload commits both balance and positions
+        good_positions = [{"ticker": "KXTEST-ATOMIC", "position": 10, "fees_paid": 0}]
+        with patch.object(im, "_fetch_balance", return_value=99999), \
+             patch.object(im, "_fetch_positions", return_value=good_positions):
+            success = await im.hydrate(is_startup=True)
+            assert success is True
+            assert im.balance_cents == 99999
+            assert im.get_position("KXTEST-ATOMIC") == 10
+
+    def test_fee_only_unrealized_mtm_before_first_mid_price(self):
+        """Verify opening fill accounts for entry fee in unrealized MTM before any mid-price tick is received."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-FEE-MTM"
+
+        # Buy 10 contracts @ 50c, fee = 10c (1c per contract). No mid-price set yet.
+        tracker.record_fill(ticker=ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=10.0)
+
+        market = tracker.get_or_create_market(ticker)
+        assert market.last_mid_price is None
+        # Unrealized PnL must reflect entry fee loss (-10.0c), and Total PnL = Realized (0) + Unrealized (-10) = -10.0c
+        assert market.unrealized_pnl_cents == -10.0
+        summary = tracker.get_market_summary(ticker)
+        assert summary["total_pnl_cents"] == -10.0
+
+        # Partial trim during reconciliation when mid-price is still None preserves fee-only MTM
+        tracker.reconcile_inventory(ticker, target_position=5)
+        summary2 = tracker.get_market_summary(ticker)
+        # 5 contracts remain, each with 1c entry fee -> -5.0c unrealized
+        assert tracker.get_open_inventory(ticker) == 5
+        assert summary2["unrealized_pnl_cents"] == -5.0
+
+    def test_reconciliation_adjustment_and_session_baseline_attribution(self):
+        """Verify reconciliation adjustments are explicitly tracked and session baselines isolate intra-session PnL."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-RECON-SESSION"
+
+        tracker.record_fill(ticker=ticker, action="buy", side="yes", count=10, price_cents=50, fee_cents=0.0)
+        tracker.update_mid_price(ticker, 60.0)  # Unrealized: +100c
+
+        # Reconcile position down to 0: MTM (+100c) is transferred to realized and tracked as reconciliation adjustment
+        tracker.reconcile_inventory(ticker, target_position=0)
+        summary = tracker.get_market_summary(ticker)
+        assert summary["realized_pnl_cents"] == 100.0
+        assert summary["reconciliation_adjustment_cents"] == 100.0
+        assert summary["session_realized_pnl_cents"] == 100.0
+
+        # Reset session for rotation: session baseline is saved at 100.0
+        tracker.reset_market_session(ticker)
+        summary_after_reset = tracker.get_market_summary(ticker)
+        assert summary_after_reset["realized_pnl_cents"] == 100.0
+        # Intra-session realized delta resets to 0.0
+        assert summary_after_reset["session_realized_pnl_cents"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_market_maker_serializes_snapshots_and_quiesces_on_stop(self):
+        """Verify market maker serializes snapshot tasks and cancels sync task on stop."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-SERIALIZE")
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
+
+        # Simulate running sync task
+        mock_sync = asyncio.create_task(asyncio.sleep(10))
+        bot._sync_task = mock_sync
+        bot._background_tasks.add(mock_sync)
+
+        # Simulate running snapshot task
+        mock_snap = asyncio.create_task(asyncio.sleep(0.01))
+        bot._snapshot_task = mock_snap
+        bot._background_tasks.add(mock_snap)
+
+        # _maybe_schedule_pnl_snapshot should skip if snapshot task is already in-flight
+        bot._last_pnl_snapshot = 0.0
+        bot._maybe_schedule_pnl_snapshot(now=time.time())
+        bot.om.record_pnl_snapshot_async.assert_not_called()
+
+        # Stop should cancel sync task and await snapshot task
+        await bot.stop()
+        assert mock_sync.cancelled()
+        assert mock_snap.done()
+        assert bot.om.record_pnl_snapshot_async.call_count == 1
+
+
 
 
 

@@ -37,6 +37,8 @@ class MarketPnL:
     realized_pnl_cents: float = 0.0
     unrealized_pnl_cents: float = 0.0
     total_fees_cents: float = 0.0
+    reconciliation_adjustment_cents: float = 0.0  # MTM adjustments realized during REST inventory reconciliation
+    session_start_realized_cents: float = 0.0  # Realized PnL baseline at rotation session start
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -64,9 +66,11 @@ class PnLTracker:
         """
         Resets session-level attribution for a market upon rotation.
         Generates a new rotation session UUID while preserving cumulative market totals.
+        Persists the current realized PnL baseline so intra-session performance can be isolated.
         """
         market = self.get_or_create_market(ticker)
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
+        market.session_start_realized_cents = market.realized_pnl_cents
         return market.rotation_session_id
 
     def seed_initial_inventory(self, ticker: str, position: int, cost_basis_cents: Optional[float] = None):
@@ -127,7 +131,11 @@ class PnLTracker:
         """
         Reconciles the tracker's lot-based inventory against authoritative REST portfolio positions.
         - Trims or flattens lots if authoritative position is smaller.
-        - Realizes net mark-to-market PnL (including deferred entry fees) on removed costed lots so Total Strategy PnL is conserved.
+        - Preserves the financial accounting invariant Total PnL = Realized PnL + Unrealized PnL:
+          When open lots are trimmed or closed during reconciliation without an execution price,
+          the net mark-to-market value (including allocated entry fees) is transferred from Unrealized
+          to Realized PnL and tracked in `reconciliation_adjustment_cents`. This maintains exact Total PnL
+          continuity without fabricating arbitrary execution prices.
         - Appends an uncosted lot if position has expanded or flipped across zero.
         """
         market = self.get_or_create_market(ticker)
@@ -148,26 +156,13 @@ class PnLTracker:
                 for lot in market.open_lots
             )
             if reconciled_mtm != 0.0:
+                market.reconciliation_adjustment_cents += reconciled_mtm
                 market.realized_pnl_cents += reconciled_mtm
                 logger.warning(
                     f"Reconciled position to 0 for {ticker}: realized {reconciled_mtm:+.2f}c in "
-                    f"net mark-to-market PnL on {len(market.open_lots)} closed lots."
+                    f"net mark-to-market reconciliation adjustment on {len(market.open_lots)} closed lots."
                 )
             market.open_lots.clear()
-        elif current_position == 0:
-            action = "buy" if target_position > 0 else "sell"
-            market.open_lots.append(
-                InventoryLot(
-                    lot_id=f"recon-{str(uuid.uuid4())[:6]}",
-                    ticker=ticker,
-                    action=action,
-                    price_cents=None,
-                    count=abs(target_position),
-                    timestamp=time.time(),
-                    is_uncosted=True,
-                    entry_fee_per_contract=0.0,
-                )
-            )
         elif (current_position > 0 and target_position > 0) or (current_position < 0 and target_position < 0):
             if abs(target_position) > abs(current_position):
                 action = "buy" if target_position > 0 else "sell"
@@ -200,21 +195,37 @@ class PnLTracker:
                         new_lots.append(lot)
                 market.open_lots = new_lots
                 if reconciled_mtm != 0.0:
+                    market.reconciliation_adjustment_cents += reconciled_mtm
                     market.realized_pnl_cents += reconciled_mtm
                     logger.warning(
                         f"Trimmed {abs(delta)} contracts during reconciliation for {ticker}: "
-                        f"realized {reconciled_mtm:+.2f}c in net mark-to-market PnL."
+                        f"realized {reconciled_mtm:+.2f}c in net mark-to-market reconciliation adjustment."
                     )
+        elif current_position == 0:
+            action = "buy" if target_position > 0 else "sell"
+            market.open_lots.append(
+                InventoryLot(
+                    lot_id=f"recon-{str(uuid.uuid4())[:6]}",
+                    ticker=ticker,
+                    action=action,
+                    price_cents=None,
+                    count=abs(target_position),
+                    timestamp=time.time(),
+                    is_uncosted=True,
+                    entry_fee_per_contract=0.0,
+                )
+            )
         else:
             reconciled_mtm = sum(
                 self._calculate_lot_mtm(lot, lot.count, market.last_mid_price)
                 for lot in market.open_lots
             )
             if reconciled_mtm != 0.0:
+                market.reconciliation_adjustment_cents += reconciled_mtm
                 market.realized_pnl_cents += reconciled_mtm
                 logger.warning(
                     f"Reconciled position reversal for {ticker}: realized {reconciled_mtm:+.2f}c in "
-                    f"net mark-to-market PnL on {len(market.open_lots)} closed lots."
+                    f"net mark-to-market reconciliation adjustment on {len(market.open_lots)} closed lots."
                 )
             market.open_lots = [
                 InventoryLot(
@@ -231,6 +242,13 @@ class PnLTracker:
 
         if market.last_mid_price is not None:
             self.update_mid_price(ticker, market.last_mid_price)
+        else:
+            # Recompute fee-only unrealized MTM when no mid-price exists
+            unrealized = 0.0
+            for lot in market.open_lots:
+                if not lot.is_uncosted and lot.price_cents is not None:
+                    unrealized -= lot.entry_fee_per_contract * lot.count
+            market.unrealized_pnl_cents = unrealized
 
 
     @staticmethod
@@ -369,6 +387,14 @@ class PnLTracker:
         # Recalculate unrealized PnL if mid-price is known
         if market.last_mid_price is not None:
             self.update_mid_price(ticker, market.last_mid_price)
+        else:
+            # When opening a position before any mid-price tick is received,
+            # reflect allocated entry fees paid as unrealized loss so Total PnL is exact.
+            unrealized = 0.0
+            for lot in market.open_lots:
+                if not lot.is_uncosted and lot.price_cents is not None:
+                    unrealized -= lot.entry_fee_per_contract * lot.count
+            market.unrealized_pnl_cents = unrealized
 
         logger.info(
             f"PnL Fill [{ticker}]: {action.upper()} {count} {side.upper()} @ {price_cents}c | "
@@ -452,6 +478,8 @@ class PnLTracker:
             "unrealized_pnl_cents": unrealized,
             "total_pnl_cents": total_pnl,
             "total_fees_cents": total_fees,
+            "reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents, 4),
+            "session_realized_pnl_cents": round(market.realized_pnl_cents - market.session_start_realized_cents, 4),
             "net_inventory": net_inventory,
             "open_lots_count": len(market.open_lots),
             "round_trips_count": market.round_trips_count,
