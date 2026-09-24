@@ -84,6 +84,15 @@ class AvellanedaStoikovBot:
         self._last_inactive_retry: float = 0.0
         self._inactive_retry_interval: float = 5.0
 
+        # Periodic PnL snapshot tracking
+        self._last_pnl_snapshot: float = time.time()
+        self._pnl_snapshot_interval: float = 60.0
+
+        # Background task references to prevent garbage collection in asyncio
+        self._background_tasks = set()
+        self._sync_task: Optional[asyncio.Task] = None
+        self._snapshot_task: Optional[asyncio.Task] = None
+
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
         logger.info(f"Starting Market Maker for {self.ticker}")
@@ -95,7 +104,9 @@ class AvellanedaStoikovBot:
         await self.om.sync_and_recover_state()
         
         # 1. Start the WebSocket Connection
-        asyncio.create_task(self.ws_client.connect())
+        ws_task = asyncio.create_task(self.ws_client.connect())
+        self._background_tasks.add(ws_task)
+        ws_task.add_done_callback(self._background_tasks.discard)
         
         # 2. Wait for connection to establish
         while not self.ws_client.is_connected:
@@ -104,10 +115,16 @@ class AvellanedaStoikovBot:
         logger.info("WebSocket Connected. Hydrating state...")
         
         # 3. Hydrate initial inventory and subscribe to channels
-        await self.inv_manager.hydrate()
+        if not await self.inv_manager.hydrate(is_startup=True):
+            logger.critical("Failed to hydrate initial inventory state from REST API on startup. Aborting startup.")
+            await send_alert(f"Startup Aborted: Failed to hydrate initial portfolio inventory for {self.ticker}.")
+            self.running = False
+            raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
         
         # 3b. Launch the periodic reconciliation background task
-        asyncio.create_task(self.inv_manager._sync_loop())
+        self._sync_task = asyncio.create_task(self.inv_manager._sync_loop())
+        self._background_tasks.add(self._sync_task)
+        self._sync_task.add_done_callback(self._background_tasks.discard)
         
         await self.inv_manager.subscribe()
         await self.ob_manager.subscribe([self.ticker])
@@ -126,6 +143,7 @@ class AvellanedaStoikovBot:
             logger.error(f"Fatal error in trading loop: {e}", exc_info=True)
             await send_alert(f"Fatal error in trading loop for {self.ticker}: {e}")
             self.running = False
+            raise
 
     async def _tick(self):
         """The core logic evaluated every cycle."""
@@ -158,6 +176,7 @@ class AvellanedaStoikovBot:
                         return
                     else:
                         logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
+            self._maybe_schedule_pnl_snapshot(now, inventory)
             return
 
         # Periodic market settlement and expiry detection
@@ -176,12 +195,14 @@ class AvellanedaStoikovBot:
                     else:
                         self._market_inactive = True
                         self._last_inactive_retry = now
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
                     return
                 else:
                     logger.error(f"No replacement market found for {self.ticker}.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
                     await self._cancel_all_quotes()
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
                     return
             elif is_active is True:
                 self._market_inactive = False
@@ -225,12 +246,14 @@ class AvellanedaStoikovBot:
                             else:
                                 self._market_inactive = True
                                 self._last_inactive_retry = now
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
                             return
                         else:
                             logger.error(f"No replacement market found for starved market {self.ticker}.")
                             self._market_inactive = True
                             self._last_inactive_retry = now
                             await self._cancel_all_quotes()
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
                             return
 
                 if now - self._last_empty_ob_log > 30:
@@ -241,6 +264,7 @@ class AvellanedaStoikovBot:
                     )
                     self._last_empty_ob_log = now
                 await self._cancel_all_quotes()
+                self._maybe_schedule_pnl_snapshot(now, inventory)
                 return
         else:
             if self._starvation_alert_sent:
@@ -255,14 +279,18 @@ class AvellanedaStoikovBot:
             # 1. Calculate Mid Price
             mid_price = (bid_price + ask_price) / 2.0
         
-        # 2. Get Inventory
+        # 2. Mark open inventory to market against current mid price
+        self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
+        self._maybe_schedule_pnl_snapshot(now, inventory)
+
+        # 3. Get Inventory
         # Convention: positive inventory = holding net YES
         
-        # 3. Calculate Reservation Price (R)
+        # 4. Calculate Reservation Price (R)
         # R = M - (q * gamma)
         reservation_price = mid_price - (inventory * self.gamma)
         
-        # 4. Calculate Optimal Bid/Ask
+        # 5. Calculate Optimal Bid/Ask
         optimal_bid = math.floor(reservation_price - (self.min_spread / 2.0))
         optimal_ask = math.ceil(reservation_price + (self.min_spread / 2.0))
         
@@ -288,16 +316,20 @@ class AvellanedaStoikovBot:
             if best_ask:
                 optimal_bid = max(1, min(best_ask[0], 98)) # Match the best ask to fill immediately
 
+        realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+        unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
         if optimal_bid is not None and optimal_ask is not None:
             logger.info(
                 f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | Gamma={self.gamma} | "
                 f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
-                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c"
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
+                f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
         else:
             logger.info(
                 f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | "
-                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged)"
+                f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged) | "
+                f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
             
         # 5. Execute Output
@@ -391,6 +423,81 @@ class AvellanedaStoikovBot:
 
         return all_cancelled
 
+    def _maybe_schedule_pnl_snapshot(self, now: float, inventory: Optional[int] = None) -> None:
+        """Schedule periodic PnL snapshot persistence to PostgreSQL if the interval has elapsed."""
+        if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
+            self._last_pnl_snapshot = now
+            current_ticker = self.ticker
+            current_inventory = self.inv_manager.get_position(current_ticker)
+            pnl_summary = self.inv_manager.get_pnl_summary(current_ticker)
+
+            # Serialize snapshot writes: skip if previous background snapshot is still writing
+            if self._snapshot_task and not self._snapshot_task.done():
+                logger.debug("Previous PnL snapshot task is still in flight; skipping periodic snapshot.")
+                return
+
+            snap_task = asyncio.create_task(
+                self.om.record_pnl_snapshot_async(
+                    ticker=current_ticker,
+                    realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                    unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                    total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                    inventory=current_inventory,
+                    rotation_session_id=pnl_summary.get("rotation_session_id", "")
+                )
+            )
+            self._snapshot_task = snap_task
+            self._background_tasks.add(snap_task)
+            snap_task.add_done_callback(self._background_tasks.discard)
+
+    async def _escalate_to_kill_switch(self, context: str = "operation") -> bool:
+        """
+        Escalates to emergency KillSwitch, canceling all orders in om.active_orders
+        and explicitly canceling and verifying untracked current_bid_id/current_ask_id.
+        Returns True if all active orders and quotes are confirmed cleared, False otherwise.
+        """
+        logger.error(f"Active orders remain or quote cancellation failed during {context}. Escalating to emergency kill switch...")
+        try:
+            from execution.kill_switch import KillSwitch
+            killer = KillSwitch(self.om)
+            initial_active = set(self.om.active_orders.keys())
+            await killer.trigger()
+
+            # For quotes that were in om.active_orders, verify killer successfully popped them
+            # For untracked quotes, explicitly cancel on exchange via om.cancel_order
+            if self.current_bid_id:
+                if self.current_bid_id in initial_active:
+                    if self.current_bid_id not in self.om.active_orders:
+                        self.current_bid_id = None
+                        self.current_bid_price = None
+                    else:
+                        logger.error(f"KillSwitch failed to cancel tracked bid quote {self.current_bid_id}")
+                else:
+                    if await self.om.cancel_order(self.current_bid_id):
+                        self.current_bid_id = None
+                        self.current_bid_price = None
+                    else:
+                        logger.error(f"Failed to confirm cancellation of untracked resting bid quote {self.current_bid_id}")
+
+            if self.current_ask_id:
+                if self.current_ask_id in initial_active:
+                    if self.current_ask_id not in self.om.active_orders:
+                        self.current_ask_id = None
+                        self.current_ask_price = None
+                    else:
+                        logger.error(f"KillSwitch failed to cancel tracked ask quote {self.current_ask_id}")
+                else:
+                    if await self.om.cancel_order(self.current_ask_id):
+                        self.current_ask_id = None
+                        self.current_ask_price = None
+                    else:
+                        logger.error(f"Failed to confirm cancellation of untracked resting ask quote {self.current_ask_id}")
+
+            return not bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        except Exception as e:
+            logger.critical(f"Emergency kill switch failed during {context}: {e}")
+            return False
+
     async def rotate_market(self, new_ticker: str) -> bool:
         """
         Dynamically rotate bot quoting and orderbook subscription to a new market ticker
@@ -402,10 +509,38 @@ class AvellanedaStoikovBot:
 
         logger.warning(f"Rotating target market from {old_ticker} to {new_ticker}...")
 
-        # 1. Withdraw all active quotes on the previous ticker
-        if not await self._cancel_all_quotes():
-            logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
+        # 1. Withdraw all active quotes on the previous ticker and ensure no active orders remain
+        quotes_cancelled = await self._cancel_all_quotes()
+        has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        if not quotes_cancelled or has_active_orders:
+            logger.error(
+                f"Aborting market rotation from {old_ticker} to {new_ticker}; "
+                f"active orders remain or quote cancellation was not confirmed."
+            )
+            await self._escalate_to_kill_switch(context=f"market rotation from {old_ticker} to {new_ticker}")
             return False
+
+        # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
+        await asyncio.sleep(0)
+        if self._snapshot_task and not self._snapshot_task.done():
+            try:
+                await self._snapshot_task
+            except Exception as e:
+                logger.warning(f"Error awaiting previous snapshot task during rotation: {e}")
+
+        # Persist final PnL attribution snapshot for the market being rotated out (after resting quotes are confirmed cancelled)
+        try:
+            pnl_summary = self.inv_manager.get_pnl_summary(old_ticker)
+            await self.om.record_pnl_snapshot_async(
+                ticker=old_ticker,
+                realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                inventory=self.inv_manager.get_position(old_ticker),
+                rotation_session_id=pnl_summary.get("rotation_session_id", "")
+            )
+        except Exception as e:
+            logger.error(f"Failed to record rotation PnL snapshot for {old_ticker}: {e}")
 
         # 2. Swap orderbook subscription
         await self.ob_manager.unsubscribe([old_ticker])
@@ -418,11 +553,59 @@ class AvellanedaStoikovBot:
         self._last_empty_ob_log = 0.0
         self._last_market_status_check = time.time()
         self._market_inactive = False
+        self._last_pnl_snapshot = time.time()
+
+        # Start a new tracking session for the new market ticker
+        self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
 
         logger.info(f"Market rotation complete. Now trading {new_ticker}.")
         await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
 
-    async def stop(self):
+    async def stop(self) -> bool:
         self.running = False
-        await self._cancel_all_quotes()
+
+        # 0. Cancel background reconciliation loop before capturing shutdown state
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # 1. Withdraw resting quotes first to eliminate market risk immediately
+        quotes_cancelled = await self._cancel_all_quotes()
+        has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        if not quotes_cancelled or has_active_orders:
+            quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
+
+        # Quiesce fills and drain running background snapshot tasks before final write
+        await asyncio.sleep(0)
+        if self._snapshot_task and not self._snapshot_task.done():
+            try:
+                await self._snapshot_task
+            except Exception as e:
+                logger.warning(f"Error awaiting previous snapshot task during shutdown: {e}")
+
+        # 2. Persist final shutdown snapshot after quotes are withdrawn
+        try:
+            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+            await self.om.record_pnl_snapshot_async(
+                ticker=self.ticker,
+                realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                inventory=self.inv_manager.get_position(self.ticker),
+                rotation_session_id=pnl_summary.get("rotation_session_id", "")
+            )
+        except Exception as e:
+            logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
+
+        # 3. Cancel and await all active background tasks
+        tasks_to_cancel = [t for t in list(self._background_tasks) if not t.done()]
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        return quotes_cancelled
