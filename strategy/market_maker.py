@@ -154,23 +154,6 @@ class AvellanedaStoikovBot:
         balance = self.inv_manager.get_balance()
         BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
 
-        # Periodic PnL snapshot persistence to PostgreSQL (every 60s)
-        if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
-            self._last_pnl_snapshot = now
-            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
-            snap_task = asyncio.create_task(
-                self.om.record_pnl_snapshot_async(
-                    ticker=self.ticker,
-                    realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
-                    unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
-                    total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
-                    inventory=inventory,
-                    rotation_session_id=pnl_summary.get("rotation_session_id", "")
-                )
-            )
-            self._background_tasks.add(snap_task)
-            snap_task.add_done_callback(self._background_tasks.discard)
-
         # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
         if self._market_inactive:
             if self.current_bid_id or self.current_ask_id:
@@ -191,6 +174,7 @@ class AvellanedaStoikovBot:
                         return
                     else:
                         logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
+            self._maybe_schedule_pnl_snapshot(now, inventory)
             return
 
         # Periodic market settlement and expiry detection
@@ -209,12 +193,14 @@ class AvellanedaStoikovBot:
                     else:
                         self._market_inactive = True
                         self._last_inactive_retry = now
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
                     return
                 else:
                     logger.error(f"No replacement market found for {self.ticker}.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
                     await self._cancel_all_quotes()
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
                     return
             elif is_active is True:
                 self._market_inactive = False
@@ -258,12 +244,14 @@ class AvellanedaStoikovBot:
                             else:
                                 self._market_inactive = True
                                 self._last_inactive_retry = now
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
                             return
                         else:
                             logger.error(f"No replacement market found for starved market {self.ticker}.")
                             self._market_inactive = True
                             self._last_inactive_retry = now
                             await self._cancel_all_quotes()
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
                             return
 
                 if now - self._last_empty_ob_log > 30:
@@ -274,6 +262,7 @@ class AvellanedaStoikovBot:
                     )
                     self._last_empty_ob_log = now
                 await self._cancel_all_quotes()
+                self._maybe_schedule_pnl_snapshot(now, inventory)
                 return
         else:
             if self._starvation_alert_sent:
@@ -290,6 +279,7 @@ class AvellanedaStoikovBot:
         
         # 2. Mark open inventory to market against current mid price
         self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
+        self._maybe_schedule_pnl_snapshot(now, inventory)
 
         # 3. Get Inventory
         # Convention: positive inventory = holding net YES
@@ -431,6 +421,24 @@ class AvellanedaStoikovBot:
 
         return all_cancelled
 
+    def _maybe_schedule_pnl_snapshot(self, now: float, inventory: int) -> None:
+        """Schedule periodic PnL snapshot persistence to PostgreSQL if the interval has elapsed."""
+        if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
+            self._last_pnl_snapshot = now
+            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+            snap_task = asyncio.create_task(
+                self.om.record_pnl_snapshot_async(
+                    ticker=self.ticker,
+                    realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
+                    unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
+                    total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
+                    inventory=inventory,
+                    rotation_session_id=pnl_summary.get("rotation_session_id", "")
+                )
+            )
+            self._background_tasks.add(snap_task)
+            snap_task.add_done_callback(self._background_tasks.discard)
+
     async def rotate_market(self, new_ticker: str) -> bool:
         """
         Dynamically rotate bot quoting and orderbook subscription to a new market ticker
@@ -442,9 +450,20 @@ class AvellanedaStoikovBot:
 
         logger.warning(f"Rotating target market from {old_ticker} to {new_ticker}...")
 
-        # 1. Withdraw all active quotes on the previous ticker
-        if not await self._cancel_all_quotes():
-            logger.error(f"Aborting market rotation from {old_ticker} to {new_ticker}; quote cancellation was not confirmed.")
+        # 1. Withdraw all active quotes on the previous ticker and ensure no active orders remain
+        quotes_cancelled = await self._cancel_all_quotes()
+        has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        if not quotes_cancelled or has_active_orders:
+            logger.error(
+                f"Aborting market rotation from {old_ticker} to {new_ticker}; "
+                f"active orders remain or quote cancellation was not confirmed. Escalating to emergency kill switch..."
+            )
+            try:
+                from execution.kill_switch import KillSwitch
+                killer = KillSwitch(self.om)
+                await killer.trigger()
+            except Exception as e:
+                logger.critical(f"Emergency kill switch failed during rotation from {old_ticker} to {new_ticker}: {e}")
             return False
 
         # Persist final PnL attribution snapshot for the market being rotated out (after resting quotes are confirmed cancelled)

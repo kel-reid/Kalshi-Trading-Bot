@@ -1548,6 +1548,94 @@ class TestMarketMakerPnLLifecycle:
         # Cost: 5 * 60c + 1.5c fee = 301.5c -> balance = 9549.0 - 301.5 = 9247.5
         assert im.balance_cents == 9247.5
 
+    def test_fetch_and_apply_positions_rejects_non_integral_positions(self):
+        """Verify _fetch_positions and _apply_positions reject non-integral position values instead of truncating."""
+        im = InventoryManager(ws_client=MagicMock())
+
+        # 1. _fetch_positions rejects fractional position string or float
+        mock_resp_frac1 = MagicMock(status_code=200)
+        mock_resp_frac1.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position": "1.5"}]}
+        with patch("requests.get", return_value=mock_resp_frac1):
+            assert im._fetch_positions() is None
+
+        mock_resp_frac2 = MagicMock(status_code=200)
+        mock_resp_frac2.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position_fp": 2.7}]}
+        with patch("requests.get", return_value=mock_resp_frac2):
+            assert im._fetch_positions() is None
+
+        # Integral float (e.g. 5.0) is accepted
+        mock_resp_int = MagicMock(status_code=200)
+        mock_resp_int.json.return_value = {"market_positions": [{"ticker": "KXTEST-INT", "position": "5.0"}]}
+        with patch("requests.get", return_value=mock_resp_int):
+            pos_list = im._fetch_positions()
+            assert pos_list is not None
+            assert len(pos_list) == 1
+            assert pos_list[0]["ticker"] == "KXTEST-INT"
+
+        # 2. _apply_positions rejects fractional position values
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-1", "position": "3.5"}]) is False
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-2", "position": 4.2}]) is False
+        assert im._apply_positions([{"ticker": "KXTEST-INT-OK", "position": 4.0}]) is True
+        assert im.get_position("KXTEST-INT-OK") == 4
+
+    @pytest.mark.asyncio
+    async def test_rotate_market_escalates_to_kill_switch_when_active_orders_remain(self):
+        """Verify rotate_market() triggers KillSwitch and aborts rotation when active orders remain in om.active_orders."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="OLD-TICKER")
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.om.active_orders = {"stray-order-1": {"kalshi_order_id": "k1"}}
+        bot.ob_manager.unsubscribe = AsyncMock()
+        bot.ob_manager.subscribe = AsyncMock()
+
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock()
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            rotated = await bot.rotate_market("NEW-TICKER")
+
+        # Must trigger KillSwitch to cancel the dangling orders on the old ticker
+        mock_killer.trigger.assert_awaited_once()
+        # Rotation must be aborted to protect the bot
+        assert rotated is False
+        assert bot.ticker == "OLD-TICKER"
+        bot.ob_manager.unsubscribe.assert_not_awaited()
+        bot.ob_manager.subscribe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tick_schedules_snapshot_after_updating_current_mid(self):
+        """Verify _tick() updates orderbook mid price before scheduling periodic snapshot."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="KXTEST-SNAP-TIMING", min_spread=2)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(40, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(60, 10))  # Mid = 50c
+        bot._update_quotes = AsyncMock()
+        bot._last_pnl_snapshot = 0.0  # Force snapshot interval to trigger
+
+        # Seed open inventory lot of 10 contracts @ 40c
+        bot.inv_manager.positions[bot.ticker] = 10
+        bot.inv_manager.pnl_tracker.record_fill(bot.ticker, "buy", "yes", 10, 40)
+        # Prior to tick, unrealized PnL is 0 because mid price hasn't been set yet
+        assert bot.inv_manager.get_unrealized_pnl(bot.ticker) == 0.0
+
+        snapshot_args = []
+        async def mock_record_snapshot(**kwargs):
+            snapshot_args.append(kwargs)
+
+        bot.om.record_pnl_snapshot_async = AsyncMock(side_effect=mock_record_snapshot)
+
+        await bot._tick()
+
+        # Await any background snapshot tasks
+        if bot._background_tasks:
+            await asyncio.gather(*list(bot._background_tasks), return_exceptions=True)
+
+        assert len(snapshot_args) == 1
+        # Mid price was updated to 50c: (50 - 40) * 10 = +100c unrealized PnL
+        assert snapshot_args[0]["unrealized_pnl_cents"] == 100.0
+        assert snapshot_args[0]["inventory"] == 10
+
+
 
 
 
