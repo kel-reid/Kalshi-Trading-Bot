@@ -304,4 +304,36 @@ async def test_main_shutdown_during_init_failure_triggers_sync_kill_and_raises()
     mock_killer.trigger_synchronous.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_main_shutdown_interrupts_in_flight_discovery():
+    """Verify that a shutdown signal during in-flight market discovery interrupts discovery and aborts startup promptly."""
+    import signal
+
+    signal_handlers = {}
+
+    def mock_signal(sig, handler):
+        signal_handlers[sig] = handler
+
+    discovery_cancelled = False
+
+    async def in_flight_discover(**kwargs):
+        nonlocal discovery_cancelled
+        handler = signal_handlers.get(signal.SIGINT)
+        assert handler is not None
+        handler(signal.SIGINT, None)
+        try:
+            await asyncio.sleep(100)
+            return "KXNFL-NEVER"
+        except asyncio.CancelledError:
+            discovery_cancelled = True
+            raise
+
+    with patch("utils.market_discovery.discover_active_market_async", side_effect=in_flight_discover), \
+         patch("main.signal.signal", side_effect=mock_signal):
+        await main()
+
+    assert discovery_cancelled is True
+
+
+
 

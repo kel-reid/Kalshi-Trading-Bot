@@ -60,6 +60,9 @@ class InventoryManager:
                 logger.error(f"Failed to parse balance JSON: {e}")
                 return None
             if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], (int, float)) and not isinstance(data["balance"], bool):
+                if not math.isfinite(data["balance"]):
+                    logger.error(f"Balance response contains non-finite balance: {data['balance']}")
+                    return None
                 return int(round(data["balance"]))
             logger.error(f"Balance response missing or invalid 'balance' field: {data}")
             return None
@@ -98,7 +101,10 @@ class InventoryManager:
                         logger.error(f"Positions response contains boolean position: {entry}")
                         return None
                     try:
-                        float(pos_val)
+                        pos_float = float(pos_val)
+                        if not math.isfinite(pos_float):
+                            logger.error(f"Positions response contains non-finite position: {entry}")
+                            return None
                     except (ValueError, TypeError):
                         logger.error(f"Positions response contains non-numeric position: {entry}")
                         return None
@@ -131,7 +137,11 @@ class InventoryManager:
                 logger.error(f"Malformed boolean position for {ticker}: {pos}")
                 return False
             try:
-                position = int(float(pos_val))
+                pos_float = float(pos_val)
+                if not math.isfinite(pos_float):
+                    logger.error(f"Malformed non-finite position value ({pos_val!r}) for {ticker}: {pos}")
+                    return False
+                position = int(pos_float)
             except (ValueError, TypeError):
                 logger.error(f"Malformed position value ({pos_val!r}) for {ticker}: {pos}")
                 return False
@@ -144,11 +154,13 @@ class InventoryManager:
                 if is_startup:
                     exposure = pos.get("market_exposure")
                     cost_basis = None
-                    try:
-                        if exposure is not None and float(exposure) != 0 and position != 0:
-                            cost_basis = abs(float(exposure) / float(position))
-                    except Exception:
-                        cost_basis = None
+                    if exposure is not None and not isinstance(exposure, bool):
+                        try:
+                            exp_val = float(exposure)
+                            if math.isfinite(exp_val) and exp_val > 0 and position != 0:
+                                cost_basis = round(exp_val / abs(position), 4)
+                        except (ValueError, TypeError):
+                            cost_basis = None
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
                 else:
                     self.pnl_tracker.reconcile_inventory(ticker, position)
