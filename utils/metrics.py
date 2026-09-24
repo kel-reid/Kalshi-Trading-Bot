@@ -38,6 +38,26 @@ BOT_INVENTORY_NET_POSITION = Gauge(
     "Net YES position for a given market",
     ["ticker"]
 )
+KALSHI_REALIZED_PNL_CENTS = Gauge(
+    "kalshi_realized_pnl_cents",
+    "Cumulative realized PnL in cents from closed round-trip trades",
+    ["ticker"]
+)
+KALSHI_UNREALIZED_PNL_CENTS = Gauge(
+    "kalshi_unrealized_pnl_cents",
+    "Mark-to-market unrealized PnL in cents against live mid-price",
+    ["ticker"]
+)
+KALSHI_FEES_PAID_CENTS = Gauge(
+    "kalshi_total_fees_cents",
+    "Total exchange fees paid in cents",
+    ["ticker"]
+)
+KALSHI_ROUND_TRIPS_TOTAL = Counter(
+    "kalshi_round_trips_total",
+    "Total count of completed round-trip trades",
+    ["ticker", "outcome"]
+)
 
 _server_started = False
 

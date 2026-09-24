@@ -8,7 +8,7 @@ This roadmap outlines the prioritized engineering milestones for the Kalshi Algo
 
 | Priority | Feature / Capability | Category | Impact | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **Phase 1 (Critical)** | [Real-Time Realized PnL & Trade Attribution](#phase-1-real-time-realized-pnl--trade-attribution) | Observability & Economics | Visibility into true strategy profitability and fill quality | **Planned (Next)** |
+| **Phase 1 (Critical)** | [Real-Time Realized PnL & Trade Attribution](#phase-1-real-time-realized-pnl--trade-attribution) | Observability & Economics | Visibility into true strategy profitability and fill quality | **Completed** |
 | **Phase 2 (High)** | [Adverse Selection & Toxic Flow Protection](#phase-2-adverse-selection--toxic-flow-protection) | Risk & Capital Defense | Safeguards resting capital against rapid information jumps | **Planned** |
 | **Phase 3 (Medium-High)** | [Dynamic Volatility & Adaptive Spread Modeling](#phase-3-dynamic-volatility--adaptive-spread-modeling) | Quantitative Alpha | Optimizes spread width according to real-time market regimes | **Planned** |
 | **Phase 4 (Medium)** | [In-Place Order Amendment Optimization](#phase-4-in-place-order-amendment-optimization) | Execution & Latency | Minimizes unquoted windows and cuts REST API roundtrips | **Planned** |
@@ -56,16 +56,17 @@ The bot persists order lifecycle records in PostgreSQL and manages inventory exp
      );
      ```
 3. **Grafana Cloud Telemetry**:
-   - Expose Prometheus gauges via `utils/metrics.py`:
-     - `kalshi_realized_pnl_cents` (gauge by market ticker)
-     - `kalshi_unrealized_pnl_cents` (gauge by market ticker)
-     - `kalshi_cumulative_pnl_cents` (counter of net realized profit)
+   - Expose Prometheus metrics via `utils/metrics.py`:
+     - `kalshi_realized_pnl_cents` (gauge by market ticker; net realized profit after fees)
+     - `kalshi_unrealized_pnl_cents` (gauge by market ticker; live mark-to-market against mid)
+     - `kalshi_total_fees_cents` (gauge by market ticker)
+     - `kalshi_round_trips_total` (counter by market ticker and outcome: profit, loss, scratch)
    - Add dedicated panels to the Grafana Cloud dashboard for instantaneous balance and PnL monitoring.
 
 ### Acceptance Criteria
-- [ ] Every partial and complete fill computes incremental realized PnL against existing inventory.
-- [ ] PnL metrics automatically reset or re-tag when auto-rotation transitions to a new contract.
-- [ ] Zero blocking calls on the asyncio event loop during database writes.
+- [x] Every partial and complete fill computes incremental realized PnL against existing inventory.
+- [x] PnL metrics automatically reset or re-tag when auto-rotation transitions to a new contract.
+- [x] Zero blocking calls on the asyncio event loop during database writes.
 
 ---
 
