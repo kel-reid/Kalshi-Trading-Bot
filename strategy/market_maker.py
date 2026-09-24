@@ -439,6 +439,54 @@ class AvellanedaStoikovBot:
             self._background_tasks.add(snap_task)
             snap_task.add_done_callback(self._background_tasks.discard)
 
+    async def _escalate_to_kill_switch(self, context: str = "operation") -> bool:
+        """
+        Escalates to emergency KillSwitch, canceling all orders in om.active_orders
+        and explicitly canceling and verifying untracked current_bid_id/current_ask_id.
+        Returns True if all active orders and quotes are confirmed cleared, False otherwise.
+        """
+        logger.error(f"Active orders remain or quote cancellation failed during {context}. Escalating to emergency kill switch...")
+        try:
+            from execution.kill_switch import KillSwitch
+            killer = KillSwitch(self.om)
+            initial_active = set(self.om.active_orders.keys())
+            await killer.trigger()
+
+            # For quotes that were in om.active_orders, verify killer successfully popped them
+            # For untracked quotes, explicitly cancel on exchange via om.cancel_order
+            if self.current_bid_id:
+                if self.current_bid_id in initial_active:
+                    if self.current_bid_id not in self.om.active_orders:
+                        self.current_bid_id = None
+                        self.current_bid_price = None
+                    else:
+                        logger.error(f"KillSwitch failed to cancel tracked bid quote {self.current_bid_id}")
+                else:
+                    if await self.om.cancel_order(self.current_bid_id):
+                        self.current_bid_id = None
+                        self.current_bid_price = None
+                    else:
+                        logger.error(f"Failed to confirm cancellation of untracked resting bid quote {self.current_bid_id}")
+
+            if self.current_ask_id:
+                if self.current_ask_id in initial_active:
+                    if self.current_ask_id not in self.om.active_orders:
+                        self.current_ask_id = None
+                        self.current_ask_price = None
+                    else:
+                        logger.error(f"KillSwitch failed to cancel tracked ask quote {self.current_ask_id}")
+                else:
+                    if await self.om.cancel_order(self.current_ask_id):
+                        self.current_ask_id = None
+                        self.current_ask_price = None
+                    else:
+                        logger.error(f"Failed to confirm cancellation of untracked resting ask quote {self.current_ask_id}")
+
+            return not bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
+        except Exception as e:
+            logger.critical(f"Emergency kill switch failed during {context}: {e}")
+            return False
+
     async def rotate_market(self, new_ticker: str) -> bool:
         """
         Dynamically rotate bot quoting and orderbook subscription to a new market ticker
@@ -456,14 +504,9 @@ class AvellanedaStoikovBot:
         if not quotes_cancelled or has_active_orders:
             logger.error(
                 f"Aborting market rotation from {old_ticker} to {new_ticker}; "
-                f"active orders remain or quote cancellation was not confirmed. Escalating to emergency kill switch..."
+                f"active orders remain or quote cancellation was not confirmed."
             )
-            try:
-                from execution.kill_switch import KillSwitch
-                killer = KillSwitch(self.om)
-                await killer.trigger()
-            except Exception as e:
-                logger.critical(f"Emergency kill switch failed during rotation from {old_ticker} to {new_ticker}: {e}")
+            await self._escalate_to_kill_switch(context=f"market rotation from {old_ticker} to {new_ticker}")
             return False
 
         # Persist final PnL attribution snapshot for the market being rotated out (after resting quotes are confirmed cancelled)
@@ -505,47 +548,7 @@ class AvellanedaStoikovBot:
         quotes_cancelled = await self._cancel_all_quotes()
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
-            logger.error("Active orders remain or quote cancellation failed during shutdown. Escalating to emergency kill switch...")
-            try:
-                from execution.kill_switch import KillSwitch
-                killer = KillSwitch(self.om)
-                initial_active = set(self.om.active_orders.keys())
-                await killer.trigger()
-
-                # For quotes that were in om.active_orders, verify killer successfully popped them
-                # For untracked quotes, explicitly cancel on exchange via om.cancel_order
-                if self.current_bid_id:
-                    if self.current_bid_id in initial_active:
-                        if self.current_bid_id not in self.om.active_orders:
-                            self.current_bid_id = None
-                            self.current_bid_price = None
-                        else:
-                            logger.error(f"KillSwitch failed to cancel tracked bid quote {self.current_bid_id}")
-                    else:
-                        if await self.om.cancel_order(self.current_bid_id):
-                            self.current_bid_id = None
-                            self.current_bid_price = None
-                        else:
-                            logger.error(f"Failed to confirm cancellation of untracked resting bid quote {self.current_bid_id}")
-
-                if self.current_ask_id:
-                    if self.current_ask_id in initial_active:
-                        if self.current_ask_id not in self.om.active_orders:
-                            self.current_ask_id = None
-                            self.current_ask_price = None
-                        else:
-                            logger.error(f"KillSwitch failed to cancel tracked ask quote {self.current_ask_id}")
-                    else:
-                        if await self.om.cancel_order(self.current_ask_id):
-                            self.current_ask_id = None
-                            self.current_ask_price = None
-                        else:
-                            logger.error(f"Failed to confirm cancellation of untracked resting ask quote {self.current_ask_id}")
-
-                quotes_cancelled = not bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
-            except Exception as e:
-                logger.critical(f"Emergency kill switch failed during shutdown: {e}")
-                quotes_cancelled = False
+            quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
 
         # 2. Persist final shutdown snapshot after quotes are withdrawn
         try:
