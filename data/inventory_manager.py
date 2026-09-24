@@ -316,13 +316,13 @@ class InventoryManager:
                     price = fill_msg.get("yes_price")
                 elif fill_msg.get("no_price") is not None:
                     opp = fill_msg.get("no_price")
-                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) else None
+                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
             elif side == "no":
                 if fill_msg.get("no_price") is not None:
                     price = fill_msg.get("no_price")
                 elif fill_msg.get("yes_price") is not None:
                     opp = fill_msg.get("yes_price")
-                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) else None
+                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
 
         # 4. Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
         if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or price >= 100 or math.isnan(price) or math.isinf(price):

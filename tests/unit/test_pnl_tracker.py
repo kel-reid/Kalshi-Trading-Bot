@@ -7,6 +7,7 @@ mark-to-market unrealized PnL, trade classification, and market rotation attribu
 
 import asyncio
 import pytest
+import time
 import uuid
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -1681,6 +1682,55 @@ class TestMarketMakerPnLLifecycle:
         # Mid price was updated to 50c: (50 - 40) * 10 = +100c unrealized PnL
         assert snapshot_args[0]["unrealized_pnl_cents"] == 100.0
         assert snapshot_args[0]["inventory"] == 10
+
+    def test_handle_fill_drops_infinite_opposite_side_prices_without_overflow_error(self):
+        """Verify _handle_fill gracefully drops infinite or NaN opposite-side fallback prices without OverflowError."""
+        im = InventoryManager(ws_client=MagicMock())
+        initial_fill_count = im._fill_count
+
+        infinite_payloads = [
+            {"market_ticker": "KXTEST-INF1", "action": "buy", "side": "yes", "count": 1, "no_price": float("inf")},
+            {"market_ticker": "KXTEST-INF2", "action": "buy", "side": "yes", "count": 1, "no_price": float("-inf")},
+            {"market_ticker": "KXTEST-INF3", "action": "buy", "side": "no", "count": 1, "yes_price": float("inf")},
+            {"market_ticker": "KXTEST-INF4", "action": "buy", "side": "no", "count": 1, "yes_price": float("-inf")},
+            {"market_ticker": "KXTEST-NAN", "action": "buy", "side": "yes", "count": 1, "no_price": float("nan")},
+        ]
+
+        for payload in infinite_payloads:
+            # Must not raise OverflowError or mutate state
+            im._handle_fill(payload)
+            assert im._fill_count == initial_fill_count
+            assert im.get_position(payload["market_ticker"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_maybe_schedule_pnl_snapshot_uses_current_ticker_and_inventory(self):
+        """Verify _maybe_schedule_pnl_snapshot always reads current ticker and inventory context consistently."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="OLD-TICKER")
+        bot.inv_manager.positions["OLD-TICKER"] = 25
+        bot.inv_manager.positions["NEW-TICKER"] = 3
+
+        snapshot_args = []
+        async def mock_record_snapshot(**kwargs):
+            snapshot_args.append(kwargs)
+
+        bot.om.record_pnl_snapshot_async = AsyncMock(side_effect=mock_record_snapshot)
+
+        # After rotation, bot.ticker is "NEW-TICKER"
+        bot.ticker = "NEW-TICKER"
+        bot._last_pnl_snapshot = 0.0
+
+        # Call snapshot helper without passing inventory (or passing stale old inventory)
+        bot._maybe_schedule_pnl_snapshot(now=time.time(), inventory=25)
+
+        if bot._background_tasks:
+            await asyncio.gather(*list(bot._background_tasks), return_exceptions=True)
+
+        assert len(snapshot_args) == 1
+        # Snapshot must be tagged with NEW-TICKER and its actual inventory (3), not the old inventory (25)
+        assert snapshot_args[0]["ticker"] == "NEW-TICKER"
+        assert snapshot_args[0]["inventory"] == 3
+
 
 
 

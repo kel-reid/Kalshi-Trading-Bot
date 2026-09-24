@@ -421,18 +421,20 @@ class AvellanedaStoikovBot:
 
         return all_cancelled
 
-    def _maybe_schedule_pnl_snapshot(self, now: float, inventory: int) -> None:
+    def _maybe_schedule_pnl_snapshot(self, now: float, inventory: Optional[int] = None) -> None:
         """Schedule periodic PnL snapshot persistence to PostgreSQL if the interval has elapsed."""
         if now - self._last_pnl_snapshot >= self._pnl_snapshot_interval:
             self._last_pnl_snapshot = now
-            pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+            current_ticker = self.ticker
+            current_inventory = self.inv_manager.get_position(current_ticker)
+            pnl_summary = self.inv_manager.get_pnl_summary(current_ticker)
             snap_task = asyncio.create_task(
                 self.om.record_pnl_snapshot_async(
-                    ticker=self.ticker,
+                    ticker=current_ticker,
                     realized_pnl_cents=pnl_summary.get("realized_pnl_cents", 0.0),
                     unrealized_pnl_cents=pnl_summary.get("unrealized_pnl_cents", 0.0),
                     total_fees_cents=pnl_summary.get("total_fees_cents", 0.0),
-                    inventory=inventory,
+                    inventory=current_inventory,
                     rotation_session_id=pnl_summary.get("rotation_session_id", "")
                 )
             )
@@ -534,6 +536,7 @@ class AvellanedaStoikovBot:
         self._last_empty_ob_log = 0.0
         self._last_market_status_check = time.time()
         self._market_inactive = False
+        self._last_pnl_snapshot = time.time()
 
         # Start a new tracking session for the new market ticker
         self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
