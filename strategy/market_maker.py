@@ -90,6 +90,8 @@ class AvellanedaStoikovBot:
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
+        self._sync_task: Optional[asyncio.Task] = None
+        self._snapshot_task: Optional[asyncio.Task] = None
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -120,9 +122,9 @@ class AvellanedaStoikovBot:
             raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
         
         # 3b. Launch the periodic reconciliation background task
-        sync_task = asyncio.create_task(self.inv_manager._sync_loop())
-        self._background_tasks.add(sync_task)
-        sync_task.add_done_callback(self._background_tasks.discard)
+        self._sync_task = asyncio.create_task(self.inv_manager._sync_loop())
+        self._background_tasks.add(self._sync_task)
+        self._sync_task.add_done_callback(self._background_tasks.discard)
         
         await self.inv_manager.subscribe()
         await self.ob_manager.subscribe([self.ticker])
@@ -428,6 +430,12 @@ class AvellanedaStoikovBot:
             current_ticker = self.ticker
             current_inventory = self.inv_manager.get_position(current_ticker)
             pnl_summary = self.inv_manager.get_pnl_summary(current_ticker)
+
+            # Serialize snapshot writes: skip if previous background snapshot is still writing
+            if self._snapshot_task and not self._snapshot_task.done():
+                logger.debug("Previous PnL snapshot task is still in flight; skipping periodic snapshot.")
+                return
+
             snap_task = asyncio.create_task(
                 self.om.record_pnl_snapshot_async(
                     ticker=current_ticker,
@@ -438,6 +446,7 @@ class AvellanedaStoikovBot:
                     rotation_session_id=pnl_summary.get("rotation_session_id", "")
                 )
             )
+            self._snapshot_task = snap_task
             self._background_tasks.add(snap_task)
             snap_task.add_done_callback(self._background_tasks.discard)
 
@@ -511,6 +520,14 @@ class AvellanedaStoikovBot:
             await self._escalate_to_kill_switch(context=f"market rotation from {old_ticker} to {new_ticker}")
             return False
 
+        # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
+        await asyncio.sleep(0)
+        if self._snapshot_task and not self._snapshot_task.done():
+            try:
+                await self._snapshot_task
+            except Exception as e:
+                logger.warning(f"Error awaiting previous snapshot task during rotation: {e}")
+
         # Persist final PnL attribution snapshot for the market being rotated out (after resting quotes are confirmed cancelled)
         try:
             pnl_summary = self.inv_manager.get_pnl_summary(old_ticker)
@@ -547,11 +564,28 @@ class AvellanedaStoikovBot:
 
     async def stop(self) -> bool:
         self.running = False
+
+        # 0. Cancel background reconciliation loop before capturing shutdown state
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # 1. Withdraw resting quotes first to eliminate market risk immediately
         quotes_cancelled = await self._cancel_all_quotes()
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
             quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
+
+        # Quiesce fills and drain running background snapshot tasks before final write
+        await asyncio.sleep(0)
+        if self._snapshot_task and not self._snapshot_task.done():
+            try:
+                await self._snapshot_task
+            except Exception as e:
+                logger.warning(f"Error awaiting previous snapshot task during shutdown: {e}")
 
         # 2. Persist final shutdown snapshot after quotes are withdrawn
         try:

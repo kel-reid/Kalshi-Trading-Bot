@@ -232,17 +232,23 @@ class InventoryManager:
                 )
                 return False
 
-        if bal is not None:
-            self.balance_cents = bal
-            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
-
         positions_applied = True
         if market_positions is not None:
             positions_applied = self._apply_positions(market_positions, is_startup=is_startup)
 
-        # On startup, both are guaranteed present here and must have successfully applied.
+        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # Commit balance only after positions validate successfully to ensure atomic hydration.
         if is_startup:
-            return positions_applied
+            if not positions_applied:
+                logger.error("Startup portfolio hydration failed: positions validation rejected payload.")
+                return False
+            self.balance_cents = bal
+            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
+            return True
+
+        if bal is not None:
+            self.balance_cents = bal
+            logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
 
         # For periodic reconciliation, return True if at least one snapshot succeeded and positions applied.
         return (bal is not None or market_positions is not None) and positions_applied
