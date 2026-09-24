@@ -1603,6 +1603,53 @@ class TestMarketMakerPnLLifecycle:
         bot.ob_manager.subscribe.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_rotate_market_cancels_untracked_quote_and_clears_id_only_on_confirmation(self):
+        """Verify rotate_market() cancels untracked quotes via om.cancel_order during escalation and aborts rotation."""
+        from strategy.market_maker import AvellanedaStoikovBot
+        bot = AvellanedaStoikovBot(ticker="OLD-TICKER")
+        bot.current_bid_id = "untracked-bid-42"
+        bot.current_bid_price = 45
+        bot.om.active_orders = {}  # Untracked in om.active_orders
+        bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.ob_manager.unsubscribe = AsyncMock()
+        bot.ob_manager.subscribe = AsyncMock()
+
+        mock_killer = MagicMock()
+        mock_killer.trigger = AsyncMock()
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            rotated = await bot.rotate_market("NEW-TICKER")
+
+        # Must trigger KillSwitch and explicitly cancel untracked quote
+        mock_killer.trigger.assert_awaited_once()
+        bot.om.cancel_order.assert_awaited_once_with("untracked-bid-42")
+        # Clears quote id on confirmation
+        assert bot.current_bid_id is None
+        assert bot.current_bid_price is None
+        # Must abort rotation safely
+        assert rotated is False
+        assert bot.ticker == "OLD-TICKER"
+        bot.ob_manager.unsubscribe.assert_not_awaited()
+        bot.ob_manager.subscribe.assert_not_awaited()
+
+        # Scenario 2: cancel_order fails on exchange for untracked ask quote
+        bot.current_ask_id = "untracked-ask-99"
+        bot.current_ask_price = 55
+        bot.om.cancel_order = AsyncMock(return_value=False)
+        mock_killer.trigger.reset_mock()
+
+        with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
+            rotated_fail = await bot.rotate_market("NEW-TICKER-2")
+
+        mock_killer.trigger.assert_awaited_once()
+        bot.om.cancel_order.assert_awaited_once_with("untracked-ask-99")
+        # ID is retained when cancellation was not confirmed
+        assert bot.current_ask_id == "untracked-ask-99"
+        assert bot.current_ask_price == 55
+        assert rotated_fail is False
+
+    @pytest.mark.asyncio
     async def test_tick_schedules_snapshot_after_updating_current_mid(self):
         """Verify _tick() updates orderbook mid price before scheduling periodic snapshot."""
         from strategy.market_maker import AvellanedaStoikovBot
