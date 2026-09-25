@@ -41,14 +41,6 @@ if "pytest" not in sys.modules and not has_env_key and not PRIVATE_KEY_PATH.exis
 # Alerting
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
-# Strategy Tuning Parameters
-# Default: Gamma 0.5 (Risk Aversion), 4 cent minimum spread, 1 contract order size
-RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.5"))
-MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
-ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
-TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
-
-
 def _get_float_env(name: str, default: float) -> float:
     val = os.getenv(name)
     if val is None or not str(val).strip():
@@ -60,6 +52,31 @@ def _get_float_env(name: str, default: float) -> float:
         return f
     except (ValueError, TypeError):
         return default
+
+
+def _get_int_env(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or not str(val).strip():
+        return default
+    try:
+        i = int(str(val).strip())
+    except (ValueError, TypeError) as err:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}") from err
+    if i <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}")
+    return i
+
+
+
+# Strategy Tuning Parameters
+# Default: Gamma 0.5 (Risk Aversion), 4 cent minimum spread, $1.00 minimum dynamic order size
+RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.5"))
+MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
+ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
+ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 1.0))
+MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
+MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
+TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
 
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery

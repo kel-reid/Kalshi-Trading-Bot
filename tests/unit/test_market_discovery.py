@@ -1044,6 +1044,48 @@ def test_config_get_float_env_defensive_parsing():
         assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 14.0
 
 
+def test_config_get_int_env_fail_fast_validation():
+    """Verify _get_int_env in config returns default for missing/empty and raises ValueError on invalid values."""
+    import os
+    from config import _get_int_env
+
+    # Missing or empty falls back to default
+    with patch.dict(os.environ, {}, clear=True):
+        assert _get_int_env("TEST_INT_VAL", 100) == 100
+
+    with patch.dict(os.environ, {"TEST_INT_VAL": ""}):
+        assert _get_int_env("TEST_INT_VAL", 100) == 100
+
+    with patch.dict(os.environ, {"TEST_INT_VAL": "   "}):
+        assert _get_int_env("TEST_INT_VAL", 100) == 100
+
+    # Valid positive integers
+    with patch.dict(os.environ, {"TEST_INT_VAL": "50"}):
+        assert _get_int_env("TEST_INT_VAL", 100) == 50
+
+    with patch.dict(os.environ, {"TEST_INT_VAL": "  250  "}):
+        assert _get_int_env("TEST_INT_VAL", 100) == 250
+
+    # Invalid non-integer or float formats raise ValueError
+    with pytest.raises(ValueError, match="TEST_INT_VAL must be a positive integer"):
+        with patch.dict(os.environ, {"TEST_INT_VAL": "10.0"}):
+            _get_int_env("TEST_INT_VAL", 100)
+
+    with pytest.raises(ValueError, match="TEST_INT_VAL must be a positive integer"):
+        with patch.dict(os.environ, {"TEST_INT_VAL": "invalid_number"}):
+            _get_int_env("TEST_INT_VAL", 100)
+
+    # Zero or negative integers raise ValueError
+    with pytest.raises(ValueError, match="TEST_INT_VAL must be a positive integer"):
+        with patch.dict(os.environ, {"TEST_INT_VAL": "0"}):
+            _get_int_env("TEST_INT_VAL", 100)
+
+    with pytest.raises(ValueError, match="TEST_INT_VAL must be a positive integer"):
+        with patch.dict(os.environ, {"TEST_INT_VAL": "-5"}):
+            _get_int_env("TEST_INT_VAL", 100)
+
+
+
 @pytest.mark.asyncio
 async def test_async_discovery_wrappers():
     """Verify async wrappers discover_active_market_async, is_market_active_async, check_market_status_async."""

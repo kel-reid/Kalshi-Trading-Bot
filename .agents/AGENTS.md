@@ -6,7 +6,7 @@
 - Never alter external API query parameters, response payload validations, or endpoint URLs based on static code review suggestions or test fixture inconsistencies without empirical verification against the live vendor API. When multi-value status predicates exist (e.g. `status in ("open", "active")`), treat them as intentional vendor API quirks unless proven otherwise by live telemetry; always preserve both values in parsing and unit tests.
 - Whenever fixes addressing PR review comments are committed and pushed, always mark the corresponding GitHub review threads as resolved via the GitHub API.
 
-## Senior Engineering Operational Protocols
+## Senior Engineering Protocols
 
 - **Anti-Regression & Invariant Tracing Protocol**: When addressing code review comments, bug reports, or edge cases, never perform isolated line edits that only address the cited lines. Explicitly trace and verify the change across the entire system:
   1. Validate boundary preconditions before mutating any state.
