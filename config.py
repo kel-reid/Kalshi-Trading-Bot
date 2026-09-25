@@ -59,12 +59,13 @@ def _get_int_env(name: str, default: int) -> int:
     if val is None or not str(val).strip():
         return default
     try:
-        i = int(val)
-        if i <= 0:
-            return default
-        return i
-    except (ValueError, TypeError):
-        return default
+        i = int(str(val).strip())
+    except (ValueError, TypeError) as err:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}") from err
+    if i <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}")
+    return i
+
 
 
 # Strategy Tuning Parameters
