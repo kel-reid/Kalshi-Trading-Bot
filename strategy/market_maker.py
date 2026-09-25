@@ -19,7 +19,15 @@ from data.inventory_manager import InventoryManager
 from execution.order_manager import OrderManager
 from utils.alerting import send_alert
 from utils.market_discovery import discover_active_market_async, is_market_active_async
-from utils.metrics import start_metrics_server, BOT_INVENTORY_NET_POSITION, BOT_PNL_CENTS
+from utils.metrics import (
+    start_metrics_server,
+    BOT_INVENTORY_NET_POSITION,
+    BOT_PNL_CENTS,
+    KALSHI_REALIZED_PNL_CENTS,
+    KALSHI_UNREALIZED_PNL_CENTS,
+    KALSHI_FEES_PAID_CENTS,
+    SAFEGUARD_EVENTS_TOTAL,
+)
 from config import (
     RISK_GAMMA,
     MIN_SPREAD,
@@ -27,6 +35,9 @@ from config import (
     ORDER_DOLLARS,
     MAX_ORDER_CONTRACTS,
     MAX_HEDGE_INVENTORY,
+    MIN_MID_PRICE,
+    MAX_MID_PRICE,
+    MIN_TIME_TO_CLOSE_SECONDS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -59,6 +70,8 @@ class AvellanedaStoikovBot:
         target_preference: Optional[str] = None,
         auto_rotate: bool = True,
         starvation_timeout: float = 900.0, # 15 minutes
+        min_mid_price: Optional[int] = None,
+        max_mid_price: Optional[int] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -69,6 +82,8 @@ class AvellanedaStoikovBot:
         self.target_preference = target_preference if target_preference is not None else ticker
         self.auto_rotate = auto_rotate
         self.starvation_timeout = starvation_timeout
+        self.min_mid_price = min_mid_price if min_mid_price is not None else MIN_MID_PRICE
+        self.max_mid_price = max_mid_price if max_mid_price is not None else MAX_MID_PRICE
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -209,6 +224,13 @@ class AvellanedaStoikovBot:
         balance = self.inv_manager.get_balance()
         BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
 
+        try:
+            KALSHI_REALIZED_PNL_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_realized_pnl(self.ticker))
+            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_unrealized_pnl(self.ticker))
+            KALSHI_FEES_PAID_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_total_fees(self.ticker))
+        except Exception as e_m:
+            logger.debug(f"Telemetry update skipped for {self.ticker}: {e_m}")
+
         # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
         if self._market_inactive:
             if self.current_bid_id or self.current_ask_id:
@@ -335,6 +357,41 @@ class AvellanedaStoikovBot:
         # 2. Mark open inventory to market against current mid price
         self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
         self._maybe_schedule_pnl_snapshot(now, inventory)
+
+        # 2a. Extreme Price Collar Safeguard:
+        # If orderbook midpoint drifts outside [min_mid_price, max_mid_price],
+        # immediately cancel active quotes to prevent late-game blowout adverse selection.
+        if mid_price < self.min_mid_price or mid_price > self.max_mid_price:
+            logger.warning(
+                f"[PRICE COLLAR BREACH] Market {self.ticker} mid price {mid_price:.2f}c is outside "
+                f"safety collar [{self.min_mid_price}c, {self.max_mid_price}c]. "
+                f"Cancelling active quotes and initiating rotation..."
+            )
+            try:
+                SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker=self.ticker).inc()
+            except Exception:
+                pass
+            await self._cancel_all_quotes()
+            if self.auto_rotate:
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker]
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                        logger.info(f"Successfully rotated from collar-breached market to {replacement}.")
+                    else:
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                        logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
+                else:
+                    logger.error(f"No replacement market found for collar-breached market {self.ticker}.")
+                    self._market_inactive = True
+                    self._last_inactive_retry = now
+            else:
+                self._market_inactive = True
+            return
 
         # 3. Get Inventory
         # Convention: positive inventory = holding net YES

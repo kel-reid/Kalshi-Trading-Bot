@@ -37,6 +37,9 @@ services:
       - ORDER_SIZE
       - TARGET_TICKER
       - MAX_EXPIRATION_DAYS
+      - MIN_MID_PRICE
+      - MAX_MID_PRICE
+      - MIN_TIME_TO_CLOSE_SECONDS
       - ALERT_WEBHOOK_URL
       - DB_HOST=db
       - DB_PORT=5432
