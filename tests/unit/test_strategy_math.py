@@ -374,5 +374,75 @@ def test_dynamic_order_sizing_financial_accounting_invariants():
     assert summary_4["unrealized_pnl_cents"] == 0.0
 
 
+def test_dynamic_order_size_bounded_to_exchange_limits():
+    """
+    Verify that extreme/sub-cent midpoints are bounded to Kalshi's valid quoting limits [1c, 99c]
+    so order sizing never explodes to thousands of contracts (e.g. 0.05c midpoint).
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK", order_dollars=1.00)
+
+    # Sub-cent extreme midpoint (e.g. 0.05c): must be bounded to 1.0c -> max 100 contracts ($1.00)
+    # rather than runaway ceil(100 / 0.05) = 2,000 contracts ($20 - $60)
+    assert bot.calculate_order_size(mid_price=0.05) == 100
+    assert 100 * 1.0 == 100.0  # Max exposure at 1c is exactly $1.00
+
+    # Upper bound extreme midpoint (> 99c): bounded to 99c -> 2 contracts ($1.98)
+    assert bot.calculate_order_size(mid_price=150.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_update_quotes_replaces_on_size_change():
+    """
+    Verify that when the optimal quote price remains unchanged but calculated contract size shifts,
+    the bot cancels the resting quote and places a new quote with the updated contract count.
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    # Set up resting quote: 4 contracts at 31c
+    bot.current_bid_id = "bid-order-1"
+    bot.current_bid_price = 31
+    bot.current_bid_size = 4
+
+    bot.current_ask_id = "ask-order-1"
+    bot.current_ask_price = 36
+    bot.current_ask_size = 4
+
+    bot.om.cancel_order = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(side_effect=["bid-order-2", "ask-order-2"])
+
+    # Midpoint shifts slightly such that optimal price is still 31c / 36c,
+    # but target quote_size changes to 3 contracts
+    bot._current_quote_size = 3
+
+    await bot._update_quotes(new_bid=31, new_ask=36)
+
+    # Both old orders must be cancelled because size shifted from 4 -> 3
+    assert bot.om.cancel_order.call_count == 2
+    bot.om.cancel_order.assert_any_call("bid-order-1")
+    bot.om.cancel_order.assert_any_call("ask-order-1")
+
+    # New orders must be placed with count=3
+    assert bot.om.place_order.call_count == 2
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="buy", count=3, price=31)
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="sell", count=3, price=36)
+
+    # Verify state updated to new size and IDs
+    assert bot.current_bid_id == "bid-order-2"
+    assert bot.current_bid_price == 31
+    assert bot.current_bid_size == 3
+
+    assert bot.current_ask_id == "ask-order-2"
+    assert bot.current_ask_price == 36
+    assert bot.current_ask_size == 3
+
+    # Subsequent tick with SAME price and SAME size should NOT cancel or place
+    bot.om.cancel_order.reset_mock()
+    bot.om.place_order.reset_mock()
+    await bot._update_quotes(new_bid=31, new_ask=36)
+    bot.om.cancel_order.assert_not_called()
+    bot.om.place_order.assert_not_called()
+
+
+
 
 
