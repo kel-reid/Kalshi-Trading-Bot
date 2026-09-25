@@ -183,3 +183,343 @@ async def test_active_hedge_subcent_short():
     # Bid should match exact sub-cent best ask (32.4)
     bot._update_quotes.assert_called_once_with(32.4, None)
 
+
+def test_dynamic_order_sizing_minimum_enforcement():
+    """Verify that order_dollars is strictly clamped to a minimum of $1.00 and never lower."""
+    # Negative value
+    bot_neg = AvellanedaStoikovBot(ticker="MOCK", order_dollars=-5.0)
+    assert bot_neg.order_dollars == 1.0
+
+    # Zero value
+    bot_zero = AvellanedaStoikovBot(ticker="MOCK", order_dollars=0.0)
+    assert bot_zero.order_dollars == 1.0
+
+    # Sub-dollar value (e.g. 50 cents)
+    bot_sub = AvellanedaStoikovBot(ticker="MOCK", order_dollars=0.50)
+    assert bot_sub.order_dollars == 1.0
+
+    # Exact dollar minimum
+    bot_exact = AvellanedaStoikovBot(ticker="MOCK", order_dollars=1.00)
+    assert bot_exact.order_dollars == 1.0
+
+    # Scaled value for future bi-weekly increases
+    bot_scaled = AvellanedaStoikovBot(ticker="MOCK", order_dollars=2.50)
+    assert bot_scaled.order_dollars == 2.50
+
+
+def test_dynamic_order_size_calculation_examples():
+    """Verify dynamic order sizing calculation across different price levels."""
+    bot = AvellanedaStoikovBot(ticker="MOCK", order_dollars=1.00)
+
+    # 3c contract -> 34 contracts ($1.02)
+    assert bot.calculate_order_size(mid_price=3.0) == 34
+    assert 34 * 3.0 >= 100.0  # Deploys at least $1.00
+
+    # 25c contract -> 4 contracts ($1.00)
+    assert bot.calculate_order_size(mid_price=25.0) == 4
+    assert 4 * 25.0 == 100.0
+
+    # 50c contract -> 2 contracts ($1.00)
+    assert bot.calculate_order_size(mid_price=50.0) == 2
+    assert 2 * 50.0 == 100.0
+
+    # 80c contract -> 2 contracts ($1.60)
+    assert bot.calculate_order_size(mid_price=80.0) == 2
+    assert 2 * 80.0 >= 100.0
+
+    # 99c contract -> 2 contracts ($1.98)
+    assert bot.calculate_order_size(mid_price=99.0) == 2
+    assert 2 * 99.0 >= 100.0
+
+    # Edge cases: None or zero price falls back to max(1, order_size)
+    assert bot.calculate_order_size(mid_price=None) == 1
+    assert bot.calculate_order_size(mid_price=0.0) == 1
+
+
+@pytest.mark.asyncio
+async def test_dynamic_order_size_execution_and_normalization():
+    """Verify dynamic order sizing integrates into _tick, reservation price math, and order placement."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    # Book with mid-price = 3.0c (best_bid=2, best_ask=4)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(4, 10))
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+
+    # Inventory of 34 contracts (exactly 1 dynamic lot at 3c)
+    bot.inv_manager.get_position = MagicMock(return_value=34)
+
+    # Mock order manager
+    bot.om.place_order = AsyncMock(return_value="order-123")
+
+    await bot._tick()
+
+    # Dynamic lot size at 3c is ceil(100 / 3) = 34
+    assert bot._current_quote_size == 34
+
+    # Normalized inventory: q = 34 / 34 = 1.0 lot
+    # ResPrice = 3.0 - (1.0 * 0.5) = 2.5
+    # Optimal Bid = floor(2.5 - 2) = 0 -> clamped to 1
+    # Optimal Ask = ceil(2.5 + 2) = 5
+    assert bot.current_bid_price == 1
+    assert bot.current_ask_price == 5
+
+    # Verify orders were placed with dynamic count=34
+    assert bot.om.place_order.call_count == 2
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="buy", count=34, price=1)
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="sell", count=34, price=5)
+
+
+@pytest.mark.asyncio
+async def test_dynamic_order_size_scaled_hedge_threshold():
+    """Verify that hedge threshold scales with dynamic quote size."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(4, 10))
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._update_quotes = AsyncMock()
+
+    # Mid = 3.0 -> quote_size = 34. Hedge threshold = 5 * 34 = 170
+    # At 169 contracts, hedge should NOT trigger
+    bot.inv_manager.get_position = MagicMock(return_value=169)
+    await bot._tick()
+    # Quotes should be active on both sides
+    bot._update_quotes.assert_called_once()
+    bid_arg, ask_arg = bot._update_quotes.call_args[0]
+    assert bid_arg is not None
+    assert ask_arg is not None
+
+    bot._update_quotes.reset_mock()
+
+    # At 170 contracts (5 full lots), hedge triggers: halts BIDs, crosses ASKs
+    bot.inv_manager.get_position = MagicMock(return_value=170)
+    await bot._tick()
+    bot._update_quotes.assert_called_once_with(None, 2)
+
+
+def test_dynamic_order_sizing_adversarial_inputs():
+    """Adversarial negative inputs (NaN, inf, invalid strings) must safely resolve to $1.00."""
+    # NaN float
+    bot_nan = AvellanedaStoikovBot(ticker="MOCK", order_dollars=float("nan"))
+    assert bot_nan.order_dollars == 1.0
+
+    # Inf float
+    bot_inf = AvellanedaStoikovBot(ticker="MOCK", order_dollars=float("inf"))
+    assert bot_inf.order_dollars == 1.0
+
+    # Negative inf
+    bot_ninf = AvellanedaStoikovBot(ticker="MOCK", order_dollars=float("-inf"))
+    assert bot_ninf.order_dollars == 1.0
+
+    # Malformed string
+    bot_str = AvellanedaStoikovBot(ticker="MOCK", order_dollars="invalid_value")
+    assert bot_str.order_dollars == 1.0
+
+    # Adversarial mid_prices in calculate_order_size
+    assert bot_nan.calculate_order_size(float("nan")) == 1
+    assert bot_nan.calculate_order_size(float("inf")) == 1
+    assert bot_nan.calculate_order_size(-50.0) == 1
+    assert bot_nan.calculate_order_size("50") == 1
+    assert bot_nan.calculate_order_size(True) == 1  # Boolean should not be treated as int 1
+
+
+def test_dynamic_order_sizing_financial_accounting_invariants():
+    """
+    Assert Financial Accounting Invariant:
+    Total PnL = Realized PnL + Unrealized PnL strictly holds through state transitions
+    (open, partial close, reversal, full close) with multi-contract dynamic order fills and fees.
+    """
+    from data.pnl_tracker import PnLTracker
+
+    tracker = PnLTracker()
+    ticker = "TEST-DYNAMIC-TICKER"
+
+    # Step 1: Open 34 contracts at 3c with 10c fee (Dynamic lot corresponding to $1.02 notional)
+    tracker.record_fill(ticker, action="buy", side="yes", count=34, price_cents=3.0, fee_cents=10.0)
+    tracker.update_mid_price(ticker, 4.0)
+    summary_1 = tracker.get_market_summary(ticker)
+    realized_1 = summary_1["realized_pnl_cents"]
+    unrealized_1 = summary_1["unrealized_pnl_cents"]
+    total_1 = summary_1["total_pnl_cents"]
+    assert round(realized_1 + unrealized_1, 4) == round(total_1, 4)
+
+    # Step 2: Partial close of 17 contracts at 5c with 5c exit fee
+    tracker.record_fill(ticker, action="sell", side="yes", count=17, price_cents=5.0, fee_cents=5.0)
+    tracker.update_mid_price(ticker, 5.0)
+    summary_2 = tracker.get_market_summary(ticker)
+    realized_2 = summary_2["realized_pnl_cents"]
+    unrealized_2 = summary_2["unrealized_pnl_cents"]
+    total_2 = summary_2["total_pnl_cents"]
+    assert round(realized_2 + unrealized_2, 4) == round(total_2, 4)
+
+    # Step 3: Reversal - Sell 34 contracts at 6c with 10c fee (closes remaining 17 long, opens 17 short)
+    tracker.record_fill(ticker, action="sell", side="yes", count=34, price_cents=6.0, fee_cents=10.0)
+    tracker.update_mid_price(ticker, 6.0)
+    summary_3 = tracker.get_market_summary(ticker)
+    realized_3 = summary_3["realized_pnl_cents"]
+    unrealized_3 = summary_3["unrealized_pnl_cents"]
+    total_3 = summary_3["total_pnl_cents"]
+    assert round(realized_3 + unrealized_3, 4) == round(total_3, 4)
+
+    # Step 4: Full close - Buy 17 contracts at 4c with 5c fee
+    tracker.record_fill(ticker, action="buy", side="yes", count=17, price_cents=4.0, fee_cents=5.0)
+    tracker.update_mid_price(ticker, 4.0)
+    summary_4 = tracker.get_market_summary(ticker)
+    realized_4 = summary_4["realized_pnl_cents"]
+    unrealized_4 = summary_4["unrealized_pnl_cents"]
+    total_4 = summary_4["total_pnl_cents"]
+    assert round(realized_4 + unrealized_4, 4) == round(total_4, 4)
+    assert summary_4["net_inventory"] == 0
+    assert summary_4["unrealized_pnl_cents"] == 0.0
+
+
+def test_dynamic_order_size_bounded_to_exchange_limits():
+    """
+    Verify that extreme/sub-cent midpoints are bounded to Kalshi's valid quoting limits [1c, 99c]
+    so order sizing never explodes to thousands of contracts (e.g. 0.05c midpoint).
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK", order_dollars=1.00)
+
+    # Sub-cent extreme midpoint (e.g. 0.05c): must be bounded to 1.0c -> max 100 contracts ($1.00)
+    # rather than runaway ceil(100 / 0.05) = 2,000 contracts ($20 - $60)
+    assert bot.calculate_order_size(mid_price=0.05) == 100
+    assert 100 * 1.0 == 100.0  # Max exposure at 1c is exactly $1.00
+
+    # Upper bound extreme midpoint (> 99c): bounded to 99c -> 2 contracts ($1.98)
+    assert bot.calculate_order_size(mid_price=150.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_update_quotes_replaces_on_size_change():
+    """
+    Verify that when the optimal quote price remains unchanged but calculated contract size shifts,
+    the bot cancels the resting quote and places a new quote with the updated contract count.
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    # Set up resting quote: 4 contracts at 31c
+    bot.current_bid_id = "bid-order-1"
+    bot.current_bid_price = 31
+    bot.current_bid_size = 4
+
+    bot.current_ask_id = "ask-order-1"
+    bot.current_ask_price = 36
+    bot.current_ask_size = 4
+
+    bot.om.cancel_order = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(side_effect=["bid-order-2", "ask-order-2"])
+
+    # Midpoint shifts slightly such that optimal price is still 31c / 36c,
+    # but target quote_size changes to 3 contracts
+    bot._current_quote_size = 3
+
+    await bot._update_quotes(new_bid=31, new_ask=36)
+
+    # Both old orders must be cancelled because size shifted from 4 -> 3
+    assert bot.om.cancel_order.call_count == 2
+    bot.om.cancel_order.assert_any_call("bid-order-1")
+    bot.om.cancel_order.assert_any_call("ask-order-1")
+
+    # New orders must be placed with count=3
+    assert bot.om.place_order.call_count == 2
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="buy", count=3, price=31)
+    bot.om.place_order.assert_any_call(ticker="MOCK_TICKER", side="yes", action="sell", count=3, price=36)
+
+    # Verify state updated to new size and IDs
+    assert bot.current_bid_id == "bid-order-2"
+    assert bot.current_bid_price == 31
+    assert bot.current_bid_size == 3
+
+    assert bot.current_ask_id == "ask-order-2"
+    assert bot.current_ask_price == 36
+    assert bot.current_ask_size == 3
+
+    # Subsequent tick with SAME price and SAME size should NOT cancel or place
+    bot.om.cancel_order.reset_mock()
+    bot.om.place_order.reset_mock()
+    await bot._update_quotes(new_bid=31, new_ask=36)
+    bot.om.cancel_order.assert_not_called()
+    bot.om.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_quotes_failed_cancellation_blocks_duplicate_order():
+    """
+    Verify that if cancel_order returns False (or fails), the quote ID is NOT cleared,
+    preventing duplicate order placement on the exchange (addresses CodeRabbit Concern 3).
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    # Active resting bid
+    bot.current_bid_id = "bid-order-active"
+    bot.current_bid_price = 30
+    bot.current_bid_size = 3
+
+    # Cancellation fails (e.g. gateway timeout or network error)
+    bot.om.cancel_order = AsyncMock(return_value=False)
+    bot.om.place_order = AsyncMock(return_value="bid-order-new")
+
+    # Midpoint shifts requiring new bid price 32c
+    await bot._update_quotes(new_bid=32, new_ask=None)
+
+    # Cancellation was attempted
+    bot.om.cancel_order.assert_called_once_with("bid-order-active")
+
+    # Because cancellation returned False, current_bid_id must be RETAINED
+    assert bot.current_bid_id == "bid-order-active"
+    assert bot.current_bid_price == 30
+    assert bot.current_bid_size == 3
+
+    # CRITICAL: No duplicate order should have been placed!
+    bot.om.place_order.assert_not_called()
+
+
+def test_max_order_contracts_ceiling():
+    """
+    Verify that calculate_order_size strictly respects max_order_contracts ceiling
+    even with high order_dollars or low mid-prices (addresses CodeRabbit Concern 1).
+    """
+    # Configure bot with $10 target but a hard ceiling of 50 contracts
+    bot = AvellanedaStoikovBot(ticker="MOCK", order_dollars=10.0, max_order_contracts=50)
+
+    # At 1c, raw calculation is ceil(1000 / 1) = 1,000 contracts
+    # Must be capped at max_order_contracts (50)
+    assert bot.calculate_order_size(mid_price=1.0) == 50
+
+
+@pytest.mark.asyncio
+async def test_max_hedge_inventory_ceiling():
+    """
+    Verify that inventory mitigation hedge threshold is strictly bounded by max_hedge_inventory
+    (addresses CodeRabbit Concern 1).
+    """
+    # Configure bot with max_hedge_inventory capped at 100 contracts
+    bot = AvellanedaStoikovBot(ticker="MOCK", gamma=0.5, min_spread=4, order_dollars=1.0, max_hedge_inventory=100)
+
+    # Mid = 3c -> quote_size = 34. Base 5-unit threshold = 5 * 34 = 170.
+    # Capped by max_hedge_inventory = 100.
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(4, 10))
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._update_quotes = AsyncMock()
+
+    # At 99 contracts (below 100 cap), hedge does NOT trigger
+    bot.inv_manager.get_position = MagicMock(return_value=99)
+    await bot._tick()
+    bid_arg, ask_arg = bot._update_quotes.call_args[0]
+    assert bid_arg is not None
+    assert ask_arg is not None
+
+    bot._update_quotes.reset_mock()
+
+    # At 100 contracts (meets cap of 100, even though 100 < 170), hedge triggers!
+    bot.inv_manager.get_position = MagicMock(return_value=100)
+    await bot._tick()
+    bot._update_quotes.assert_called_once_with(None, 2)
+
+
+
+
+
+

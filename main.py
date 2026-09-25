@@ -18,7 +18,7 @@ from execution.kill_switch import KillSwitch
 
 
 async def main():
-    from config import ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+    from config import ENVIRONMENT, TARGET_TICKER, RISK_GAMMA, MIN_SPREAD, ORDER_SIZE, ORDER_DOLLARS
     from utils.market_discovery import discover_active_market_async
     
     loop = asyncio.get_running_loop()
@@ -99,6 +99,7 @@ async def main():
         gamma=RISK_GAMMA,
         min_spread=MIN_SPREAD,
         order_size=ORDER_SIZE,
+        order_dollars=ORDER_DOLLARS,
         target_preference=TARGET_TICKER,
     )
     killer = KillSwitch(bot.om)
