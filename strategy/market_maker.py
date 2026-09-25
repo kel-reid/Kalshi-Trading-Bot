@@ -86,7 +86,10 @@ class AvellanedaStoikovBot:
         
         self.current_bid_price: Optional[Union[int, float]] = None
         self.current_ask_price: Optional[Union[int, float]] = None
+        self.current_bid_size: Optional[int] = None
+        self.current_ask_size: Optional[int] = None
         self._last_empty_ob_log: float = 0.0
+
 
         # Starvation tracking
         self._starvation_start_time: Optional[float] = None
@@ -114,14 +117,19 @@ class AvellanedaStoikovBot:
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
         required to deploy at least order_dollars at the current mid-price.
         Guaranteed to deploy at least $1.00 and never lower.
+        Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] to prevent extreme
+        runaway contract counts on sub-cent books (e.g. 0.05c).
         Otherwise falls back to fixed order_size.
         """
         if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
             if isinstance(mid_price, (int, float)) and not isinstance(mid_price, bool) and math.isfinite(mid_price) and mid_price > 0:
-                # e.g. for order_dollars=1.0 and mid_price=3.0c: ceil(100.0 / 3.0) = 34 contracts ($1.02)
-                return max(1, math.ceil((self.order_dollars * 100.0) / mid_price))
+                # Bound midpoint to Kalshi's valid exchange quoting limits [1c, 99c]
+                # to prevent runaway contract counts on extreme/sub-cent books (e.g. 0.05c -> 2,000 contracts)
+                effective_price = max(1.0, min(99.0, float(mid_price)))
+                return max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
         return max(1, fallback)
+
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -373,19 +381,32 @@ class AvellanedaStoikovBot:
         await self._update_quotes(optimal_bid, optimal_ask)
 
     async def _update_quotes(self, new_bid: Optional[Union[int, float]], new_ask: Optional[Union[int, float]]):
-        """Places or replaces quotes if the optimal prices have shifted."""
+        """Places or replaces quotes if the optimal prices or contract sizes have shifted."""
         cancel_tasks = []
         cancel_bid = False
         cancel_ask = False
 
+        # Determine target quote sizes for bid and ask
+        target_bid_size = getattr(self, "_current_quote_size", None)
+        if not isinstance(target_bid_size, int) or isinstance(target_bid_size, bool) or target_bid_size <= 0:
+            target_bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+
+        target_ask_size = getattr(self, "_current_quote_size", None)
+        if not isinstance(target_ask_size, int) or isinstance(target_ask_size, bool) or target_ask_size <= 0:
+            target_ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+
+        # Check whether quotes need update (price change OR contract size change on active quote)
+        bid_needs_update = (new_bid != self.current_bid_price) or (new_bid is not None and target_bid_size != self.current_bid_size)
+        ask_needs_update = (new_ask != self.current_ask_price) or (new_ask is not None and target_ask_size != self.current_ask_size)
+
         # Handle BID Side
-        if new_bid != self.current_bid_price:
+        if bid_needs_update:
             if self.current_bid_id:
                 cancel_tasks.append(self.om.cancel_order(self.current_bid_id))
                 cancel_bid = True
 
         # Handle ASK Side (Selling YES contracts)
-        if new_ask != self.current_ask_price:
+        if ask_needs_update:
             if self.current_ask_id:
                 cancel_tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_ask = True
@@ -399,35 +420,42 @@ class AvellanedaStoikovBot:
                 if not isinstance(result, Exception):
                     self.current_bid_id = None
                     self.current_bid_price = None
+                    self.current_bid_size = None
             if cancel_ask:
                 result = next(result_iter)
                 if not isinstance(result, Exception):
                     self.current_ask_id = None
                     self.current_ask_price = None
+                    self.current_ask_size = None
 
         # Place new BID if needed
-        if new_bid != self.current_bid_price:
+        if bid_needs_update:
             if new_bid is not None and self.current_bid_id is None:
-                bid_size = getattr(self, "_current_quote_size", None)
-                if not isinstance(bid_size, int) or isinstance(bid_size, bool) or bid_size <= 0:
-                    bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
-                logger.info(f">> Placing new BID: {bid_size} YES @ {new_bid}c")
+                logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c")
                 self.current_bid_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="buy", count=bid_size, price=new_bid
+                    ticker=self.ticker, side="yes", action="buy", count=target_bid_size, price=new_bid
                 )
-                self.current_bid_price = new_bid if self.current_bid_id else None
+                if self.current_bid_id:
+                    self.current_bid_price = new_bid
+                    self.current_bid_size = target_bid_size
+                else:
+                    self.current_bid_price = None
+                    self.current_bid_size = None
 
         # Place new ASK if needed
-        if new_ask != self.current_ask_price:
+        if ask_needs_update:
             if new_ask is not None and self.current_ask_id is None:
-                ask_size = getattr(self, "_current_quote_size", None)
-                if not isinstance(ask_size, int) or isinstance(ask_size, bool) or ask_size <= 0:
-                    ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
-                logger.info(f">> Placing new ASK: {ask_size} YES @ {new_ask}c")
+                logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c")
                 self.current_ask_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="sell", count=ask_size, price=new_ask
+                    ticker=self.ticker, side="yes", action="sell", count=target_ask_size, price=new_ask
                 )
-                self.current_ask_price = new_ask if self.current_ask_id else None
+                if self.current_ask_id:
+                    self.current_ask_price = new_ask
+                    self.current_ask_size = target_ask_size
+                else:
+                    self.current_ask_price = None
+                    self.current_ask_size = None
+
 
 
     async def _cancel_all_quotes(self) -> bool:
@@ -461,9 +489,11 @@ class AvellanedaStoikovBot:
             if side == "bid":
                 self.current_bid_id = None
                 self.current_bid_price = None
+                self.current_bid_size = None
             else:
                 self.current_ask_id = None
                 self.current_ask_price = None
+                self.current_ask_size = None
 
         return all_cancelled
 
@@ -514,12 +544,14 @@ class AvellanedaStoikovBot:
                     if self.current_bid_id not in self.om.active_orders:
                         self.current_bid_id = None
                         self.current_bid_price = None
+                        self.current_bid_size = None
                     else:
                         logger.error(f"KillSwitch failed to cancel tracked bid quote {self.current_bid_id}")
                 else:
                     if await self.om.cancel_order(self.current_bid_id):
                         self.current_bid_id = None
                         self.current_bid_price = None
+                        self.current_bid_size = None
                     else:
                         logger.error(f"Failed to confirm cancellation of untracked resting bid quote {self.current_bid_id}")
 
@@ -528,14 +560,17 @@ class AvellanedaStoikovBot:
                     if self.current_ask_id not in self.om.active_orders:
                         self.current_ask_id = None
                         self.current_ask_price = None
+                        self.current_ask_size = None
                     else:
                         logger.error(f"KillSwitch failed to cancel tracked ask quote {self.current_ask_id}")
                 else:
                     if await self.om.cancel_order(self.current_ask_id):
                         self.current_ask_id = None
                         self.current_ask_price = None
+                        self.current_ask_size = None
                     else:
                         logger.error(f"Failed to confirm cancellation of untracked resting ask quote {self.current_ask_id}")
+
 
             return not bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         except Exception as e:
