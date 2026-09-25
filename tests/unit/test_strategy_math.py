@@ -110,7 +110,7 @@ async def test_active_hedge_short():
 @pytest.mark.asyncio
 async def test_bounds_clipping():
     """Quotes should be clipped to Kalshi's boundaries (1c to 99c) and not cross each other."""
-    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=1.0, min_spread=100, order_size=1)
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=1.0, min_spread=100, order_size=1, min_mid_price=1, max_mid_price=99)
     
     bot.inv_manager.get_position = MagicMock(return_value=0) # 0 position to avoid active hedge
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
@@ -239,7 +239,7 @@ def test_dynamic_order_size_calculation_examples():
 @pytest.mark.asyncio
 async def test_dynamic_order_size_execution_and_normalization():
     """Verify dynamic order sizing integrates into _tick, reservation price math, and order placement."""
-    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0, min_mid_price=1, max_mid_price=99)
 
     # Book with mid-price = 3.0c (best_bid=2, best_ask=4)
     bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
@@ -273,7 +273,7 @@ async def test_dynamic_order_size_execution_and_normalization():
 @pytest.mark.asyncio
 async def test_dynamic_order_size_scaled_hedge_threshold():
     """Verify that hedge threshold scales with dynamic quote size."""
-    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0, min_mid_price=1, max_mid_price=99)
 
     bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(4, 10))
@@ -495,7 +495,7 @@ async def test_max_hedge_inventory_ceiling():
     (addresses CodeRabbit Concern 1).
     """
     # Configure bot with max_hedge_inventory capped at 100 contracts
-    bot = AvellanedaStoikovBot(ticker="MOCK", gamma=0.5, min_spread=4, order_dollars=1.0, max_hedge_inventory=100)
+    bot = AvellanedaStoikovBot(ticker="MOCK", gamma=0.5, min_spread=4, order_dollars=1.0, max_hedge_inventory=100, min_mid_price=1, max_mid_price=99)
 
     # Mid = 3c -> quote_size = 34. Base 5-unit threshold = 5 * 34 = 170.
     # Capped by max_hedge_inventory = 100.

@@ -54,16 +54,21 @@ def _get_float_env(name: str, default: float) -> float:
         return default
 
 
-def _get_int_env(name: str, default: int) -> int:
+def _get_int_env(name: str, default: int, allow_zero: bool = False) -> int:
     val = os.getenv(name)
     if val is None or not str(val).strip():
         return default
     try:
         i = int(str(val).strip())
     except (ValueError, TypeError) as err:
-        raise ValueError(f"{name} must be a positive integer, got {val!r}") from err
-    if i <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {val!r}")
+        expected = "a non-negative integer" if allow_zero else "a positive integer"
+        raise ValueError(f"{name} must be {expected}, got {val!r}") from err
+    if allow_zero:
+        if i < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {val!r}")
+    else:
+        if i <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {val!r}")
     return i
 
 
@@ -78,6 +83,20 @@ MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
 TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
 
+# Extreme Price Collar Safeguards (Cents)
+# In binary markets ($0-$1.00), quoting outside safe collars (e.g. < 10c or > 90c) introduces
+# asymmetric adverse selection and settlement-at-zero holding risk.
+MIN_MID_PRICE = _get_int_env("MIN_MID_PRICE", 10)
+MAX_MID_PRICE = _get_int_env("MAX_MID_PRICE", 90)
+if MIN_MID_PRICE < 1 or MAX_MID_PRICE > 99 or MIN_MID_PRICE >= MAX_MID_PRICE:
+    raise ValueError(
+        f"Invalid price collar configuration: MIN_MID_PRICE ({MIN_MID_PRICE}) "
+        f"must be strictly less than MAX_MID_PRICE ({MAX_MID_PRICE}) and within [1, 99]."
+    )
+
+# Expiration Cutoff Safeguard (Seconds)
+# Cease quoting and rotate away when market close_time is within this buffer (default 3600s = 60 mins).
+MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 3600, allow_zero=True)
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
