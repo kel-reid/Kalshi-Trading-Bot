@@ -122,8 +122,8 @@ class AvellanedaStoikovBot:
         self._starvation_start_time: Optional[float] = None
         self._starvation_alert_sent: bool = False
 
-        # Periodic market settlement/status check (every 60s)
-        self._last_market_status_check: float = time.time()
+        # Periodic market settlement/status check (initialized to 0.0 to enforce on startup tick)
+        self._last_market_status_check: float = 0.0
         self._market_status_check_interval: float = 60.0
         self._market_inactive: bool = False
         self._last_inactive_retry: float = 0.0
@@ -226,7 +226,6 @@ class AvellanedaStoikovBot:
 
         try:
             KALSHI_REALIZED_PNL_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_realized_pnl(self.ticker))
-            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_unrealized_pnl(self.ticker))
             KALSHI_FEES_PAID_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_total_fees(self.ticker))
         except Exception as e_m:
             logger.debug(f"Telemetry update skipped for {self.ticker}: {e_m}")
@@ -254,31 +253,38 @@ class AvellanedaStoikovBot:
             self._maybe_schedule_pnl_snapshot(now, inventory)
             return
 
-        # Periodic market settlement and expiry detection
-        if self.auto_rotate and (now - self._last_market_status_check >= self._market_status_check_interval):
+        # Periodic market settlement and expiry detection (evaluated on startup tick and every interval)
+        if now - self._last_market_status_check >= self._market_status_check_interval:
             self._last_market_status_check = now
             is_active = await is_market_active_async(self.ticker)
             if is_active is False:
-                logger.warning(f"Market {self.ticker} is no longer active (settled or expired). Initiating rotation...")
-                replacement = await discover_active_market_async(
-                    target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker]
-                )
-                if replacement:
-                    if await self.rotate_market(replacement):
-                        self._market_inactive = False
+                logger.warning(f"Market {self.ticker} is no longer active (settled, expired, or reached cutoff). Withdrawing quotes...")
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="expiry_cutoff", ticker=self.ticker).inc()
+                except Exception as e_metric:
+                    logger.debug(f"Safeguard metric update failed: {e_metric}")
+                await self._cancel_all_quotes()
+                if self.auto_rotate:
+                    replacement = await discover_active_market_async(
+                        target_preference=self.target_preference,
+                        exclude_tickers=[self.ticker]
+                    )
+                    if replacement:
+                        if await self.rotate_market(replacement):
+                            self._market_inactive = False
+                            logger.info(f"Successfully rotated from inactive market to {replacement}.")
+                        else:
+                            self._market_inactive = True
+                            self._last_inactive_retry = now
+                            logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                     else:
+                        logger.error(f"No replacement market found for {self.ticker}.")
                         self._market_inactive = True
                         self._last_inactive_retry = now
-                    self._maybe_schedule_pnl_snapshot(now, inventory)
-                    return
                 else:
-                    logger.error(f"No replacement market found for {self.ticker}.")
                     self._market_inactive = True
-                    self._last_inactive_retry = now
-                    await self._cancel_all_quotes()
-                    self._maybe_schedule_pnl_snapshot(now, inventory)
-                    return
+                self._maybe_schedule_pnl_snapshot(now, inventory)
+                return
             elif is_active is True:
                 self._market_inactive = False
             else:
@@ -354,8 +360,14 @@ class AvellanedaStoikovBot:
             # 1. Calculate Mid Price
             mid_price = (bid_price + ask_price) / 2.0
         
-        # 2. Mark open inventory to market against current mid price
+        # 2. Mark open inventory to market against current mid price and update unrealized PnL gauge
         self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
+        try:
+            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=self.ticker).set(
+                self.inv_manager.pnl_tracker.get_unrealized_pnl(self.ticker)
+            )
+        except Exception as e_m:
+            logger.debug(f"Telemetry unrealized update skipped for {self.ticker}: {e_m}")
         self._maybe_schedule_pnl_snapshot(now, inventory)
 
         # 2a. Extreme Price Collar Safeguard:
@@ -369,8 +381,8 @@ class AvellanedaStoikovBot:
             )
             try:
                 SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker=self.ticker).inc()
-            except Exception:
-                pass
+            except Exception as e_metric:
+                logger.debug(f"Safeguard metric update failed: {e_metric}")
             await self._cancel_all_quotes()
             if self.auto_rotate:
                 replacement = await discover_active_market_async(

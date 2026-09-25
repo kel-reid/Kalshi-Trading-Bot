@@ -179,6 +179,34 @@ class TestPreflightDiscoveryCollar:
         with patch("requests.get", return_value=mock_resp):
             assert check_orderbook_has_quotes("KXNFLGAME-COMPLIANT") is True
 
+    def test_preflight_orderbook_legacy_cents_unit_disambiguation(self):
+        """Legacy 'yes' and 'no' fields with value 1 or 1.0 are treated as 1 cent, not $1.00."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # Legacy format: yes bid = 1 cent, no bid = 97 cents -> implied ask = 3 cents -> mid = 2.0 cents (< 10c)
+        mock_resp.json.return_value = {
+            "orderbook": {
+                "yes": [[1.0, 10]],
+                "no": [[97.0, 10]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            # Mid = (1 + (100 - 97)) / 2 = 2c -> Outside collar [10, 90] -> Returns False
+            assert check_orderbook_has_quotes("KXNFLGAME-LEGACY-CENT") is False
+
+    def test_preflight_orderbook_fails_closed_on_invalid_data(self):
+        """Preflight fails closed (returns False) when orderbook prices are invalid or malformed."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "orderbook": {
+                "yes": [["invalid_price", 10]],
+                "no": [[50, 10]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            assert check_orderbook_has_quotes("KXNFLGAME-MALFORMED") is False
+
 
 class TestExpirationCutoffSafeguard:
     """Verify time-to-expiration cutoff rules in market status checks."""
@@ -220,6 +248,30 @@ class TestExpirationCutoffSafeguard:
             status = check_market_status("KXNFLGAME-SAFE-EXPIRY")
             assert status == "active"
             assert is_market_active("KXNFLGAME-SAFE-EXPIRY") is True
+
+    @pytest.mark.asyncio
+    async def test_startup_tick_checks_expiry_and_quiesces_without_autorotate(self):
+        """On cold startup (tick 1), expiry is evaluated immediately even if auto_rotate=False."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-EXPIRING-COLD",
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            auto_rotate=False,
+        )
+        bot._cancel_all_quotes = AsyncMock()
+        bot._update_quotes = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Mock is_market_active_async returning False (due to expiry cutoff)
+        with patch("strategy.market_maker.is_market_active_async", new=AsyncMock(return_value=False)):
+            await bot._tick()
+
+        # Bot must cancel quotes and set inactive immediately
+        bot._cancel_all_quotes.assert_called_once()
+        bot._update_quotes.assert_not_called()
+        assert bot._market_inactive is True
 
 
 class TestBaselineTelemetryLifecycle:

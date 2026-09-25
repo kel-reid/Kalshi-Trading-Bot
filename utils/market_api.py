@@ -192,43 +192,69 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
         if resp.status_code == 200:
             data = resp.json()
             ob = data.get("orderbook_fp") or data.get("orderbook") or {}
-            is_dollars = "yes_dollars_fp" in ob or "yes_dollars" in ob
-            yes_bids = (
-                ob.get("yes_dollars_fp") or ob.get("yes_dollars") or ob.get("yes") or []
-            )
-            no_bids = (
-                ob.get("no_dollars_fp") or ob.get("no_dollars") or ob.get("no") or []
-            )
+            dollar_yes = ob.get("yes_dollars_fp") or ob.get("yes_dollars")
+            if dollar_yes is not None:
+                yes_bids = dollar_yes
+                is_yes_dollars = True
+            else:
+                yes_bids = ob.get("yes") or []
+                is_yes_dollars = False
+
+            dollar_no = ob.get("no_dollars_fp") or ob.get("no_dollars")
+            if dollar_no is not None:
+                no_bids = dollar_no
+                is_no_dollars = True
+            else:
+                no_bids = ob.get("no") or []
+                is_no_dollars = False
+
             if not (len(yes_bids) > 0 and len(no_bids) > 0):
                 return False
 
-            # Verify orderbook midpoint is within safe price collar
+            # Verify orderbook midpoint is strictly within safe price collar
             try:
                 from config import MIN_MID_PRICE, MAX_MID_PRICE
-                yes_prices = [
-                    float(b[0]) * 100.0 if (is_dollars or (float(b[0]) <= 1.0 and ("." in str(b[0]) or float(b[0]) < 1.0))) else float(b[0])
-                    for b in yes_bids if isinstance(b, (list, tuple)) and len(b) >= 1
-                ]
-                no_prices = [
-                    float(b[0]) * 100.0 if (is_dollars or (float(b[0]) <= 1.0 and ("." in str(b[0]) or float(b[0]) < 1.0))) else float(b[0])
-                    for b in no_bids if isinstance(b, (list, tuple)) and len(b) >= 1
-                ]
-                if yes_prices and no_prices:
-                    best_yes_bid = max(yes_prices)
-                    best_no_bid = max(no_prices)
-                    implied_yes_ask = 100.0 - best_no_bid
-                    if 0 < best_yes_bid <= 100 and 0 < implied_yes_ask <= 100:
-                        mid = (best_yes_bid + implied_yes_ask) / 2.0
-                        if mid < MIN_MID_PRICE or mid > MAX_MID_PRICE:
-                            logger.info(
-                                f"Pre-flight orderbook check for {ticker} rejected: "
-                                f"mid-price {mid:.1f}c outside collar [{MIN_MID_PRICE}c, {MAX_MID_PRICE}c]."
-                            )
-                            return False
-            except Exception as e_collar:
-                logger.debug(f"Collar evaluation skipped for {ticker}: {e_collar}")
+                yes_prices = []
+                for b in yes_bids:
+                    if isinstance(b, (list, tuple)) and len(b) >= 1:
+                        p = float(b[0])
+                        cents = p * 100.0 if is_yes_dollars else p
+                        yes_prices.append(cents)
 
-            return True
+                no_prices = []
+                for b in no_bids:
+                    if isinstance(b, (list, tuple)) and len(b) >= 1:
+                        p = float(b[0])
+                        cents = p * 100.0 if is_no_dollars else p
+                        no_prices.append(cents)
+
+                if not (yes_prices and no_prices):
+                    logger.debug(f"Pre-flight orderbook for {ticker} missing numeric bid prices; failing closed.")
+                    return False
+
+                best_yes_bid = max(yes_prices)
+                best_no_bid = max(no_prices)
+                implied_yes_ask = 100.0 - best_no_bid
+
+                if not (0 < best_yes_bid <= 100 and 0 < implied_yes_ask <= 100):
+                    logger.debug(
+                        f"Pre-flight orderbook for {ticker} has invalid best prices "
+                        f"(bid={best_yes_bid}, ask={implied_yes_ask}); failing closed."
+                    )
+                    return False
+
+                mid = (best_yes_bid + implied_yes_ask) / 2.0
+                if mid < MIN_MID_PRICE or mid > MAX_MID_PRICE:
+                    logger.info(
+                        f"Pre-flight orderbook check for {ticker} rejected: "
+                        f"mid-price {mid:.1f}c outside collar [{MIN_MID_PRICE}c, {MAX_MID_PRICE}c]."
+                    )
+                    return False
+
+                return True
+            except Exception as e_collar:
+                logger.debug(f"Collar evaluation failed for {ticker}: {e_collar}")
+                return False
     except Exception as e:
         logger.debug(f"Pre-flight orderbook check for {ticker} failed: {e}")
     return False
