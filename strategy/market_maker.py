@@ -10,6 +10,7 @@ import asyncio
 import logging
 import time
 import math
+import os
 from typing import Optional, Union
 
 from data.websocket_client import KalshiWebsocketClient
@@ -19,7 +20,7 @@ from execution.order_manager import OrderManager
 from utils.alerting import send_alert
 from utils.market_discovery import discover_active_market_async, is_market_active_async
 from utils.metrics import start_metrics_server, BOT_INVENTORY_NET_POSITION, BOT_PNL_CENTS
-from config import RISK_GAMMA, MIN_SPREAD, ORDER_SIZE
+from config import RISK_GAMMA, MIN_SPREAD, ORDER_SIZE, ORDER_DOLLARS
 
 logger = logging.getLogger("MarketMaker")
 logger.setLevel(logging.INFO)
@@ -44,7 +45,8 @@ class AvellanedaStoikovBot:
         ticker: str, 
         gamma: float = None, # Risk aversion. How much 1 contract skews our price (in cents).
         min_spread: int = None, # Minimum spread to quote (in cents).
-        order_size: int = None,  # Number of contracts to quote on each side.
+        order_size: int = None,  # Number of contracts to quote on each side (fallback/fixed mode).
+        order_dollars: float = None,  # Target dollar notional per order (min $1.00).
         target_preference: Optional[str] = None,
         auto_rotate: bool = True,
         starvation_timeout: float = 900.0, # 15 minutes
@@ -56,7 +58,20 @@ class AvellanedaStoikovBot:
         self.target_preference = target_preference if target_preference is not None else ticker
         self.auto_rotate = auto_rotate
         self.starvation_timeout = starvation_timeout
-        
+
+        # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
+        if order_dollars is not None:
+            try:
+                od = float(order_dollars)
+                self.order_dollars = max(1.0, od) if math.isfinite(od) else 1.0
+            except (ValueError, TypeError):
+                self.order_dollars = 1.0
+        elif order_size is not None:
+            # Caller explicitly passed fixed order_size (e.g. in deterministic unit tests)
+            self.order_dollars = None
+        else:
+            self.order_dollars = max(1.0, float(ORDER_DOLLARS))
+
         # Core Managers
         self.ws_client = KalshiWebsocketClient()
         self.ob_manager = OrderbookManager(self.ws_client)
@@ -92,6 +107,21 @@ class AvellanedaStoikovBot:
         self._background_tasks = set()
         self._sync_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
+
+    def calculate_order_size(self, mid_price: Optional[float]) -> int:
+        """
+        Calculates the order size (contract count) for the current quoting cycle.
+        If order_dollars is configured (>= $1.00), dynamically calculates the contract count
+        required to deploy at least order_dollars at the current mid-price.
+        Guaranteed to deploy at least $1.00 and never lower.
+        Otherwise falls back to fixed order_size.
+        """
+        if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
+            if isinstance(mid_price, (int, float)) and not isinstance(mid_price, bool) and math.isfinite(mid_price) and mid_price > 0:
+                # e.g. for order_dollars=1.0 and mid_price=3.0c: ceil(100.0 / 3.0) = 34 contracts ($1.02)
+                return max(1, math.ceil((self.order_dollars * 100.0) / mid_price))
+        fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        return max(1, fallback)
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -286,9 +316,15 @@ class AvellanedaStoikovBot:
         # 3. Get Inventory
         # Convention: positive inventory = holding net YES
         
+        # Determine dynamic quote size for current market price
+        quote_size = self.calculate_order_size(mid_price)
+        self._current_quote_size = quote_size
+
         # 4. Calculate Reservation Price (R)
-        # R = M - (q * gamma)
-        reservation_price = mid_price - (inventory * self.gamma)
+        # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
+        # q = inventory / quote_size
+        normalized_q = (inventory / quote_size) if (self.order_dollars and quote_size > 0) else inventory
+        reservation_price = mid_price - (normalized_q * self.gamma)
         
         # 5. Calculate Optimal Bid/Ask
         optimal_bid = math.floor(reservation_price - (self.min_spread / 2.0))
@@ -304,14 +340,15 @@ class AvellanedaStoikovBot:
             
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
-        HEDGE_THRESHOLD = 5
-        if inventory >= HEDGE_THRESHOLD:
-            logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory}). Halting BIDs, crossing ASKs to exit.")
+        # Threshold scales with quote size (5 order units)
+        hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        if inventory >= hedge_threshold:
+            logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). Halting BIDs, crossing ASKs to exit.")
             optimal_bid = None # Do not buy more YES
             if best_bid:
                 optimal_ask = max(2, min(best_bid[0], 99)) # Match the best bid to fill immediately
-        elif inventory <= -HEDGE_THRESHOLD:
-            logger.warning(f"[HEDGE ACTIVE] Short inventory high ({inventory}). Halting ASKs, crossing BIDs to exit.")
+        elif inventory <= -hedge_threshold:
+            logger.warning(f"[HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). Halting ASKs, crossing BIDs to exit.")
             optimal_ask = None # Do not sell more YES
             if best_ask:
                 optimal_bid = max(1, min(best_ask[0], 98)) # Match the best ask to fill immediately
@@ -320,14 +357,14 @@ class AvellanedaStoikovBot:
         unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
         if optimal_bid is not None and optimal_ask is not None:
             logger.info(
-                f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | Gamma={self.gamma} | "
+                f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | Gamma={self.gamma} | "
                 f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
                 f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
         else:
             logger.info(
-                f"[A-S MATH] Mid={mid_price:.1f}c | Inventory={inventory} | "
+                f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
                 f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged) | "
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
@@ -371,20 +408,27 @@ class AvellanedaStoikovBot:
         # Place new BID if needed
         if new_bid != self.current_bid_price:
             if new_bid is not None and self.current_bid_id is None:
-                logger.info(f">> Placing new BID: {self.order_size} YES @ {new_bid}c")
+                bid_size = getattr(self, "_current_quote_size", None)
+                if not isinstance(bid_size, int) or isinstance(bid_size, bool) or bid_size <= 0:
+                    bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+                logger.info(f">> Placing new BID: {bid_size} YES @ {new_bid}c")
                 self.current_bid_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="buy", count=self.order_size, price=new_bid
+                    ticker=self.ticker, side="yes", action="buy", count=bid_size, price=new_bid
                 )
                 self.current_bid_price = new_bid if self.current_bid_id else None
 
         # Place new ASK if needed
         if new_ask != self.current_ask_price:
             if new_ask is not None and self.current_ask_id is None:
-                logger.info(f">> Placing new ASK: {self.order_size} YES @ {new_ask}c")
+                ask_size = getattr(self, "_current_quote_size", None)
+                if not isinstance(ask_size, int) or isinstance(ask_size, bool) or ask_size <= 0:
+                    ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+                logger.info(f">> Placing new ASK: {ask_size} YES @ {new_ask}c")
                 self.current_ask_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="sell", count=self.order_size, price=new_ask
+                    ticker=self.ticker, side="yes", action="sell", count=ask_size, price=new_ask
                 )
                 self.current_ask_price = new_ask if self.current_ask_id else None
+
 
     async def _cancel_all_quotes(self) -> bool:
         """Withdraws all active quotes from the market."""
