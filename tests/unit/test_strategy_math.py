@@ -443,6 +443,83 @@ async def test_update_quotes_replaces_on_size_change():
     bot.om.place_order.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_update_quotes_failed_cancellation_blocks_duplicate_order():
+    """
+    Verify that if cancel_order returns False (or fails), the quote ID is NOT cleared,
+    preventing duplicate order placement on the exchange (addresses CodeRabbit Concern 3).
+    """
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_dollars=1.0)
+
+    # Active resting bid
+    bot.current_bid_id = "bid-order-active"
+    bot.current_bid_price = 30
+    bot.current_bid_size = 3
+
+    # Cancellation fails (e.g. gateway timeout or network error)
+    bot.om.cancel_order = AsyncMock(return_value=False)
+    bot.om.place_order = AsyncMock(return_value="bid-order-new")
+
+    # Midpoint shifts requiring new bid price 32c
+    await bot._update_quotes(new_bid=32, new_ask=None)
+
+    # Cancellation was attempted
+    bot.om.cancel_order.assert_called_once_with("bid-order-active")
+
+    # Because cancellation returned False, current_bid_id must be RETAINED
+    assert bot.current_bid_id == "bid-order-active"
+    assert bot.current_bid_price == 30
+    assert bot.current_bid_size == 3
+
+    # CRITICAL: No duplicate order should have been placed!
+    bot.om.place_order.assert_not_called()
+
+
+def test_max_order_contracts_ceiling():
+    """
+    Verify that calculate_order_size strictly respects max_order_contracts ceiling
+    even with high order_dollars or low mid-prices (addresses CodeRabbit Concern 1).
+    """
+    # Configure bot with $10 target but a hard ceiling of 50 contracts
+    bot = AvellanedaStoikovBot(ticker="MOCK", order_dollars=10.0, max_order_contracts=50)
+
+    # At 1c, raw calculation is ceil(1000 / 1) = 1,000 contracts
+    # Must be capped at max_order_contracts (50)
+    assert bot.calculate_order_size(mid_price=1.0) == 50
+
+
+@pytest.mark.asyncio
+async def test_max_hedge_inventory_ceiling():
+    """
+    Verify that inventory mitigation hedge threshold is strictly bounded by max_hedge_inventory
+    (addresses CodeRabbit Concern 1).
+    """
+    # Configure bot with max_hedge_inventory capped at 100 contracts
+    bot = AvellanedaStoikovBot(ticker="MOCK", gamma=0.5, min_spread=4, order_dollars=1.0, max_hedge_inventory=100)
+
+    # Mid = 3c -> quote_size = 34. Base 5-unit threshold = 5 * 34 = 170.
+    # Capped by max_hedge_inventory = 100.
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(2, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(4, 10))
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._update_quotes = AsyncMock()
+
+    # At 99 contracts (below 100 cap), hedge does NOT trigger
+    bot.inv_manager.get_position = MagicMock(return_value=99)
+    await bot._tick()
+    bid_arg, ask_arg = bot._update_quotes.call_args[0]
+    assert bid_arg is not None
+    assert ask_arg is not None
+
+    bot._update_quotes.reset_mock()
+
+    # At 100 contracts (meets cap of 100, even though 100 < 170), hedge triggers!
+    bot.inv_manager.get_position = MagicMock(return_value=100)
+    await bot._tick()
+    bot._update_quotes.assert_called_once_with(None, 2)
+
+
+
 
 
 

@@ -20,7 +20,14 @@ from execution.order_manager import OrderManager
 from utils.alerting import send_alert
 from utils.market_discovery import discover_active_market_async, is_market_active_async
 from utils.metrics import start_metrics_server, BOT_INVENTORY_NET_POSITION, BOT_PNL_CENTS
-from config import RISK_GAMMA, MIN_SPREAD, ORDER_SIZE, ORDER_DOLLARS
+from config import (
+    RISK_GAMMA,
+    MIN_SPREAD,
+    ORDER_SIZE,
+    ORDER_DOLLARS,
+    MAX_ORDER_CONTRACTS,
+    MAX_HEDGE_INVENTORY,
+)
 
 logger = logging.getLogger("MarketMaker")
 logger.setLevel(logging.INFO)
@@ -47,6 +54,8 @@ class AvellanedaStoikovBot:
         min_spread: int = None, # Minimum spread to quote (in cents).
         order_size: int = None,  # Number of contracts to quote on each side (fallback/fixed mode).
         order_dollars: float = None,  # Target dollar notional per order (min $1.00).
+        max_order_contracts: int = None,  # Hard ceiling on contracts per single order.
+        max_hedge_inventory: int = None,  # Hard ceiling on inventory hedge threshold.
         target_preference: Optional[str] = None,
         auto_rotate: bool = True,
         starvation_timeout: float = 900.0, # 15 minutes
@@ -55,9 +64,12 @@ class AvellanedaStoikovBot:
         self.gamma = gamma if gamma is not None else RISK_GAMMA
         self.min_spread = min_spread if min_spread is not None else MIN_SPREAD
         self.order_size = order_size if order_size is not None else ORDER_SIZE
+        self.max_order_contracts = max(1, int(max_order_contracts)) if max_order_contracts is not None else MAX_ORDER_CONTRACTS
+        self.max_hedge_inventory = max(5, int(max_hedge_inventory)) if max_hedge_inventory is not None else MAX_HEDGE_INVENTORY
         self.target_preference = target_preference if target_preference is not None else ticker
         self.auto_rotate = auto_rotate
         self.starvation_timeout = starvation_timeout
+
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
         if order_dollars is not None:
@@ -117,18 +129,21 @@ class AvellanedaStoikovBot:
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
         required to deploy at least order_dollars at the current mid-price.
         Guaranteed to deploy at least $1.00 and never lower.
-        Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] to prevent extreme
-        runaway contract counts on sub-cent books (e.g. 0.05c).
-        Otherwise falls back to fixed order_size.
+        Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] and enforces
+        a hard pre-submission ceiling (self.max_order_contracts) to prevent runaway
+        or manipulated contract counts.
+        Otherwise falls back to fixed order_size (also capped by max_order_contracts).
         """
         if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
             if isinstance(mid_price, (int, float)) and not isinstance(mid_price, bool) and math.isfinite(mid_price) and mid_price > 0:
                 # Bound midpoint to Kalshi's valid exchange quoting limits [1c, 99c]
                 # to prevent runaway contract counts on extreme/sub-cent books (e.g. 0.05c -> 2,000 contracts)
                 effective_price = max(1.0, min(99.0, float(mid_price)))
-                return max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
+                raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
+                return min(self.max_order_contracts, raw_count)
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
-        return max(1, fallback)
+        return min(self.max_order_contracts, max(1, fallback))
+
 
 
     async def start(self):
@@ -348,8 +363,9 @@ class AvellanedaStoikovBot:
             
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
-        # Threshold scales with quote size (5 order units)
-        hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        # Threshold scales with quote size (5 order units), bounded by max_hedge_inventory
+        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
         if inventory >= hedge_threshold:
             logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). Halting BIDs, crossing ASKs to exit.")
             optimal_bid = None # Do not buy more YES
@@ -417,16 +433,27 @@ class AvellanedaStoikovBot:
             result_iter = iter(results)
             if cancel_bid:
                 result = next(result_iter)
-                if not isinstance(result, Exception):
+                if result is True:
                     self.current_bid_id = None
                     self.current_bid_price = None
                     self.current_bid_size = None
+                else:
+                    logger.error(
+                        f"Failed to confirm cancellation of bid quote {self.current_bid_id} "
+                        f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
+                    )
             if cancel_ask:
                 result = next(result_iter)
-                if not isinstance(result, Exception):
+                if result is True:
                     self.current_ask_id = None
                     self.current_ask_price = None
                     self.current_ask_size = None
+                else:
+                    logger.error(
+                        f"Failed to confirm cancellation of ask quote {self.current_ask_id} "
+                        f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
+                    )
+
 
         # Place new BID if needed
         if bid_needs_update:
