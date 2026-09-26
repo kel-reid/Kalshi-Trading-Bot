@@ -109,7 +109,9 @@ async def test_bot_inactive_market_with_no_replacement_halts_quoting():
     mock_status.assert_awaited_once_with("MOCK_TICKER")
     mock_discover.assert_awaited_once_with(
         target_preference="MOCK_TICKER",
-        exclude_tickers=["MOCK_TICKER"]
+        exclude_tickers=["MOCK_TICKER"],
+        min_mid_price=bot.min_mid_price,
+        max_mid_price=bot.max_mid_price,
     )
     bot._cancel_all_quotes.assert_awaited_once()
     bot._update_quotes.assert_not_awaited()
@@ -192,7 +194,9 @@ async def test_starvation_triggers_auto_rotation():
         mock_alert.assert_awaited_once()
         mock_discover.assert_awaited_once_with(
             target_preference="DEAD_TICKER",
-            exclude_tickers=["DEAD_TICKER"]
+            exclude_tickers=["DEAD_TICKER"],
+            min_mid_price=bot.min_mid_price,
+            max_mid_price=bot.max_mid_price,
         )
         bot.rotate_market.assert_awaited_once_with("REPLACEMENT_TICKER")
         assert bot._market_inactive is False
@@ -233,7 +237,9 @@ async def test_bot_retries_discovery_and_recovers_from_inactive():
 
         mock_discover.assert_awaited_once_with(
             target_preference="INACTIVE_TICKER",
-            exclude_tickers=["INACTIVE_TICKER"]
+            exclude_tickers=["INACTIVE_TICKER"],
+            min_mid_price=bot.min_mid_price,
+            max_mid_price=bot.max_mid_price,
         )
         bot.rotate_market.assert_awaited_once_with("RECOVERED_TICKER")
         assert bot._market_inactive is False

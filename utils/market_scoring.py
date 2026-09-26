@@ -82,6 +82,8 @@ def _select_best_market(
     preflight_check: bool = True,
     max_probes: int = 10,
     budget_tracker: Optional[Dict[str, int]] = None,
+    min_mid_price: Optional[float] = None,
+    max_mid_price: Optional[float] = None,
 ) -> Optional[str]:
     """
     Prioritize markets that have existing trading volume, open interest, or two-sided quotes.
@@ -120,7 +122,16 @@ def _select_best_market(
             if budget_tracker is not None:
                 budget_tracker["remaining"] -= 1
 
-            if check_orderbook_has_quotes(cand_ticker):
+            try:
+                has_quotes = check_orderbook_has_quotes(
+                    cand_ticker,
+                    min_mid_price=min_mid_price,
+                    max_mid_price=max_mid_price,
+                )
+            except TypeError:
+                has_quotes = check_orderbook_has_quotes(cand_ticker)
+
+            if has_quotes:
                 logger.info(f"Pre-flight orderbook check confirmed two-sided quotes for: {cand_ticker}")
                 return cand_ticker
         logger.info("Pre-flight orderbook check found no candidates with active two-sided quotes.")

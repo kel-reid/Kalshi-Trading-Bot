@@ -175,7 +175,11 @@ def fetch_eligible_markets(
         return []
 
 
-def check_orderbook_has_quotes(ticker: str) -> bool:
+def check_orderbook_has_quotes(
+    ticker: str,
+    min_mid_price: Optional[float] = None,
+    max_mid_price: Optional[float] = None,
+) -> bool:
     """
     Check if a market's live orderbook currently has active two-sided quotes (bids and asks).
     Makes a lightweight REST check to avoid selecting dormant contracts or contracts outside the safe price collar.
@@ -213,7 +217,10 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
 
             # Verify orderbook midpoint is strictly within safe price collar
             try:
-                from config import MIN_MID_PRICE, MAX_MID_PRICE
+                from config import MIN_MID_PRICE as DEFAULT_MIN_MID_PRICE, MAX_MID_PRICE as DEFAULT_MAX_MID_PRICE
+                effective_min_mid = min_mid_price if min_mid_price is not None else DEFAULT_MIN_MID_PRICE
+                effective_max_mid = max_mid_price if max_mid_price is not None else DEFAULT_MAX_MID_PRICE
+
                 yes_prices = []
                 for b in yes_bids:
                     if isinstance(b, (list, tuple)) and len(b) >= 1:
@@ -244,10 +251,10 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
                     return False
 
                 mid = (best_yes_bid + implied_yes_ask) / 2.0
-                if mid < MIN_MID_PRICE or mid > MAX_MID_PRICE:
+                if mid < effective_min_mid or mid > effective_max_mid:
                     logger.info(
                         f"Pre-flight orderbook check for {ticker} rejected: "
-                        f"mid-price {mid:.1f}c outside collar [{MIN_MID_PRICE}c, {MAX_MID_PRICE}c]."
+                        f"mid-price {mid:.1f}c outside collar [{effective_min_mid}c, {effective_max_mid}c]."
                     )
                     return False
 
