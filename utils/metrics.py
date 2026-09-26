@@ -58,6 +58,11 @@ KALSHI_ROUND_TRIPS_TOTAL = Counter(
     "Total count of completed round-trip trades",
     ["ticker", "outcome"]
 )
+SAFEGUARD_EVENTS_TOTAL = Counter(
+    "safeguard_events_total",
+    "Total count of risk safeguard trigger events (e.g. price collar breach, expiry cutoff)",
+    ["safeguard", "ticker"]
+)
 
 _server_started = False
 

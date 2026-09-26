@@ -88,6 +88,8 @@ def discover_active_market(
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
     max_targeted_series_fallbacks: int = DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
+    min_mid_price: Optional[float] = None,
+    max_mid_price: Optional[float] = None,
 ) -> Optional[str]:
     """
     Select an active tradeable market ticker based on a target preference or category.
@@ -154,9 +156,18 @@ def discover_active_market(
                     return None
                 if budget_tracker is not None:
                     budget_tracker["remaining"] -= 1
-                if exact_ticker and check_orderbook_has_quotes(exact_ticker):
-                    logger.info(f"Targeting exact matched market with active quotes: {pref}")
-                    return exact_ticker
+                if exact_ticker:
+                    try:
+                        has_quotes = check_orderbook_has_quotes(
+                            exact_ticker,
+                            min_mid_price=min_mid_price,
+                            max_mid_price=max_mid_price,
+                        )
+                    except TypeError:
+                        has_quotes = check_orderbook_has_quotes(exact_ticker)
+                    if has_quotes:
+                        logger.info(f"Targeting exact matched market with active quotes: {pref}")
+                        return exact_ticker
                 logger.info(f"Exact matched market {pref} has no active quotes.")
                 return None
             else:
@@ -174,6 +185,8 @@ def discover_active_market(
                 matched,
                 preflight_check=preflight_check,
                 budget_tracker=budget_tracker,
+                min_mid_price=min_mid_price,
+                max_mid_price=max_mid_price,
             )
             if selected:
                 logger.info(f"Matched active market for '{target_preference}': {selected}")
@@ -262,6 +275,8 @@ def discover_active_market(
                         preflight_check=preflight_check,
                         max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
                         budget_tracker=budget_tracker,
+                        min_mid_price=min_mid_price,
+                        max_mid_price=max_mid_price,
                     )
                     if selected:
                         logger.info(f"SportsSeasonRouter selected active {league} Primary Moneyline ({primary_series}): {selected}")
@@ -288,6 +303,8 @@ def discover_active_market(
                         preflight_check=preflight_check,
                         max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
                         budget_tracker=budget_tracker,
+                        min_mid_price=min_mid_price,
+                        max_mid_price=max_mid_price,
                     )
                     if selected:
                         logger.info(f"SportsSeasonRouter selected active {league} Game Line ({series_ticker}): {selected}")
@@ -311,6 +328,8 @@ def discover_active_market(
                         preflight_check=preflight_check,
                         max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
                         budget_tracker=budget_tracker,
+                        min_mid_price=min_mid_price,
+                        max_mid_price=max_mid_price,
                     )
                     if selected:
                         logger.info(f"SportsSeasonRouter selected active {league} Player Prop ({series_ticker}): {selected}")
@@ -342,6 +361,8 @@ def discover_active_market(
                     preflight_check=preflight_check,
                     max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
                     budget_tracker=budget_tracker,
+                    min_mid_price=min_mid_price,
+                    max_mid_price=max_mid_price,
                 )
                 if selected:
                     logger.info(f"SportsSeasonRouter selected active general {league} market: {selected}")
@@ -371,6 +392,8 @@ async def discover_active_market_async(
     max_total_probes: int = DEFAULT_MAX_TOTAL_PROBES,
     max_expiration_days: Optional[float] = None,
     max_targeted_series_fallbacks: int = DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
+    min_mid_price: Optional[float] = None,
+    max_mid_price: Optional[float] = None,
 ) -> Optional[str]:
     """Non-blocking async wrapper for discover_active_market."""
     return await asyncio.to_thread(
@@ -381,6 +404,8 @@ async def discover_active_market_async(
         max_total_probes,
         max_expiration_days,
         max_targeted_series_fallbacks,
+        min_mid_price,
+        max_mid_price,
     )
 
 

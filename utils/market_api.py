@@ -149,12 +149,14 @@ def fetch_eligible_markets(
                 continue
             if str(m.get("ticker", "")).upper().startswith(("KXMVE", "KXNHL")):
                 continue
-            # Filter out markets whose close_time or expiration_time has passed
+            # Filter out markets whose close_time or expiration_time has passed or is within expiration cutoff
             close_time_str = m.get("close_time") or m.get("expiration_time")
             if close_time_str:
                 close_dt = _parse_iso_timestamp(close_time_str)
-                if close_dt is not None and close_dt <= now_utc:
-                    continue
+                if close_dt is not None:
+                    from config import MIN_TIME_TO_CLOSE_SECONDS
+                    if (close_dt - now_utc).total_seconds() <= MIN_TIME_TO_CLOSE_SECONDS:
+                        continue
             if not _is_within_horizon(m, max_expiration_days, now_utc):
                 continue
             eligible.append(m)
@@ -173,10 +175,14 @@ def fetch_eligible_markets(
         return []
 
 
-def check_orderbook_has_quotes(ticker: str) -> bool:
+def check_orderbook_has_quotes(
+    ticker: str,
+    min_mid_price: Optional[float] = None,
+    max_mid_price: Optional[float] = None,
+) -> bool:
     """
     Check if a market's live orderbook currently has active two-sided quotes (bids and asks).
-    Makes a lightweight REST check to avoid selecting dormant contracts.
+    Makes a lightweight REST check to avoid selecting dormant contracts or contracts outside the safe price collar.
     """
     try:
         base_url = _get_base_url()
@@ -190,13 +196,72 @@ def check_orderbook_has_quotes(ticker: str) -> bool:
         if resp.status_code == 200:
             data = resp.json()
             ob = data.get("orderbook_fp") or data.get("orderbook") or {}
-            yes_bids = (
-                ob.get("yes_dollars_fp") or ob.get("yes_dollars") or ob.get("yes") or []
-            )
-            no_bids = (
-                ob.get("no_dollars_fp") or ob.get("no_dollars") or ob.get("no") or []
-            )
-            return bool(len(yes_bids) > 0 and len(no_bids) > 0)
+            dollar_yes = ob.get("yes_dollars_fp") or ob.get("yes_dollars")
+            if dollar_yes is not None:
+                yes_bids = dollar_yes
+                is_yes_dollars = True
+            else:
+                yes_bids = ob.get("yes") or []
+                is_yes_dollars = False
+
+            dollar_no = ob.get("no_dollars_fp") or ob.get("no_dollars")
+            if dollar_no is not None:
+                no_bids = dollar_no
+                is_no_dollars = True
+            else:
+                no_bids = ob.get("no") or []
+                is_no_dollars = False
+
+            if not (len(yes_bids) > 0 and len(no_bids) > 0):
+                return False
+
+            # Verify orderbook midpoint is strictly within safe price collar
+            try:
+                from config import MIN_MID_PRICE as DEFAULT_MIN_MID_PRICE, MAX_MID_PRICE as DEFAULT_MAX_MID_PRICE
+                effective_min_mid = min_mid_price if min_mid_price is not None else DEFAULT_MIN_MID_PRICE
+                effective_max_mid = max_mid_price if max_mid_price is not None else DEFAULT_MAX_MID_PRICE
+
+                yes_prices = []
+                for b in yes_bids:
+                    if isinstance(b, (list, tuple)) and len(b) >= 1:
+                        p = float(b[0])
+                        cents = p * 100.0 if is_yes_dollars else p
+                        yes_prices.append(cents)
+
+                no_prices = []
+                for b in no_bids:
+                    if isinstance(b, (list, tuple)) and len(b) >= 1:
+                        p = float(b[0])
+                        cents = p * 100.0 if is_no_dollars else p
+                        no_prices.append(cents)
+
+                if not (yes_prices and no_prices):
+                    logger.debug(f"Pre-flight orderbook for {ticker} missing numeric bid prices; failing closed.")
+                    return False
+
+                best_yes_bid = max(yes_prices)
+                best_no_bid = max(no_prices)
+                implied_yes_ask = 100.0 - best_no_bid
+
+                if not (0 < best_yes_bid <= 100 and 0 < implied_yes_ask <= 100):
+                    logger.debug(
+                        f"Pre-flight orderbook for {ticker} has invalid best prices "
+                        f"(bid={best_yes_bid}, ask={implied_yes_ask}); failing closed."
+                    )
+                    return False
+
+                mid = (best_yes_bid + implied_yes_ask) / 2.0
+                if mid < effective_min_mid or mid > effective_max_mid:
+                    logger.info(
+                        f"Pre-flight orderbook check for {ticker} rejected: "
+                        f"mid-price {mid:.1f}c outside collar [{effective_min_mid}c, {effective_max_mid}c]."
+                    )
+                    return False
+
+                return True
+            except Exception as e_collar:
+                logger.debug(f"Collar evaluation failed for {ticker}: {e_collar}")
+                return False
     except Exception as e:
         logger.debug(f"Pre-flight orderbook check for {ticker} failed: {e}")
     return False
@@ -206,7 +271,7 @@ def check_market_status(ticker: str) -> Optional[str]:
     """
     Query the status of a specific market from Kalshi REST API.
     Returns status string (e.g., 'active', 'open', 'closed', 'settled') or None if error.
-    Also verifies close_time to catch expired hourly contracts before batch settlement.
+    Also verifies close_time to catch expired hourly contracts and markets within MIN_TIME_TO_CLOSE_SECONDS.
     """
     try:
         base_url = _get_base_url()
@@ -231,8 +296,14 @@ def check_market_status(ticker: str) -> Optional[str]:
                     md = sys.modules.get("utils.market_discovery")
                     dt_module = getattr(md, "datetime", datetime) if md else datetime
                     now_utc = dt_module.datetime.now(datetime.timezone.utc)
-                    if close_dt <= now_utc:
-                        logger.info(f"Market {ticker} has passed its close_time ({close_time_str}); treating as closed.")
+                    from config import MIN_TIME_TO_CLOSE_SECONDS
+                    remaining_sec = (close_dt - now_utc).total_seconds()
+                    if remaining_sec <= MIN_TIME_TO_CLOSE_SECONDS:
+                        logger.info(
+                            f"Market {ticker} is within expiration cutoff "
+                            f"({remaining_sec:.0f}s <= {MIN_TIME_TO_CLOSE_SECONDS}s, close_time: {close_time_str}); "
+                            f"treating as closed."
+                        )
                         return "closed"
 
             return status
