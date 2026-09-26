@@ -241,7 +241,9 @@ class AvellanedaStoikovBot:
                 logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
                 replacement = await discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker]
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
                 )
                 if replacement:
                     if await self.rotate_market(replacement):
@@ -267,7 +269,9 @@ class AvellanedaStoikovBot:
                 if self.auto_rotate:
                     replacement = await discover_active_market_async(
                         target_preference=self.target_preference,
-                        exclude_tickers=[self.ticker]
+                        exclude_tickers=[self.ticker],
+                        min_mid_price=self.min_mid_price,
+                        max_mid_price=self.max_mid_price,
                     )
                     if replacement:
                         if await self.rotate_market(replacement):
@@ -319,7 +323,9 @@ class AvellanedaStoikovBot:
                         )
                         replacement = await discover_active_market_async(
                             target_preference=self.target_preference,
-                            exclude_tickers=[self.ticker]
+                            exclude_tickers=[self.ticker],
+                            min_mid_price=self.min_mid_price,
+                            max_mid_price=self.max_mid_price,
                         )
                         if replacement:
                             if await self.rotate_market(replacement):
@@ -370,24 +376,59 @@ class AvellanedaStoikovBot:
             logger.debug(f"Telemetry unrealized update skipped for {self.ticker}: {e_m}")
         self._maybe_schedule_pnl_snapshot(now, inventory)
 
+        # 3. Determine dynamic quote size and hedge threshold for current market price
+        quote_size = self.calculate_order_size(mid_price)
+        self._current_quote_size = quote_size
+        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
+
         # 2a. Extreme Price Collar Safeguard:
-        # If orderbook midpoint drifts outside [min_mid_price, max_mid_price],
-        # immediately cancel active quotes to prevent late-game blowout adverse selection.
+        # If orderbook midpoint drifts outside [min_mid_price, max_mid_price]:
         if mid_price < self.min_mid_price or mid_price > self.max_mid_price:
             logger.warning(
                 f"[PRICE COLLAR BREACH] Market {self.ticker} mid price {mid_price:.2f}c is outside "
-                f"safety collar [{self.min_mid_price}c, {self.max_mid_price}c]. "
-                f"Cancelling active quotes and initiating rotation..."
+                f"safety collar [{self.min_mid_price}c, {self.max_mid_price}c]."
             )
             try:
                 SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker=self.ticker).inc()
             except Exception as e_metric:
                 logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+            # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
+            if abs(inventory) >= hedge_threshold:
+                if inventory >= hedge_threshold:
+                    logger.warning(
+                        f"[COLLAR BREACH - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
+                        f"Halting BIDs outside collar, crossing ASKs to exit."
+                    )
+                    optimal_bid = None
+                    optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                else:
+                    logger.warning(
+                        f"[COLLAR BREACH - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
+                        f"Halting ASKs outside collar, crossing BIDs to exit."
+                    )
+                    optimal_ask = None
+                    optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+
+                realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+                unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                logger.info(
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Collar Breach Hedged) | "
+                    f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
+                )
+                await self._update_quotes(optimal_bid, optimal_ask)
+                return
+
+            # Otherwise (inventory below hedge threshold), cancel all active quotes and rotate/quiesce.
             await self._cancel_all_quotes()
             if self.auto_rotate:
                 replacement = await discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker]
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
                 )
                 if replacement:
                     if await self.rotate_market(replacement):
@@ -404,13 +445,6 @@ class AvellanedaStoikovBot:
             else:
                 self._market_inactive = True
             return
-
-        # 3. Get Inventory
-        # Convention: positive inventory = holding net YES
-        
-        # Determine dynamic quote size for current market price
-        quote_size = self.calculate_order_size(mid_price)
-        self._current_quote_size = quote_size
 
         # 4. Calculate Reservation Price (R)
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
@@ -432,9 +466,6 @@ class AvellanedaStoikovBot:
             
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
-        # Threshold scales with quote size (5 order units), bounded by max_hedge_inventory
-        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
-        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
         if inventory >= hedge_threshold:
             logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). Halting BIDs, crossing ASKs to exit.")
             optimal_bid = None # Do not buy more YES
