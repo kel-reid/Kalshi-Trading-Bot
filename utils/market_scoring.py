@@ -19,7 +19,7 @@ DEFAULT_MAX_PROBES_PER_SERIES: int = 2
 DEFAULT_MAX_TARGETED_SERIES_FALLBACKS: int = 3
 
 
-def _get_orderbook_checker() -> Callable[[str], bool]:
+def _get_orderbook_checker() -> Callable[..., bool]:
     """Retrieve the check_orderbook_has_quotes function, honoring any mock in utils.market_discovery."""
     import sys
     md = sys.modules.get("utils.market_discovery")
