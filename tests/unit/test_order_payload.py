@@ -9,7 +9,7 @@ conform to the Kalshi V2 API schema requirements, specifically:
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from execution.order_manager import OrderManager
 
 
@@ -171,4 +171,48 @@ class TestV2PayloadSchema:
         # Whole cent 50 cents = $0.50
         await om.place_order(ticker="T", side="yes", action="buy", count=1, price=50)
         assert captured["payload"]["price"] == "0.50"
+
+    @pytest.mark.asyncio
+    async def test_place_order_parses_root_v2_order_id(self, order_manager):
+        """Verify order_id is properly extracted when returned at the root of the JSON response."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json.return_value = {
+            "order_id": "kalshi-root-id-456",
+            "client_order_id": "client-uuid",
+            "fill_count": "0.00",
+            "remaining_count": "2.00",
+        }
+        order_manager._post_request = MagicMock(return_value=mock_resp)
+        cid = await order_manager.place_order(ticker="T", side="yes", action="buy", count=2, price=45)
+        assert cid in order_manager.active_orders
+        assert order_manager.active_orders[cid]["kalshi_order_id"] == "kalshi-root-id-456"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_cancels_orphans(self, order_manager):
+        """Verify reconcile_resting_orders cancels orders on the exchange that are not tracked locally."""
+        order_manager.active_orders["tracked-cid"] = {
+            "ticker": "TEST-TICKER",
+            "kalshi_order_id": "tracked-kalshi-id"
+        }
+
+        mock_get = MagicMock()
+        mock_get.status_code = 200
+        mock_get.json.return_value = {
+            "orders": [
+                {"order_id": "tracked-kalshi-id", "client_order_id": "tracked-cid", "ticker": "TEST-TICKER"},
+                {"order_id": "orphan-1", "client_order_id": "orphan-cid-1", "ticker": "TEST-TICKER"},
+                {"order_id": "orphan-2", "client_order_id": "orphan-cid-2", "ticker": "TEST-TICKER"},
+            ]
+        }
+
+        with patch("execution.order_manager.requests.get", return_value=mock_get):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=None)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="TEST-TICKER")
+
+            assert cancelled == 2
+            assert order_manager._cancel_by_kalshi_id.call_count == 2
+            calls = [c.args for c in order_manager._cancel_by_kalshi_id.call_args_list]
+            assert ("orphan-1", "orphan-cid-1") in calls
+            assert ("orphan-2", "orphan-cid-2") in calls
 

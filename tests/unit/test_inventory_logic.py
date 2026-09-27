@@ -269,6 +269,6 @@ def test_portfolio_value_and_positions_value_telemetry():
     assert manager.get_portfolio_value(ticker) == 2057.0
 
     assert KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker)._value.get() == 850.0
-    assert KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker)._value.get() == 2057.0
+    assert KALSHI_PORTFOLIO_VALUE_CENTS._value.get() == 2057.0
 
 

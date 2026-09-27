@@ -395,3 +395,100 @@ class TestBaselineTelemetryLifecycle:
         assert KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 50.0
         assert KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker)._value.get() == 0.0
         assert KALSHI_FEES_PAID_CENTS.labels(ticker=ticker)._value.get() == 5.0
+
+
+class TestSessionRiskSafeguards:
+    """Verify fee churn circuit breaker and session stop-loss triggers."""
+
+    @pytest.mark.asyncio
+    async def test_fee_churn_circuit_breaker_cancels_and_rotates(self, monkeypatch):
+        """When accumulated fees meet or exceed max_session_fees_cents, quotes are cancelled and bot rotates."""
+        ticker = "KXCHURN-TICKER"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            auto_rotate=True,
+            max_session_fees_cents=150,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.rotate_market = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Fees reached 155c (over 150c limit)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": 10.0,
+            "unrealized_pnl_cents": 0.0,
+            "total_fees_cents": 155.0,
+        })
+
+        monkeypatch.setattr(
+            "strategy.market_maker.discover_active_market_async",
+            AsyncMock(return_value="KXREPLACEMENT-TICKER")
+        )
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot.rotate_market.assert_called_once_with("KXREPLACEMENT-TICKER")
+
+    @pytest.mark.asyncio
+    async def test_session_stop_loss_cancels_and_rotates(self, monkeypatch):
+        """When net session PnL breaches max_session_loss_cents, quotes are cancelled and bot rotates."""
+        ticker = "KXLOSS-TICKER"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            auto_rotate=True,
+            max_session_loss_cents=200,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.rotate_market = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Net loss is -250c (exceeds -200c stop-loss limit)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": -200.0,
+            "unrealized_pnl_cents": -50.0,
+            "total_fees_cents": 20.0,
+        })
+
+        monkeypatch.setattr(
+            "strategy.market_maker.discover_active_market_async",
+            AsyncMock(return_value="KXREPLACEMENT-TICKER")
+        )
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot.rotate_market.assert_called_once_with("KXREPLACEMENT-TICKER")
+
+    @pytest.mark.asyncio
+    async def test_order_placement_failure_initiates_cooldown(self):
+        """When place_order fails, placement is throttled during the cooldown window."""
+        ticker = "KXCOOLDOWN-TICKER"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+            auto_rotate=False,
+        )
+        # First attempt: place_order fails (returns None)
+        bot.om.place_order = AsyncMock(return_value=None)
+        await bot._update_quotes(new_bid=48, new_ask=52)
+
+        assert bot.current_bid_id is None
+        assert bot._last_order_error_time > 0
+        call_count_1 = bot.om.place_order.call_count
+
+        # Second attempt immediately after: within 5s cooldown, should NOT call place_order again
+        await bot._update_quotes(new_bid=48, new_ask=52)
+        assert bot.om.place_order.call_count == call_count_1

@@ -193,7 +193,7 @@ class InventoryManager:
                 KALSHI_REALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_realized_pnl(t))
                 KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_unrealized_pnl(t))
                 KALSHI_FEES_PAID_CENTS.labels(ticker=t).set(self.pnl_tracker.get_total_fees(t))
-                KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=t).set(self.get_portfolio_value(t))
+                KALSHI_PORTFOLIO_VALUE_CENTS.set(self.get_portfolio_value(t))
                 KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=t).set(self.get_positions_value(t))
             except Exception as e:
                 logger.debug(f"Prometheus metric update skipped for {t}: {e}")
@@ -453,7 +453,7 @@ class InventoryManager:
             KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_realized_pnl(ticker))
             KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_unrealized_pnl(ticker))
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
-            KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker).set(self.get_portfolio_value(ticker))
+            KALSHI_PORTFOLIO_VALUE_CENTS.set(self.get_portfolio_value(ticker))
             KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
 
             for outcome in pnl_impact.get("matched_outcomes", []):
@@ -476,7 +476,7 @@ class InventoryManager:
         try:
             KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(unrealized)
             KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
-            KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker).set(self.get_portfolio_value(ticker))
+            KALSHI_PORTFOLIO_VALUE_CENTS.set(self.get_portfolio_value(ticker))
         except Exception as e:
             logger.debug(f"Prometheus unrealized/portfolio metric update skipped: {e}")
         return unrealized
