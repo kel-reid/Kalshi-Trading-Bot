@@ -55,8 +55,7 @@ KALSHI_FEES_PAID_CENTS = Gauge(
 )
 KALSHI_PORTFOLIO_VALUE_CENTS = Gauge(
     "kalshi_portfolio_value_cents",
-    "Total portfolio value in cents (cash balance plus open positions market value)",
-    ["ticker"]
+    "Total account portfolio value in cents (cash balance plus open positions market value)"
 )
 KALSHI_POSITIONS_VALUE_CENTS = Gauge(
     "kalshi_positions_value_cents",

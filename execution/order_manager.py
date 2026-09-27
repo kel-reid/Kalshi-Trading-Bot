@@ -23,6 +23,7 @@ from utils.rate_limiter import RateLimiter
 from utils.metrics import measure_latency, ORDERS_PLACED_TOTAL, ORDER_ERRORS_TOTAL
 
 logger = logging.getLogger("OrderManager")
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -303,20 +304,24 @@ class OrderManager:
                     logger.info(f"Order Placed: {action} {count} {side} @ {price}c for {ticker} (ID: {client_order_id})")
                     ORDERS_PLACED_TOTAL.labels(ticker=ticker, action=action, side=side).inc()
                     
+                    resp_json = response.json() if callable(getattr(response, "json", None)) else {}
+                    # Kalshi V2 events/orders returns root order_id; fallback to legacy/mocked {"order": {"order_id": ...}}
+                    kalshi_order_id = resp_json.get("order_id") or resp_json.get("order", {}).get("order_id")
+                    
                     self.active_orders[client_order_id] = {
                         "ticker": ticker,
                         "side": side,
                         "action": action,
                         "count": count,
                         "price": price,
-                        "kalshi_order_id": response.json().get("order", {}).get("order_id")
+                        "kalshi_order_id": kalshi_order_id
                     }
                     
                     # Persist to database
                     self._update_db_order_status(
                         client_order_id, 
                         "resting", 
-                        kalshi_order_id=self.active_orders[client_order_id]["kalshi_order_id"],
+                        kalshi_order_id=kalshi_order_id,
                         order_details=self.active_orders[client_order_id]
                     )
                     
@@ -345,8 +350,6 @@ class OrderManager:
         """
         if client_order_id not in self.active_orders:
             logger.warning(f"Order {client_order_id} not found in active orders.")
-            # Note: order might have filled, or tracker lost it.
-            # We could still try to cancel it if we really wanted to.
         
         order_to_cancel = self.active_orders.get(client_order_id)
         if order_to_cancel and order_to_cancel.get("kalshi_order_id"):
@@ -369,16 +372,24 @@ class OrderManager:
             
             if response is not None:
                 if response.status_code in [200, 204]:
-                    logger.info(f"Order Cancelled: {client_order_id}")
+                    logger.info(f"Order Cancelled: {client_order_id} (kalshi_id: {order_id})")
                     self.active_orders.pop(client_order_id, None)
                     self._update_db_order_status(client_order_id, "cancelled")
                     return True
                 elif response.status_code == 404:
-                    # Order might already be filled or cancelled
-                    logger.info(f"Order {client_order_id} not found on server (may be filled/cancelled already).")
-                    self.active_orders.pop(client_order_id, None)
-                    self._update_db_order_status(client_order_id, "cancelled_or_filled_404")
-                    return True
+                    if order_to_cancel and order_to_cancel.get("kalshi_order_id"):
+                        # We had an authentic kalshi_order_id; 404 confirms it is already cleared from the exchange
+                        logger.info(f"Order {client_order_id} ({order_id}) not found on server (may be filled/cancelled already).")
+                        self.active_orders.pop(client_order_id, None)
+                        self._update_db_order_status(client_order_id, "cancelled_or_filled_404")
+                        return True
+                    else:
+                        # We lacked a verified kalshi_order_id; 404 indicates Kalshi rejected client_order_id.
+                        logger.warning(f"DELETE 404 for unverified order {order_id}; reconciling resting orders...")
+                        await self.reconcile_resting_orders()
+                        self.active_orders.pop(client_order_id, None)
+                        self._update_db_order_status(client_order_id, "reconciled_after_404")
+                        return True
                 elif response.status_code == 429:
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -458,6 +469,63 @@ class OrderManager:
                 order_copy["client_order_id"] = cid
                 orders.append(order_copy)
         return orders
+    async def reconcile_resting_orders(self, ticker: Optional[str] = None) -> int:
+        """
+        Actively queries Kalshi for all resting orders on the exchange.
+        Cancels any order resting on Kalshi that does not correspond to an active tracked order.
+        Returns the count of orphaned orders cancelled.
+        """
+        sign_path = "/trade-api/v2/portfolio/orders"
+        query_params = {"status": "resting", "limit": 100}
+        if ticker:
+            query_params["ticker"] = ticker
+            
+        try:
+            await self.rate_limiter.acquire()
+            headers = get_auth_headers(method="GET", sign_path=sign_path)
+            with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
+                response = await asyncio.to_thread(
+                    requests.get,
+                    BASE_URL + sign_path,
+                    headers=headers,
+                    params=query_params,
+                    timeout=10,
+                    verify=certifi.where()
+                )
+            if response.status_code == 200:
+                orders_list = response.json().get("orders", [])
+                tracked_kalshi_ids = {
+                    v.get("kalshi_order_id") for v in self.active_orders.values() if v.get("kalshi_order_id")
+                }
+                tracked_client_ids = set(self.active_orders.keys())
+                
+                cancelled_count = 0
+                cancel_tasks = []
+                for order in orders_list:
+                    oid = order.get("order_id")
+                    cid = order.get("client_order_id")
+                    order_ticker = order.get("ticker")
+                    if ticker and order_ticker != ticker:
+                        continue
+                    
+                    if oid not in tracked_kalshi_ids and cid not in tracked_client_ids:
+                        logger.warning(
+                            f"Reconciling orphaned resting order on exchange: {oid} "
+                            f"(client_id: {cid}, ticker: {order_ticker})"
+                        )
+                        cancel_tasks.append(self._cancel_by_kalshi_id(oid, cid))
+                        cancelled_count += 1
+                        
+                if cancel_tasks:
+                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                    logger.info(f"Reconciliation cancelled {cancelled_count} orphaned resting orders.")
+                return cancelled_count
+            else:
+                logger.error(f"Failed to fetch resting orders for reconciliation: {response.status_code} - {response.text}")
+                return 0
+        except Exception as e:
+            logger.error(f"Error during resting order reconciliation: {e}")
+            return 0
 
     async def sync_and_recover_state(self):
         """

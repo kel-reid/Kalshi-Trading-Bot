@@ -38,6 +38,8 @@ from config import (
     MIN_MID_PRICE,
     MAX_MID_PRICE,
     MIN_TIME_TO_CLOSE_SECONDS,
+    MAX_SESSION_FEES_CENTS,
+    MAX_SESSION_LOSS_CENTS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -72,6 +74,8 @@ class AvellanedaStoikovBot:
         starvation_timeout: float = 900.0, # 15 minutes
         min_mid_price: Optional[int] = None,
         max_mid_price: Optional[int] = None,
+        max_session_fees_cents: Optional[int] = None,
+        max_session_loss_cents: Optional[int] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -84,6 +88,8 @@ class AvellanedaStoikovBot:
         self.starvation_timeout = starvation_timeout
         self.min_mid_price = min_mid_price if min_mid_price is not None else MIN_MID_PRICE
         self.max_mid_price = max_mid_price if max_mid_price is not None else MAX_MID_PRICE
+        self.max_session_fees_cents = max_session_fees_cents if max_session_fees_cents is not None else MAX_SESSION_FEES_CENTS
+        self.max_session_loss_cents = max_session_loss_cents if max_session_loss_cents is not None else MAX_SESSION_LOSS_CENTS
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -132,6 +138,14 @@ class AvellanedaStoikovBot:
         # Periodic PnL snapshot tracking
         self._last_pnl_snapshot: float = time.time()
         self._pnl_snapshot_interval: float = 60.0
+
+        # Order placement failure cooldown tracking to prevent runaway rate limit spam
+        self._last_order_error_time: float = 0.0
+        self._order_error_cooldown: float = 5.0
+
+        # Periodic exchange resting order reconciliation
+        self._last_reconciliation_time: float = time.time()
+        self._reconciliation_interval: float = 60.0
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
@@ -376,6 +390,54 @@ class AvellanedaStoikovBot:
             logger.debug(f"Telemetry unrealized update skipped for {self.ticker}: {e_m}")
         self._maybe_schedule_pnl_snapshot(now, inventory)
 
+        # Periodic exchange resting order reconciliation
+        if now - self._last_reconciliation_time >= self._reconciliation_interval:
+            self._last_reconciliation_time = now
+            rec_task = asyncio.create_task(self.om.reconcile_resting_orders(ticker=self.ticker))
+            self._background_tasks.add(rec_task)
+            rec_task.add_done_callback(self._background_tasks.discard)
+
+        # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
+        pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+        session_fees = pnl_summary.get("total_fees_cents", 0.0)
+        session_net_pnl = pnl_summary.get("realized_pnl_cents", 0.0) + pnl_summary.get("unrealized_pnl_cents", 0.0)
+
+        if session_fees >= self.max_session_fees_cents or session_net_pnl <= -self.max_session_loss_cents:
+            reason = "fee_churn" if session_fees >= self.max_session_fees_cents else "session_stop_loss"
+            logger.warning(
+                f"[{reason.upper()} TRIGGERED] Market {self.ticker} session metrics: "
+                f"fees={session_fees:.1f}c (limit: {self.max_session_fees_cents}c), "
+                f"net_pnl={session_net_pnl:.1f}c (loss limit: -{self.max_session_loss_cents}c). "
+                f"Ceasing quoting and rotating market."
+            )
+            try:
+                SAFEGUARD_EVENTS_TOTAL.labels(safeguard=reason, ticker=self.ticker).inc()
+            except Exception as e_metric:
+                logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+            await self._cancel_all_quotes()
+            if self.auto_rotate:
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                        logger.info(f"Successfully rotated from {reason} market to {replacement}.")
+                    else:
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                else:
+                    logger.error(f"No replacement market found after {reason} on {self.ticker}.")
+                    self._market_inactive = True
+                    self._last_inactive_retry = now
+            else:
+                self._market_inactive = True
+            return
+
         # 3. Determine dynamic quote size and hedge threshold for current market price
         quote_size = self.calculate_order_size(mid_price)
         self._current_quote_size = quote_size
@@ -556,7 +618,10 @@ class AvellanedaStoikovBot:
 
 
         # Place new BID if needed
-        if bid_needs_update:
+        now = time.time()
+        in_error_cooldown = (now - self._last_order_error_time < self._order_error_cooldown)
+
+        if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
                 logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c")
                 self.current_bid_id = await self.om.place_order(
@@ -566,11 +631,12 @@ class AvellanedaStoikovBot:
                     self.current_bid_price = new_bid
                     self.current_bid_size = target_bid_size
                 else:
+                    self._last_order_error_time = time.time()
                     self.current_bid_price = None
                     self.current_bid_size = None
 
         # Place new ASK if needed
-        if ask_needs_update:
+        if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
                 logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c")
                 self.current_ask_id = await self.om.place_order(
@@ -580,6 +646,7 @@ class AvellanedaStoikovBot:
                     self.current_ask_price = new_ask
                     self.current_ask_size = target_ask_size
                 else:
+                    self._last_order_error_time = time.time()
                     self.current_ask_price = None
                     self.current_ask_size = None
 
@@ -621,6 +688,12 @@ class AvellanedaStoikovBot:
                 self.current_ask_id = None
                 self.current_ask_price = None
                 self.current_ask_size = None
+
+        # Actively sweep any resting orders on the exchange for this market ticker
+        try:
+            await self.om.reconcile_resting_orders(ticker=self.ticker)
+        except Exception as e_rec:
+            logger.debug(f"Exchange resting order sweep skipped during quote withdrawal: {e_rec}")
 
         return all_cancelled
 
@@ -717,6 +790,10 @@ class AvellanedaStoikovBot:
 
         # 1. Withdraw all active quotes on the previous ticker and ensure no active orders remain
         quotes_cancelled = await self._cancel_all_quotes()
+        try:
+            await self.om.reconcile_resting_orders(ticker=old_ticker)
+        except Exception as e_rec:
+            logger.debug(f"Exchange resting order sweep skipped during market rotation: {e_rec}")
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
             logger.error(
