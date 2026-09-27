@@ -309,41 +309,100 @@ class InventoryManager:
             logger.warning(f"Dropping fill with invalid action/side ({action_raw!r}, {side_raw!r}): {fill_msg}")
             return
 
-        # 3. Validate count (must be positive integer, not boolean)
-        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
-            logger.warning(f"Dropping fill with invalid count ({count!r}): {fill_msg}")
+        # 3. Validate and parse count (supports vendor count_fp string/float or legacy count)
+        raw_count = fill_msg.get("count_fp") if fill_msg.get("count_fp") is not None else fill_msg.get("count")
+        if raw_count is None or isinstance(raw_count, bool):
+            logger.warning(f"Dropping fill with missing count: {fill_msg}")
             return
 
-        # Resolve fill execution price from generic 'price' or vendor side-specific fields ('yes_price' / 'no_price')
-        price = fill_msg.get("price")
-        if price is None:
-            if side == "yes":
-                if fill_msg.get("yes_price") is not None:
-                    price = fill_msg.get("yes_price")
-                elif fill_msg.get("no_price") is not None:
-                    opp = fill_msg.get("no_price")
-                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
-            elif side == "no":
-                if fill_msg.get("no_price") is not None:
-                    price = fill_msg.get("no_price")
-                elif fill_msg.get("yes_price") is not None:
-                    opp = fill_msg.get("yes_price")
-                    price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
+        try:
+            count_f = float(raw_count)
+        except (TypeError, ValueError):
+            logger.warning(f"Dropping fill with non-numeric count ({raw_count!r}): {fill_msg}")
+            return
 
-        # 4. Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
+        if not math.isfinite(count_f) or count_f <= 0:
+            logger.warning(f"Dropping fill with invalid count ({raw_count!r}): {fill_msg}")
+            return
+
+        count = int(count_f) if count_f.is_integer() else round(count_f, 4)
+
+        # 4. Resolve fill execution price from vendor dollar fields, generic price, or side-specific fields
+        # Vendor WebSocket v2 provides yes_price_dollars / no_price_dollars as decimal dollar strings (e.g. "0.8700")
+        price = None
+        if side == "yes":
+            if fill_msg.get("yes_price_dollars") is not None:
+                try:
+                    price = round(float(fill_msg["yes_price_dollars"]) * 100.0, 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("no_price_dollars") is not None:
+                try:
+                    price = round(100.0 - (float(fill_msg["no_price_dollars"]) * 100.0), 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("price_dollars") is not None:
+                try:
+                    price = round(float(fill_msg["price_dollars"]) * 100.0, 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("price") is not None:
+                price = fill_msg.get("price")
+            elif fill_msg.get("yes_price") is not None:
+                price = fill_msg.get("yes_price")
+            elif fill_msg.get("no_price") is not None:
+                opp = fill_msg.get("no_price")
+                price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
+        elif side == "no":
+            if fill_msg.get("no_price_dollars") is not None:
+                try:
+                    price = round(float(fill_msg["no_price_dollars"]) * 100.0, 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("yes_price_dollars") is not None:
+                try:
+                    price = round(100.0 - (float(fill_msg["yes_price_dollars"]) * 100.0), 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("price_dollars") is not None:
+                try:
+                    price = round(float(fill_msg["price_dollars"]) * 100.0, 4)
+                except (TypeError, ValueError):
+                    pass
+            elif fill_msg.get("price") is not None:
+                price = fill_msg.get("price")
+            elif fill_msg.get("no_price") is not None:
+                price = fill_msg.get("no_price")
+            elif fill_msg.get("yes_price") is not None:
+                opp = fill_msg.get("yes_price")
+                price = round(100.0 - opp, 4) if isinstance(opp, (int, float)) and not isinstance(opp, bool) and math.isfinite(opp) else None
+
+        # Validate price (must be positive numeric in exchange range (0, 100) cents, not boolean, non-NaN/inf)
         if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0 or price >= 100 or math.isnan(price) or math.isinf(price):
             logger.warning(f"Dropping fill with invalid/out-of-range price ({price!r}): {fill_msg}")
             return
+        price = round(float(price), 4)
 
-        # 5. Parse and validate fee safely
-        fee_val = fill_msg.get("fee_cents", fill_msg.get("fee", 0.0))
-        try:
-            fee = float(fee_val)
-            if fee < 0.0 or math.isnan(fee) or math.isinf(fee):
-                logger.warning(f"Dropping fill with invalid fee ({fee_val!r}): {fill_msg}")
-                return
-        except (TypeError, ValueError):
-            logger.warning(f"Dropping fill with non-numeric fee ({fee_val!r}): {fill_msg}")
+        # 5. Parse and validate fee safely (supports vendor fee_cost in dollars, fee_cents, or legacy fee in cents)
+        if fill_msg.get("fee_cost") is not None:
+            try:
+                fee = round(float(fill_msg["fee_cost"]) * 100.0, 4)
+            except (TypeError, ValueError):
+                fee = None
+        elif fill_msg.get("fee_dollars") is not None:
+            try:
+                fee = round(float(fill_msg["fee_dollars"]) * 100.0, 4)
+            except (TypeError, ValueError):
+                fee = None
+        else:
+            fee_val = fill_msg.get("fee_cents", fill_msg.get("fee", 0.0))
+            try:
+                fee = round(float(fee_val), 4)
+            except (TypeError, ValueError):
+                fee = None
+
+        if fee is None or fee < 0.0 or math.isnan(fee) or math.isinf(fee):
+            logger.warning(f"Dropping fill with invalid fee: {fill_msg}")
             return
 
         # All preconditions validated; state mutation and counter increment can now safely occur
@@ -358,17 +417,15 @@ class InventoryManager:
             
         # Update positions
         # Standard convention: + for 'yes' shares, - for 'no' shares (or tracked separately)
-        # Kalshi usually tracks them as positive positions of the specific side.
-        # Assuming our simple market maker focuses on 'yes' contracts (or tracks them neutrally as 'yes' equivalents):
-        # Let's track the actual balance of shares as reported by Kalshi portfolio (usually positive integer).
-        # We will assume position is net 'yes' shares where + is YES and - is NO.
+        # We assume position is net 'yes' shares where + is YES and - is NO.
         delta = count if action == "buy" else -count
         
         if side == "no":
             delta = -delta # buying NO is equivalent to selling YES from a risk perspective
             
         current_pos = self.positions.get(ticker, 0)
-        self.positions[ticker] = current_pos + delta
+        new_pos = round(current_pos + delta, 4)
+        self.positions[ticker] = int(new_pos) if new_pos.is_integer() else new_pos
         
         # Track Realized and Unrealized PnL via FIFO lot matching
         pnl_impact = self.pnl_tracker.record_fill(
