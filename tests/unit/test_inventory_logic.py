@@ -8,7 +8,7 @@ class to maintain an accurate local record of:
 """
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from data.inventory_manager import InventoryManager
 
 def test_inventory_buy_yes_fill():
@@ -232,4 +232,43 @@ def test_inventory_v2_no_price_dollars_conversion():
     summary = manager.pnl_tracker.get_market_summary(ticker)
     assert summary["net_inventory"] == -5
     assert summary["total_fees_cents"] == 1.0
+
+
+def test_portfolio_value_and_positions_value_telemetry():
+    """
+    Verify portfolio value (Cash + Positions Value) accurately tracks Kalshi API
+    and live orderbook mark-to-market across state transitions.
+    """
+    from utils.metrics import KALSHI_PORTFOLIO_VALUE_CENTS, KALSHI_POSITIONS_VALUE_CENTS
+
+    mock_client = MagicMock()
+    manager = InventoryManager(mock_client)
+    ticker = "KXNFLGAME-26SEP27KCMIA-KC"
+
+    # 1. Simulate REST balance response matching user's exact screenshot ($12.07 cash, $6.12 positions = $18.19 total)
+    mock_balance_response = MagicMock()
+    mock_balance_response.status_code = 200
+    mock_balance_response.json.return_value = {
+        "balance": 1207,
+        "portfolio_value": 612,
+    }
+
+    with patch("data.inventory_manager.requests.get", return_value=mock_balance_response):
+        bal = manager._fetch_balance()
+        assert bal == 1207
+        assert manager.positions_value_cents == 612.0
+
+    manager.balance_cents = 1207.0
+    manager.positions = {ticker: 10}
+
+    # 2. Update orderbook mid price to 85c: 10 YES contracts @ 85c = 850c positions value
+    manager.update_orderbook_mid(ticker, 85.0)
+
+    assert manager.get_positions_value(ticker) == 850.0
+    # Total Portfolio Value = $12.07 cash (1207c) + $8.50 positions (850c) = $20.57 (2057c)
+    assert manager.get_portfolio_value(ticker) == 2057.0
+
+    assert KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker)._value.get() == 850.0
+    assert KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker)._value.get() == 2057.0
+
 

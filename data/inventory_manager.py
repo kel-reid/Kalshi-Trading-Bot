@@ -24,7 +24,9 @@ from utils.metrics import (
     KALSHI_REALIZED_PNL_CENTS,
     KALSHI_UNREALIZED_PNL_CENTS,
     KALSHI_FEES_PAID_CENTS,
-    KALSHI_ROUND_TRIPS_TOTAL
+    KALSHI_ROUND_TRIPS_TOTAL,
+    KALSHI_PORTFOLIO_VALUE_CENTS,
+    KALSHI_POSITIONS_VALUE_CENTS,
 )
 from data.pnl_tracker import PnLTracker
 
@@ -39,6 +41,8 @@ class InventoryManager:
     def __init__(self, ws_client, pnl_tracker: Optional[PnLTracker] = None):
         self.ws_client = ws_client
         self.balance_cents: float = 0.0
+        self.positions_value_cents: float = 0.0
+        self._last_mid_prices: Dict[str, float] = {}
         # self.positions[ticker] = position_size (positive means net 'yes', negative means net 'no' or just track absolute shares)
         # Kalshi usually tracks 'position' as an integer of contracts.
         self.positions: Dict[str, int] = {}
@@ -63,6 +67,9 @@ class InventoryManager:
                 if not math.isfinite(data["balance"]):
                     logger.error(f"Balance response contains non-finite balance: {data['balance']}")
                     return None
+                pv = data.get("portfolio_value")
+                if isinstance(pv, (int, float)) and not isinstance(pv, bool) and math.isfinite(pv):
+                    self.positions_value_cents = float(pv)
                 return int(round(data["balance"]))
             logger.error(f"Balance response missing or invalid 'balance' field: {data}")
             return None
@@ -186,6 +193,8 @@ class InventoryManager:
                 KALSHI_REALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_realized_pnl(t))
                 KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=t).set(self.pnl_tracker.get_unrealized_pnl(t))
                 KALSHI_FEES_PAID_CENTS.labels(ticker=t).set(self.pnl_tracker.get_total_fees(t))
+                KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=t).set(self.get_portfolio_value(t))
+                KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=t).set(self.get_positions_value(t))
             except Exception as e:
                 logger.debug(f"Prometheus metric update skipped for {t}: {e}")
 
@@ -444,6 +453,8 @@ class InventoryManager:
             KALSHI_REALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_realized_pnl(ticker))
             KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_unrealized_pnl(ticker))
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
+            KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker).set(self.get_portfolio_value(ticker))
+            KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
 
             for outcome in pnl_impact.get("matched_outcomes", []):
                 KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
@@ -460,12 +471,39 @@ class InventoryManager:
         Updates mark-to-market unrealized PnL against current mid price
         and emits Prometheus telemetry.
         """
+        self._last_mid_prices[ticker] = float(mid_price)
         unrealized = self.pnl_tracker.update_mid_price(ticker, mid_price)
         try:
             KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=ticker).set(unrealized)
+            KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
+            KALSHI_PORTFOLIO_VALUE_CENTS.labels(ticker=ticker).set(self.get_portfolio_value(ticker))
         except Exception as e:
-            logger.debug(f"Prometheus unrealized metric update skipped: {e}")
+            logger.debug(f"Prometheus unrealized/portfolio metric update skipped: {e}")
         return unrealized
+
+    def get_positions_value(self, ticker: Optional[str] = None) -> float:
+        """
+        Returns estimated market value of open positions in cents.
+        If a ticker is specified and has a known mid-price, computes live mark-to-market.
+        Otherwise falls back to the REST portfolio_value or marked inventory across tickers.
+        """
+        if ticker and ticker in self.positions:
+            pos = self.positions[ticker]
+            mid = self._last_mid_prices.get(ticker)
+            if mid is not None:
+                if pos > 0:
+                    return round(pos * mid, 4)
+                elif pos < 0:
+                    return round(abs(pos) * (100.0 - mid), 4)
+                return 0.0
+        # If no positions are held, positions value is 0.0
+        if not self.positions or all(v == 0 for v in self.positions.values()):
+            return 0.0
+        return self.positions_value_cents
+
+    def get_portfolio_value(self, ticker: Optional[str] = None) -> float:
+        """Returns total portfolio value in cents (cash balance plus open positions market value)."""
+        return round(self.balance_cents + self.get_positions_value(ticker), 4)
 
     def get_realized_pnl(self, ticker: str) -> float:
         """Returns cumulative realized PnL in cents for a ticker."""
