@@ -53,6 +53,16 @@ KALSHI_FEES_PAID_CENTS = Gauge(
     "Total exchange fees paid in cents",
     ["ticker"]
 )
+KALSHI_PORTFOLIO_VALUE_CENTS = Gauge(
+    "kalshi_portfolio_value_cents",
+    "Total portfolio value in cents (cash balance plus open positions market value)",
+    ["ticker"]
+)
+KALSHI_POSITIONS_VALUE_CENTS = Gauge(
+    "kalshi_positions_value_cents",
+    "Live mark-to-market value of open contract positions in cents",
+    ["ticker"]
+)
 KALSHI_ROUND_TRIPS_TOTAL = Counter(
     "kalshi_round_trips_total",
     "Total count of completed round-trip trades",
