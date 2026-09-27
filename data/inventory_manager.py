@@ -109,8 +109,8 @@ class InventoryManager:
                         return None
                     try:
                         pos_float = float(pos_val)
-                        if not math.isfinite(pos_float) or not pos_float.is_integer():
-                            logger.error(f"Positions response contains non-finite or non-integral position: {entry}")
+                        if not math.isfinite(pos_float):
+                            logger.error(f"Positions response contains non-finite position: {entry}")
                             return None
                     except (ValueError, TypeError):
                         logger.error(f"Positions response contains non-numeric position: {entry}")
@@ -145,10 +145,10 @@ class InventoryManager:
                 return False
             try:
                 pos_float = float(pos_val)
-                if not math.isfinite(pos_float) or not pos_float.is_integer():
-                    logger.error(f"Malformed non-finite or non-integral position value ({pos_val!r}) for {ticker}: {pos}")
+                if not math.isfinite(pos_float):
+                    logger.error(f"Malformed non-finite position value ({pos_val!r}) for {ticker}: {pos}")
                     return False
-                position = int(pos_float)
+                position = int(pos_float) if pos_float.is_integer() else round(pos_float, 4)
             except (ValueError, TypeError):
                 logger.error(f"Malformed position value ({pos_val!r}) for {ticker}: {pos}")
                 return False

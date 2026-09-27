@@ -1549,19 +1549,29 @@ class TestMarketMakerPnLLifecycle:
         # Cost: 5 * 60c + 1.5c fee = 301.5c -> balance = 9549.0 - 301.5 = 9247.5
         assert im.balance_cents == 9247.5
 
-    def test_fetch_and_apply_positions_rejects_non_integral_positions(self):
-        """Verify _fetch_positions and _apply_positions reject non-integral position values instead of truncating."""
+    def test_fetch_and_apply_positions_supports_fractional_and_integral_positions(self):
+        """Verify _fetch_positions and _apply_positions parse both fractional and integral position values accurately."""
         im = InventoryManager(ws_client=MagicMock())
 
-        # 1. _fetch_positions rejects fractional position string or float
+        # 1. _fetch_positions accepts fractional and integral positions
         mock_resp_frac1 = MagicMock(status_code=200)
         mock_resp_frac1.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position": "1.5"}]}
         with patch("requests.get", return_value=mock_resp_frac1):
-            assert im._fetch_positions() is None
+            pos_list = im._fetch_positions()
+            assert pos_list is not None
+            assert pos_list[0]["position"] == "1.5"
 
         mock_resp_frac2 = MagicMock(status_code=200)
-        mock_resp_frac2.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position_fp": 2.7}]}
+        mock_resp_frac2.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC2", "position_fp": "1.69"}]}
         with patch("requests.get", return_value=mock_resp_frac2):
+            pos_list = im._fetch_positions()
+            assert pos_list is not None
+            assert pos_list[0]["position_fp"] == "1.69"
+
+        # Rejects non-finite positions
+        mock_resp_nan = MagicMock(status_code=200)
+        mock_resp_nan.json.return_value = {"market_positions": [{"ticker": "KXTEST-NAN", "position": "nan"}]}
+        with patch("requests.get", return_value=mock_resp_nan):
             assert im._fetch_positions() is None
 
         # Integral float (e.g. 5.0) is accepted
@@ -1573,11 +1583,17 @@ class TestMarketMakerPnLLifecycle:
             assert len(pos_list) == 1
             assert pos_list[0]["ticker"] == "KXTEST-INT"
 
-        # 2. _apply_positions rejects fractional position values
-        assert im._apply_positions([{"ticker": "KXTEST-FRAC-1", "position": "3.5"}]) is False
-        assert im._apply_positions([{"ticker": "KXTEST-FRAC-2", "position": 4.2}]) is False
+        # 2. _apply_positions parses fractional and integral positions
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-1", "position": "3.5"}]) is True
+        assert im.get_position("KXTEST-FRAC-1") == 3.5
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-2", "position_fp": "1.69"}]) is True
+        assert im.get_position("KXTEST-FRAC-2") == 1.69
         assert im._apply_positions([{"ticker": "KXTEST-INT-OK", "position": 4.0}]) is True
         assert im.get_position("KXTEST-INT-OK") == 4
+        assert isinstance(im.get_position("KXTEST-INT-OK"), int)
+
+        # Rejects non-finite position values
+        assert im._apply_positions([{"ticker": "KXTEST-INF", "position": float("inf")}]) is False
 
     @pytest.mark.asyncio
     async def test_rotate_market_escalates_to_kill_switch_when_active_orders_remain(self):
