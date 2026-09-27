@@ -481,29 +481,40 @@ class InventoryManager:
             logger.debug(f"Prometheus unrealized/portfolio metric update skipped: {e}")
         return unrealized
 
+    def _ticker_value(self, ticker: str) -> Optional[float]:
+        """Calculates live mark-to-market value in cents for a single ticker's inventory."""
+        pos = self.positions.get(ticker, 0)
+        mid = self._last_mid_prices.get(ticker)
+        if pos == 0:
+            return 0.0
+        if mid is None:
+            return None
+        return round(pos * mid, 4) if pos > 0 else round(abs(pos) * (100.0 - mid), 4)
+
     def get_positions_value(self, ticker: Optional[str] = None) -> float:
         """
         Returns estimated market value of open positions in cents.
         If a ticker is specified and has a known mid-price, computes live mark-to-market.
         Otherwise falls back to the REST portfolio_value or marked inventory across tickers.
         """
-        if ticker and ticker in self.positions:
-            pos = self.positions[ticker]
-            mid = self._last_mid_prices.get(ticker)
-            if mid is not None:
-                if pos > 0:
-                    return round(pos * mid, 4)
-                elif pos < 0:
-                    return round(abs(pos) * (100.0 - mid), 4)
-                return 0.0
-        # If no positions are held, positions value is 0.0
+        if ticker:
+            val = self._ticker_value(ticker)
+            if val is not None:
+                return val
+            return 0.0
+
+        # If no positions are held across any ticker, positions value is 0.0
         if not self.positions or all(v == 0 for v in self.positions.values()):
             return 0.0
-        return self.positions_value_cents
+
+        vals = [self._ticker_value(t) for t in self.positions]
+        if any(v is None for v in vals):
+            return self.positions_value_cents
+        return round(sum(vals), 4)
 
     def get_portfolio_value(self, ticker: Optional[str] = None) -> float:
         """Returns total portfolio value in cents (cash balance plus open positions market value)."""
-        return round(self.balance_cents + self.get_positions_value(ticker), 4)
+        return round(self.balance_cents + self.get_positions_value(), 4)
 
     def get_realized_pnl(self, ticker: str) -> float:
         """Returns cumulative realized PnL in cents for a ticker."""

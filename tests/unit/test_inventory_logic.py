@@ -9,7 +9,7 @@ class to maintain an accurate local record of:
 
 import pytest
 from unittest.mock import MagicMock, patch
-from data.inventory_manager import InventoryManager
+from data.inventory_manager import InventoryManager, KALSHI_PORTFOLIO_VALUE_CENTS
 
 def test_inventory_buy_yes_fill():
     """Buying YES contracts should reduce balance and increase position."""
@@ -270,5 +270,35 @@ def test_portfolio_value_and_positions_value_telemetry():
 
     assert KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker)._value.get() == 850.0
     assert KALSHI_PORTFOLIO_VALUE_CENTS._value.get() == 2057.0
+
+
+def test_multi_ticker_portfolio_value_aggregation():
+    """Verify get_portfolio_value aggregates across multiple open positions."""
+    mock_ws = MagicMock()
+    manager = InventoryManager(mock_ws)
+    manager.balance_cents = 1000.0
+
+    manager.positions = {
+        "TICKER-A": 10,
+        "TICKER-B": -5,
+        "TICKER-C": 0,
+    }
+
+    # Update mid prices:
+    # TICKER-A: 10 * 60c = 600c
+    # TICKER-B: 5 * (100 - 30) = 350c
+    manager.update_orderbook_mid("TICKER-A", 60.0)
+    manager.update_orderbook_mid("TICKER-B", 30.0)
+
+    assert manager.get_positions_value("TICKER-A") == 600.0
+    assert manager.get_positions_value("TICKER-B") == 350.0
+    assert manager.get_positions_value("TICKER-C") == 0.0
+    assert manager.get_positions_value("UNKNOWN") == 0.0
+
+    # Total positions value = 600 + 350 = 950c
+    assert manager.get_positions_value() == 950.0
+    # Total portfolio value = 1000 cash + 950 positions = 1950c
+    assert manager.get_portfolio_value() == 1950.0
+    assert KALSHI_PORTFOLIO_VALUE_CENTS._value.get() == 1950.0
 
 

@@ -397,6 +397,12 @@ class AvellanedaStoikovBot:
             self._background_tasks.add(rec_task)
             rec_task.add_done_callback(self._background_tasks.discard)
 
+        # 3. Determine dynamic quote size and hedge threshold for current market price
+        quote_size = self.calculate_order_size(mid_price)
+        self._current_quote_size = quote_size
+        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
+
         # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
         pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
         session_fees = pnl_summary.get("total_fees_cents", 0.0)
@@ -407,14 +413,41 @@ class AvellanedaStoikovBot:
             logger.warning(
                 f"[{reason.upper()} TRIGGERED] Market {self.ticker} session metrics: "
                 f"fees={session_fees:.1f}c (limit: {self.max_session_fees_cents}c), "
-                f"net_pnl={session_net_pnl:.1f}c (loss limit: -{self.max_session_loss_cents}c). "
-                f"Ceasing quoting and rotating market."
+                f"net_pnl={session_net_pnl:.1f}c (loss limit: -{self.max_session_loss_cents}c)."
             )
             try:
                 SAFEGUARD_EVENTS_TOTAL.labels(safeguard=reason, ticker=self.ticker).inc()
             except Exception as e_metric:
                 logger.debug(f"Safeguard metric update failed: {e_metric}")
 
+            # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
+            if abs(inventory) >= hedge_threshold:
+                if inventory >= hedge_threshold:
+                    logger.warning(
+                        f"[{reason.upper()} - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
+                        f"Halting BIDs, crossing ASKs to exit."
+                    )
+                    optimal_bid = None
+                    optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                else:
+                    logger.warning(
+                        f"[{reason.upper()} - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
+                        f"Halting ASKs, crossing BIDs to exit."
+                    )
+                    optimal_ask = None
+                    optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+
+                realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+                unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                logger.info(
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"→ Bid={optimal_bid}c  Ask={optimal_ask}c ({reason} Hedged) | "
+                    f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
+                )
+                await self._update_quotes(optimal_bid, optimal_ask)
+                return
+
+            # Otherwise (inventory below hedge threshold), cancel all active quotes and rotate/quiesce.
             await self._cancel_all_quotes()
             if self.auto_rotate:
                 replacement = await discover_active_market_async(
@@ -437,12 +470,6 @@ class AvellanedaStoikovBot:
             else:
                 self._market_inactive = True
             return
-
-        # 3. Determine dynamic quote size and hedge threshold for current market price
-        quote_size = self.calculate_order_size(mid_price)
-        self._current_quote_size = quote_size
-        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
-        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
 
         # 2a. Extreme Price Collar Safeguard:
         # If orderbook midpoint drifts outside [min_mid_price, max_mid_price]:

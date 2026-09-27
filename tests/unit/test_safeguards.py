@@ -471,6 +471,47 @@ class TestSessionRiskSafeguards:
         bot.rotate_market.assert_called_once_with("KXREPLACEMENT-TICKER")
 
     @pytest.mark.asyncio
+    async def test_session_stop_loss_with_inventory_executes_exit_hedge_only(self, monkeypatch):
+        """When net session PnL breaches max_session_loss_cents with high inventory, exit hedge runs before rotation."""
+        ticker = "KXLOSS-HEDGE-TICKER"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            auto_rotate=True,
+            max_session_loss_cents=200,
+            max_hedge_inventory=10,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.rotate_market = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        # Inventory = 15 (high long inventory >= hedge_threshold 10)
+        bot.inv_manager.get_position = MagicMock(return_value=15)
+        bot.inv_manager.pnl_tracker.get_realized_pnl = MagicMock(return_value=-200.0)
+        bot.inv_manager.pnl_tracker.get_unrealized_pnl = MagicMock(return_value=-50.0)
+
+        # Net loss is -250c (exceeds -200c stop-loss limit)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": -200.0,
+            "unrealized_pnl_cents": -50.0,
+            "total_fees_cents": 20.0,
+        })
+
+        monkeypatch.setattr(
+            "strategy.market_maker.discover_active_market_async",
+            AsyncMock(return_value="KXREPLACEMENT-TICKER")
+        )
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_not_called()
+        bot.rotate_market.assert_not_called()
+        bot._update_quotes.assert_called_once_with(None, 48)
+
+    @pytest.mark.asyncio
     async def test_order_placement_failure_initiates_cooldown(self):
         """When place_order fails, placement is throttled during the cooldown window."""
         ticker = "KXCOOLDOWN-TICKER"
