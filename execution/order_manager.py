@@ -386,8 +386,8 @@ class OrderManager:
                     else:
                         # We lacked a verified kalshi_order_id; 404 indicates Kalshi rejected client_order_id.
                         logger.warning(f"DELETE 404 for unverified order {order_id}; reconciling resting orders...")
-                        await self.reconcile_resting_orders()
                         self.active_orders.pop(client_order_id, None)
+                        await self.reconcile_resting_orders()
                         self._update_db_order_status(client_order_id, "reconciled_after_404")
                         return True
                 elif response.status_code == 429:
@@ -505,6 +505,8 @@ class OrderManager:
                     oid = order.get("order_id")
                     cid = order.get("client_order_id")
                     order_ticker = order.get("ticker")
+                    if not oid:
+                        continue
                     if ticker and order_ticker != ticker:
                         continue
                     
