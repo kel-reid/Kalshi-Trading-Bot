@@ -82,6 +82,7 @@ async def test_cancel_all_quotes_preserves_failed_order_ids():
     bot.current_ask_id = "ask-1"
     bot.current_ask_price = 55
     bot.om.cancel_order = AsyncMock(side_effect=[False, True])
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
 
     cancelled = await bot._cancel_all_quotes()
 
@@ -90,6 +91,35 @@ async def test_cancel_all_quotes_preserves_failed_order_ids():
     assert bot.current_bid_price == 45
     assert bot.current_ask_id is None
     assert bot.current_ask_price is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_quotes_sweeps_exchange_even_when_no_tracked_quotes():
+    """Verify that _cancel_all_quotes executes resting-order sweep even when no quotes are tracked locally."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.current_bid_id = None
+    bot.current_ask_id = None
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
+    cancelled = await bot._cancel_all_quotes()
+
+    assert cancelled is True
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="MOCK_TICKER")
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_quotes_returns_false_when_reconciliation_fails():
+    """Verify that _cancel_all_quotes returns False if resting-order reconciliation fails."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.current_bid_id = "bid-1"
+    bot.current_ask_id = "ask-1"
+    bot.om.cancel_order = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=None)
+
+    cancelled = await bot._cancel_all_quotes()
+
+    assert cancelled is False
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="MOCK_TICKER")
 
 
 @pytest.mark.asyncio
