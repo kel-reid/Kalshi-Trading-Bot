@@ -17,11 +17,14 @@ async def test_bot_rotate_market():
     bot.ob_manager.unsubscribe = AsyncMock()
     bot.ob_manager.subscribe = AsyncMock()
 
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
         rotated = await bot.rotate_market("NEW-TICKER")
 
         assert rotated is True
         bot._cancel_all_quotes.assert_awaited_once()
+        bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="OLD-TICKER")
         bot.ob_manager.unsubscribe.assert_awaited_once_with(["OLD-TICKER"])
         bot.ob_manager.subscribe.assert_awaited_once_with(["NEW-TICKER"])
         assert bot.ticker == "NEW-TICKER"
@@ -42,6 +45,29 @@ async def test_bot_rotate_market_aborts_when_quote_cancel_fails():
 
     assert rotated is False
     assert bot.ticker == "OLD-TICKER"
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    mock_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bot_rotate_market_aborts_when_reconciliation_fails():
+    """Verify that rotate_market escalates to kill switch and aborts if resting-order reconciliation fails."""
+    bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=None)
+    bot._escalate_to_kill_switch = AsyncMock(return_value=False)
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+        rotated = await bot.rotate_market("NEW-TICKER")
+
+    assert rotated is False
+    assert bot.ticker == "OLD-TICKER"
+    bot._cancel_all_quotes.assert_awaited_once()
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="OLD-TICKER")
+    bot._escalate_to_kill_switch.assert_awaited_once()
     bot.ob_manager.unsubscribe.assert_not_awaited()
     bot.ob_manager.subscribe.assert_not_awaited()
     mock_alert.assert_not_awaited()
