@@ -236,6 +236,39 @@ class TestSessionAttributionAndRotation:
         assert s2 != s1
         assert tracker.get_or_create_market(ticker).rotation_session_id == s2
 
+    def test_rotation_session_resets_session_fees_and_realized_deltas(self):
+        """Resetting market session resets session_fees_cents and session_realized_pnl_cents to zero while preserving cumulatives."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-26SEP-FEES-ROT"
+
+        # Trade 1 in session 1: Buy 10 @ 40c, fee = 15c
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=40, fee_cents=15.0)
+        # Sell 10 @ 60c, fee = 15c -> Realized PnL = +200c, Total Fees = 30c
+        tracker.record_fill(ticker, action="sell", side="yes", count=10, price_cents=60, fee_cents=15.0)
+
+        s1_summary = tracker.get_market_summary(ticker)
+        assert s1_summary["realized_pnl_cents"] == 170.0  # (60 - 40) * 10 - 15 (entry fee) - 15 (exit fee)
+        assert s1_summary["total_fees_cents"] == 30.0
+        assert s1_summary["session_realized_pnl_cents"] == 170.0
+        assert s1_summary["session_fees_cents"] == 30.0
+
+        # Rotate away / reset session
+        tracker.reset_market_session(ticker)
+
+        s2_summary = tracker.get_market_summary(ticker)
+        # Cumulative totals are conserved
+        assert s2_summary["realized_pnl_cents"] == 170.0
+        assert s2_summary["total_fees_cents"] == 30.0
+        # Session deltas reset to 0
+        assert s2_summary["session_realized_pnl_cents"] == 0.0
+        assert s2_summary["session_fees_cents"] == 0.0
+
+        # Trade in session 2: Buy 5 @ 50c, fee = 10c
+        tracker.record_fill(ticker, action="buy", side="yes", count=5, price_cents=50, fee_cents=10.0)
+        s2_mid_summary = tracker.get_market_summary(ticker)
+        assert s2_mid_summary["total_fees_cents"] == 40.0
+        assert s2_mid_summary["session_fees_cents"] == 10.0
+
 
 class TestInventoryManagerPnLIntegration:
     """Verifies InventoryManager correctly integrates PnLTracker."""
