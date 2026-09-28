@@ -153,10 +153,11 @@ def fetch_eligible_markets(
             close_time_str = m.get("close_time") or m.get("expiration_time")
             if close_time_str:
                 close_dt = _parse_iso_timestamp(close_time_str)
-                if close_dt is not None:
-                    from config import MIN_TIME_TO_CLOSE_SECONDS
-                    if (close_dt - now_utc).total_seconds() <= MIN_TIME_TO_CLOSE_SECONDS:
-                        continue
+                if close_dt is None:
+                    continue
+                from config import MIN_TIME_TO_CLOSE_SECONDS
+                if (close_dt - now_utc).total_seconds() <= MIN_TIME_TO_CLOSE_SECONDS:
+                    continue
             if not _is_within_horizon(m, max_expiration_days, now_utc):
                 continue
             eligible.append(m)
@@ -291,20 +292,22 @@ def check_market_status(ticker: str) -> Optional[str]:
             close_time_str = market_info.get("close_time") or market_info.get("expiration_time")
             if close_time_str:
                 close_dt = _parse_iso_timestamp(close_time_str)
-                if close_dt is not None:
-                    import sys
-                    md = sys.modules.get("utils.market_discovery")
-                    dt_module = getattr(md, "datetime", datetime) if md else datetime
-                    now_utc = dt_module.datetime.now(datetime.timezone.utc)
-                    from config import MIN_TIME_TO_CLOSE_SECONDS
-                    remaining_sec = (close_dt - now_utc).total_seconds()
-                    if remaining_sec <= MIN_TIME_TO_CLOSE_SECONDS:
-                        logger.info(
-                            f"Market {ticker} is within expiration cutoff "
-                            f"({remaining_sec:.0f}s <= {MIN_TIME_TO_CLOSE_SECONDS}s, close_time: {close_time_str}); "
-                            f"treating as closed."
-                        )
-                        return "closed"
+                if close_dt is None:
+                    logger.warning(f"Market {ticker} has unparseable close_time ({close_time_str}); treating as closed.")
+                    return "closed"
+                import sys
+                md = sys.modules.get("utils.market_discovery")
+                dt_module = getattr(md, "datetime", datetime) if md else datetime
+                now_utc = dt_module.datetime.now(datetime.timezone.utc)
+                from config import MIN_TIME_TO_CLOSE_SECONDS
+                remaining_sec = (close_dt - now_utc).total_seconds()
+                if remaining_sec <= MIN_TIME_TO_CLOSE_SECONDS:
+                    logger.info(
+                        f"Market {ticker} is within expiration cutoff "
+                        f"({remaining_sec:.0f}s <= {MIN_TIME_TO_CLOSE_SECONDS}s, close_time: {close_time_str}); "
+                        f"treating as closed."
+                    )
+                    return "closed"
 
             return status
         logger.warning(f"Market status lookup for {ticker} returned HTTP {resp.status_code}")
