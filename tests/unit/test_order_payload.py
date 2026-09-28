@@ -8,6 +8,7 @@ conform to the Kalshi V2 API schema requirements, specifically:
 - Price is formatted as a fixed-point dollar string (e.g., "0.49").
 """
 
+import asyncio
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from execution.order_manager import OrderManager
@@ -352,5 +353,36 @@ class TestV2PayloadSchema:
 
             assert cancelled == 0
             order_manager._cancel_by_kalshi_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_acquires_rate_limiter_and_succeeds(self, order_manager):
+        """_cancel_by_kalshi_id acquires rate limiter token and cancels order successfully."""
+        mock_del = MagicMock(status_code=200)
+        order_manager._delete_request = MagicMock(return_value=mock_del)
+        order_manager._update_db_order_status = MagicMock()
+        order_manager.rate_limiter.acquire = AsyncMock()
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-1", "client-cid-1")
+
+        assert result is True
+        order_manager.rate_limiter.acquire.assert_awaited_once()
+        order_manager._update_db_order_status.assert_called_once_with("client-cid-1", "cancelled", kalshi_order_id="kalshi-oid-1")
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_retries_429_with_backoff(self, order_manager, monkeypatch):
+        """_cancel_by_kalshi_id retries upon receiving 429 and succeeds on next attempt."""
+        resp_429 = MagicMock(status_code=429)
+        resp_200 = MagicMock(status_code=200)
+        order_manager._delete_request = MagicMock(side_effect=[resp_429, resp_200])
+        order_manager.rate_limiter.acquire = AsyncMock()
+        mock_sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-2", None)
+
+        assert result is True
+        assert order_manager.rate_limiter.acquire.await_count == 2
+        mock_sleep.assert_awaited_once_with(1.0)
+
 
 
