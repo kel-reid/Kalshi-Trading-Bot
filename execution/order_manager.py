@@ -487,66 +487,80 @@ class OrderManager:
     ) -> Optional[int]:
         """
         Actively queries Kalshi for all resting orders on the exchange.
+        Follows cursor pagination to retrieve orders across all pages.
         Cancels any order resting on Kalshi that does not correspond to an active tracked order,
         or that matches target_client_order_id.
         Returns the count of orphaned orders cancelled on success, or None on failure.
         """
         sign_path = "/trade-api/v2/portfolio/orders"
-        query_params = {"status": "resting", "limit": 100}
-        if ticker:
-            query_params["ticker"] = ticker
-            
-        try:
-            await self.rate_limiter.acquire()
-            headers = get_auth_headers(method="GET", sign_path=sign_path)
-            with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
-                response = await asyncio.to_thread(
-                    requests.get,
-                    BASE_URL + sign_path,
-                    headers=headers,
-                    params=query_params,
-                    timeout=10,
-                    verify=certifi.where()
-                )
-            if response.status_code == 200:
-                orders_list = response.json().get("orders", [])
-                tracked_kalshi_ids = {
-                    v.get("kalshi_order_id") for v in self.active_orders.values() if v.get("kalshi_order_id")
-                }
-                tracked_client_ids = set(self.active_orders.keys())
-                
-                cancelled_count = 0
-                cancel_tasks = []
-                for order in orders_list:
-                    oid = order.get("order_id")
-                    cid = order.get("client_order_id")
-                    order_ticker = order.get("ticker")
-                    if not oid:
-                        continue
-                    if ticker and order_ticker != ticker:
-                        continue
-                    
-                    is_target = target_client_order_id and cid == target_client_order_id
-                    is_orphan = oid not in tracked_kalshi_ids and cid not in tracked_client_ids
+        cursor: Optional[str] = None
+        orders_list: List[Dict[str, Any]] = []
 
-                    if is_target or is_orphan:
-                        logger.warning(
-                            f"Reconciling {'target' if is_target else 'orphaned'} resting order on exchange: {oid} "
-                            f"(client_id: {cid}, ticker: {order_ticker})"
-                        )
-                        cancel_tasks.append(self._cancel_by_kalshi_id(oid, cid))
-                        cancelled_count += 1
-                        
-                if cancel_tasks:
-                    results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                    if any(result is not True for result in results):
-                        logger.error("Failed to cancel one or more orphaned resting orders during reconciliation.")
-                        return None
-                    logger.info(f"Reconciliation cancelled {cancelled_count} orphaned resting orders.")
-                return cancelled_count
-            else:
-                logger.error(f"Failed to fetch resting orders for reconciliation: {response.status_code} - {response.text}")
-                return None
+        try:
+            while True:
+                await self.rate_limiter.acquire()
+                headers = get_auth_headers(method="GET", sign_path=sign_path)
+                query_params = {"status": "resting", "limit": 100}
+                if ticker:
+                    query_params["ticker"] = ticker
+                if cursor:
+                    query_params["cursor"] = cursor
+
+                with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
+                    response = await asyncio.to_thread(
+                        requests.get,
+                        BASE_URL + sign_path,
+                        headers=headers,
+                        params=query_params,
+                        timeout=10,
+                        verify=certifi.where()
+                    )
+                if response.status_code != 200:
+                    logger.error(f"Failed to fetch resting orders for reconciliation: {response.status_code} - {response.text}")
+                    return None
+
+                data = response.json()
+                page_orders = data.get("orders", [])
+                orders_list.extend(page_orders)
+
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+
+            tracked_kalshi_ids = {
+                v.get("kalshi_order_id") for v in self.active_orders.values() if v.get("kalshi_order_id")
+            }
+            tracked_client_ids = set(self.active_orders.keys())
+            
+            cancelled_count = 0
+            cancel_tasks = []
+            for order in orders_list:
+                oid = order.get("order_id")
+                cid = order.get("client_order_id")
+                order_ticker = order.get("ticker")
+                if not oid:
+                    continue
+                if ticker and order_ticker != ticker:
+                    continue
+                
+                is_target = target_client_order_id and cid == target_client_order_id
+                is_orphan = oid not in tracked_kalshi_ids and cid not in tracked_client_ids
+
+                if is_target or is_orphan:
+                    logger.warning(
+                        f"Reconciling {'target' if is_target else 'orphaned'} resting order on exchange: {oid} "
+                        f"(client_id: {cid}, ticker: {order_ticker})"
+                    )
+                    cancel_tasks.append(self._cancel_by_kalshi_id(oid, cid))
+                    cancelled_count += 1
+                    
+            if cancel_tasks:
+                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                if any(result is not True for result in results):
+                    logger.error("Failed to cancel one or more orphaned resting orders during reconciliation.")
+                    return None
+                logger.info(f"Reconciliation cancelled {cancelled_count} orphaned resting orders.")
+            return cancelled_count
         except Exception as e:
             logger.error(f"Error during resting order reconciliation: {e}")
             return None

@@ -690,37 +690,40 @@ class AvellanedaStoikovBot:
             tasks.append(self.om.cancel_order(self.current_ask_id))
             cancel_targets.append(("ask", self.current_ask_id))
              
-        if not tasks:
-            return True
-
-        logger.info("Withdrawing quotes...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
         all_cancelled = True
 
-        for (side, order_id), result in zip(cancel_targets, results):
-            if isinstance(result, Exception):
-                logger.error(f"Failed to cancel {side} quote {order_id}: {result}")
-                all_cancelled = False
-                continue
-            if result is not True:
-                logger.error(f"Failed to cancel {side} quote {order_id}.")
-                all_cancelled = False
-                continue
+        if tasks:
+            logger.info("Withdrawing quotes...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if side == "bid":
-                self.current_bid_id = None
-                self.current_bid_price = None
-                self.current_bid_size = None
-            else:
-                self.current_ask_id = None
-                self.current_ask_price = None
-                self.current_ask_size = None
+            for (side, order_id), result in zip(cancel_targets, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to cancel {side} quote {order_id}: {result}")
+                    all_cancelled = False
+                    continue
+                if result is not True:
+                    logger.error(f"Failed to cancel {side} quote {order_id}.")
+                    all_cancelled = False
+                    continue
+
+                if side == "bid":
+                    self.current_bid_id = None
+                    self.current_bid_price = None
+                    self.current_bid_size = None
+                else:
+                    self.current_ask_id = None
+                    self.current_ask_price = None
+                    self.current_ask_size = None
 
         # Actively sweep any resting orders on the exchange for this market ticker
         try:
-            await self.om.reconcile_resting_orders(ticker=self.ticker)
+            recon_res = await self.om.reconcile_resting_orders(ticker=self.ticker)
+            if recon_res is None:
+                logger.error(f"Resting-order reconciliation failed for {self.ticker} during quote withdrawal.")
+                all_cancelled = False
         except Exception as e_rec:
-            logger.debug(f"Exchange resting order sweep skipped during quote withdrawal: {e_rec}")
+            logger.error(f"Exchange resting order sweep failed during quote withdrawal: {e_rec}")
+            all_cancelled = False
 
         return all_cancelled
 

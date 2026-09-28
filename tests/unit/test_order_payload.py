@@ -271,3 +271,46 @@ class TestV2PayloadSchema:
         order_manager.reconcile_resting_orders.assert_awaited_once_with(target_client_order_id=cid)
         order_manager._update_db_order_status.assert_called_once_with(cid, "reconciled_after_404")
 
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_follows_cursor_pagination(self, order_manager):
+        """Verify reconcile_resting_orders paginates using cursor across multiple pages."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "orders": [{"order_id": "p1-orphan", "client_order_id": "p1-cid", "ticker": "T1"}],
+            "cursor": "cursor_for_page2",
+        }
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {
+            "orders": [{"order_id": "p2-orphan", "client_order_id": "p2-cid", "ticker": "T1"}],
+            "cursor": None,
+        }
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]) as mock_get:
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="T1")
+
+            assert cancelled == 2
+            assert mock_get.call_count == 2
+            # Check params of second call contains cursor
+            assert mock_get.call_args_list[0][1]["params"].get("cursor") is None
+            assert mock_get.call_args_list[1][1]["params"].get("cursor") == "cursor_for_page2"
+            assert order_manager._cancel_by_kalshi_id.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_returns_none_if_subsequent_page_fails(self, order_manager):
+        """Verify reconcile_resting_orders returns None if any subsequent paginated request fails."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "orders": [{"order_id": "p1-orphan", "client_order_id": "p1-cid", "ticker": "T1"}],
+            "cursor": "cursor_for_page2",
+        }
+        page2 = MagicMock(status_code=500, text="Internal Error")
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="T1")
+
+            assert cancelled is None
+            # Must not execute any orphan cancellations from partial pages
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
