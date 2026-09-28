@@ -17,11 +17,14 @@ async def test_bot_rotate_market():
     bot.ob_manager.unsubscribe = AsyncMock()
     bot.ob_manager.subscribe = AsyncMock()
 
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
         rotated = await bot.rotate_market("NEW-TICKER")
 
         assert rotated is True
         bot._cancel_all_quotes.assert_awaited_once()
+        bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="OLD-TICKER")
         bot.ob_manager.unsubscribe.assert_awaited_once_with(["OLD-TICKER"])
         bot.ob_manager.subscribe.assert_awaited_once_with(["NEW-TICKER"])
         assert bot.ticker == "NEW-TICKER"
@@ -48,6 +51,29 @@ async def test_bot_rotate_market_aborts_when_quote_cancel_fails():
 
 
 @pytest.mark.asyncio
+async def test_bot_rotate_market_aborts_when_reconciliation_fails():
+    """Verify that rotate_market escalates to kill switch and aborts if resting-order reconciliation fails."""
+    bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=None)
+    bot._escalate_to_kill_switch = AsyncMock(return_value=False)
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+        rotated = await bot.rotate_market("NEW-TICKER")
+
+    assert rotated is False
+    assert bot.ticker == "OLD-TICKER"
+    bot._cancel_all_quotes.assert_awaited_once()
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="OLD-TICKER")
+    bot._escalate_to_kill_switch.assert_awaited_once()
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    mock_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cancel_all_quotes_preserves_failed_order_ids():
     """Verify that only successfully cancelled orders have their state cleared."""
     bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
@@ -56,6 +82,7 @@ async def test_cancel_all_quotes_preserves_failed_order_ids():
     bot.current_ask_id = "ask-1"
     bot.current_ask_price = 55
     bot.om.cancel_order = AsyncMock(side_effect=[False, True])
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
 
     cancelled = await bot._cancel_all_quotes()
 
@@ -64,6 +91,35 @@ async def test_cancel_all_quotes_preserves_failed_order_ids():
     assert bot.current_bid_price == 45
     assert bot.current_ask_id is None
     assert bot.current_ask_price is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_quotes_sweeps_exchange_even_when_no_tracked_quotes():
+    """Verify that _cancel_all_quotes executes resting-order sweep even when no quotes are tracked locally."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.current_bid_id = None
+    bot.current_ask_id = None
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
+    cancelled = await bot._cancel_all_quotes()
+
+    assert cancelled is True
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="MOCK_TICKER")
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_quotes_returns_false_when_reconciliation_fails():
+    """Verify that _cancel_all_quotes returns False if resting-order reconciliation fails."""
+    bot = AvellanedaStoikovBot(ticker="MOCK_TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot.current_bid_id = "bid-1"
+    bot.current_ask_id = "ask-1"
+    bot.om.cancel_order = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=None)
+
+    cancelled = await bot._cancel_all_quotes()
+
+    assert cancelled is False
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="MOCK_TICKER")
 
 
 @pytest.mark.asyncio
@@ -109,7 +165,9 @@ async def test_bot_inactive_market_with_no_replacement_halts_quoting():
     mock_status.assert_awaited_once_with("MOCK_TICKER")
     mock_discover.assert_awaited_once_with(
         target_preference="MOCK_TICKER",
-        exclude_tickers=["MOCK_TICKER"]
+        exclude_tickers=["MOCK_TICKER"],
+        min_mid_price=bot.min_mid_price,
+        max_mid_price=bot.max_mid_price,
     )
     bot._cancel_all_quotes.assert_awaited_once()
     bot._update_quotes.assert_not_awaited()
@@ -192,7 +250,9 @@ async def test_starvation_triggers_auto_rotation():
         mock_alert.assert_awaited_once()
         mock_discover.assert_awaited_once_with(
             target_preference="DEAD_TICKER",
-            exclude_tickers=["DEAD_TICKER"]
+            exclude_tickers=["DEAD_TICKER"],
+            min_mid_price=bot.min_mid_price,
+            max_mid_price=bot.max_mid_price,
         )
         bot.rotate_market.assert_awaited_once_with("REPLACEMENT_TICKER")
         assert bot._market_inactive is False
@@ -233,7 +293,9 @@ async def test_bot_retries_discovery_and_recovers_from_inactive():
 
         mock_discover.assert_awaited_once_with(
             target_preference="INACTIVE_TICKER",
-            exclude_tickers=["INACTIVE_TICKER"]
+            exclude_tickers=["INACTIVE_TICKER"],
+            min_mid_price=bot.min_mid_price,
+            max_mid_price=bot.max_mid_price,
         )
         bot.rotate_market.assert_awaited_once_with("RECOVERED_TICKER")
         assert bot._market_inactive is False

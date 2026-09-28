@@ -8,8 +8,9 @@ conform to the Kalshi V2 API schema requirements, specifically:
 - Price is formatted as a fixed-point dollar string (e.g., "0.49").
 """
 
+import asyncio
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from execution.order_manager import OrderManager
 
 
@@ -171,4 +172,217 @@ class TestV2PayloadSchema:
         # Whole cent 50 cents = $0.50
         await om.place_order(ticker="T", side="yes", action="buy", count=1, price=50)
         assert captured["payload"]["price"] == "0.50"
+
+    @pytest.mark.asyncio
+    async def test_place_order_parses_root_v2_order_id(self, order_manager):
+        """Verify order_id is properly extracted when returned at the root of the JSON response."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json.return_value = {
+            "order_id": "kalshi-root-id-456",
+            "client_order_id": "client-uuid",
+            "fill_count": "0.00",
+            "remaining_count": "2.00",
+        }
+        order_manager._post_request = MagicMock(return_value=mock_resp)
+        cid = await order_manager.place_order(ticker="T", side="yes", action="buy", count=2, price=45)
+        assert cid in order_manager.active_orders
+        assert order_manager.active_orders[cid]["kalshi_order_id"] == "kalshi-root-id-456"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_cancels_orphans(self, order_manager):
+        """Verify reconcile_resting_orders cancels orders on the exchange that are not tracked locally."""
+        order_manager.active_orders["tracked-cid"] = {
+            "ticker": "TEST-TICKER",
+            "kalshi_order_id": "tracked-kalshi-id"
+        }
+
+        mock_get = MagicMock()
+        mock_get.status_code = 200
+        mock_get.json.return_value = {
+            "orders": [
+                {"order_id": "tracked-kalshi-id", "client_order_id": "tracked-cid", "ticker": "TEST-TICKER"},
+                {"order_id": "orphan-1", "client_order_id": "orphan-cid-1", "ticker": "TEST-TICKER"},
+                {"order_id": "orphan-2", "client_order_id": "orphan-cid-2", "ticker": "TEST-TICKER"},
+            ]
+        }
+
+        with patch("execution.order_manager.requests.get", return_value=mock_get):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="TEST-TICKER")
+
+            assert cancelled == 2
+            assert order_manager._cancel_by_kalshi_id.call_count == 2
+            calls = [c.args for c in order_manager._cancel_by_kalshi_id.call_args_list]
+            assert ("orphan-1", "orphan-cid-1") in calls
+            assert ("orphan-2", "orphan-cid-2") in calls
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_returns_none_on_fetch_failure(self, order_manager):
+        """Verify reconcile_resting_orders returns None when GET /orders fails."""
+        mock_get = MagicMock()
+        mock_get.status_code = 500
+        mock_get.text = "Internal Server Error"
+        with patch("execution.order_manager.requests.get", return_value=mock_get):
+            assert await order_manager.reconcile_resting_orders() is None
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_returns_none_on_cancellation_failure(self, order_manager):
+        """Verify reconcile_resting_orders returns None when any orphan cancellation fails."""
+        mock_get = MagicMock()
+        mock_get.status_code = 200
+        mock_get.json.return_value = {
+            "orders": [
+                {"order_id": "orphan-fail", "client_order_id": "cid-fail", "ticker": "TEST-TICKER"},
+            ]
+        }
+        with patch("execution.order_manager.requests.get", return_value=mock_get):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=False)
+            assert await order_manager.reconcile_resting_orders(ticker="TEST-TICKER") is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_404_unverified_retains_order_when_reconciliation_fails(self, order_manager):
+        """When 404 occurs on unverified order and reconciliation fails, order tracking is preserved and False returned."""
+        cid = "unverified-cid-1"
+        order_manager.active_orders[cid] = {"ticker": "TICKER-X", "kalshi_order_id": None}
+        mock_del = MagicMock(status_code=404)
+        order_manager._delete_request = MagicMock(return_value=mock_del)
+        order_manager.reconcile_resting_orders = AsyncMock(return_value=None)
+
+        result = await order_manager.cancel_order(cid)
+
+        assert result is False
+        assert cid in order_manager.active_orders
+        order_manager.reconcile_resting_orders.assert_awaited_once_with(ticker="TICKER-X", target_client_order_id=cid)
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_404_unverified_clears_order_when_reconciliation_confirms(self, order_manager):
+        """When 404 occurs on unverified order and reconciliation succeeds, order is popped and True returned."""
+        cid = "unverified-cid-2"
+        order_manager.active_orders[cid] = {"ticker": "TICKER-X", "kalshi_order_id": None}
+        mock_del = MagicMock(status_code=404)
+        order_manager._delete_request = MagicMock(return_value=mock_del)
+        order_manager.reconcile_resting_orders = AsyncMock(return_value=1)
+        order_manager._update_db_order_status = MagicMock()
+
+        result = await order_manager.cancel_order(cid)
+
+        assert result is True
+        assert cid not in order_manager.active_orders
+        order_manager.reconcile_resting_orders.assert_awaited_once_with(ticker="TICKER-X", target_client_order_id=cid)
+        order_manager._update_db_order_status.assert_called_once_with(cid, "reconciled_after_404")
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_follows_cursor_pagination(self, order_manager):
+        """Verify reconcile_resting_orders paginates using cursor across multiple pages."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "orders": [{"order_id": "p1-orphan", "client_order_id": "p1-cid", "ticker": "T1"}],
+            "cursor": "cursor_for_page2",
+        }
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {
+            "orders": [{"order_id": "p2-orphan", "client_order_id": "p2-cid", "ticker": "T1"}],
+            "cursor": None,
+        }
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]) as mock_get:
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="T1")
+
+            assert cancelled == 2
+            assert mock_get.call_count == 2
+            # Check params of second call contains cursor
+            assert mock_get.call_args_list[0][1]["params"].get("cursor") is None
+            assert mock_get.call_args_list[1][1]["params"].get("cursor") == "cursor_for_page2"
+            assert order_manager._cancel_by_kalshi_id.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_returns_none_if_subsequent_page_fails(self, order_manager):
+        """Verify reconcile_resting_orders returns None if any subsequent paginated request fails."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "orders": [{"order_id": "p1-orphan", "client_order_id": "p1-cid", "ticker": "T1"}],
+            "cursor": "cursor_for_page2",
+        }
+        page2 = MagicMock(status_code=500, text="Internal Error")
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="T1")
+
+            assert cancelled is None
+            # Must not execute any orphan cancellations from partial pages
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_with_target_ignores_untracked_orphans(self, order_manager):
+        """When target_client_order_id is passed, untracked orphan orders on Kalshi are NOT cancelled."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "orders": [
+                {"order_id": "target-oid", "client_order_id": "target-cid", "ticker": "T1"},
+                {"order_id": "other-oid", "client_order_id": "other-cid", "ticker": "T1"},
+            ],
+            "cursor": None,
+        }
+        with patch("execution.order_manager.requests.get", return_value=mock_resp):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(
+                ticker="T1",
+                target_client_order_id="target-cid"
+            )
+
+            assert cancelled == 1
+            order_manager._cancel_by_kalshi_id.assert_awaited_once_with("target-oid", "target-cid")
+
+    @pytest.mark.asyncio
+    async def test_reconcile_resting_orders_ignores_in_flight_pending_client_ids(self, order_manager):
+        """Orders whose client_order_id is currently in _pending_client_ids are not cancelled as orphans."""
+        order_manager._pending_client_ids.add("in-flight-cid")
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "orders": [
+                {"order_id": "in-flight-oid", "client_order_id": "in-flight-cid", "ticker": "T1"},
+            ],
+            "cursor": None,
+        }
+        with patch("execution.order_manager.requests.get", return_value=mock_resp):
+            order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+            cancelled = await order_manager.reconcile_resting_orders(ticker="T1")
+
+            assert cancelled == 0
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_acquires_rate_limiter_and_succeeds(self, order_manager):
+        """_cancel_by_kalshi_id acquires rate limiter token and cancels order successfully."""
+        mock_del = MagicMock(status_code=200)
+        order_manager._delete_request = MagicMock(return_value=mock_del)
+        order_manager._update_db_order_status = MagicMock()
+        order_manager.rate_limiter.acquire = AsyncMock()
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-1", "client-cid-1")
+
+        assert result is True
+        order_manager.rate_limiter.acquire.assert_awaited_once()
+        order_manager._update_db_order_status.assert_called_once_with("client-cid-1", "cancelled", kalshi_order_id="kalshi-oid-1")
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_retries_429_with_backoff(self, order_manager, monkeypatch):
+        """_cancel_by_kalshi_id retries upon receiving 429 and succeeds on next attempt."""
+        resp_429 = MagicMock(status_code=429)
+        resp_200 = MagicMock(status_code=200)
+        order_manager._delete_request = MagicMock(side_effect=[resp_429, resp_200])
+        order_manager.rate_limiter.acquire = AsyncMock()
+        mock_sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-2", None)
+
+        assert result is True
+        assert order_manager.rate_limiter.acquire.await_count == 2
+        mock_sleep.assert_awaited_once_with(1.0)
+
+
 
