@@ -405,8 +405,8 @@ class AvellanedaStoikovBot:
 
         # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
         pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
-        session_fees = pnl_summary.get("total_fees_cents", 0.0)
-        session_net_pnl = pnl_summary.get("realized_pnl_cents", 0.0) + pnl_summary.get("unrealized_pnl_cents", 0.0)
+        session_fees = pnl_summary.get("session_fees_cents", pnl_summary.get("total_fees_cents", 0.0))
+        session_net_pnl = pnl_summary.get("session_realized_pnl_cents", pnl_summary.get("realized_pnl_cents", 0.0)) + pnl_summary.get("unrealized_pnl_cents", 0.0)
 
         if session_fees >= self.max_session_fees_cents or session_net_pnl <= -self.max_session_loss_cents:
             reason = "fee_churn" if session_fees >= self.max_session_fees_cents else "session_stop_loss"

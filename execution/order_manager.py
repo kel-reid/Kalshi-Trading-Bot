@@ -38,6 +38,8 @@ class OrderManager:
     def __init__(self):
         # Maps client_order_id -> Order Dict
         self.active_orders: Dict[str, Dict[str, Any]] = {}
+        # In-flight client_order_ids currently undergoing placement POST requests
+        self._pending_client_ids: set[str] = set()
         self.db_pool: Optional[pool.ThreadedConnectionPool] = None
 
         # Initialize PostgreSQL database connection pool and schema
@@ -292,56 +294,60 @@ class OrderManager:
         max_retries = 3
         base_delay = 1.0
         
-        for attempt in range(max_retries + 1):
-            # 1. Wait for token to enforce overall rate limit
-            await self.rate_limiter.acquire()
-            
-            # 2. Perform REST request without blocking the async loop
-            response = await asyncio.to_thread(self._post_request, sign_path, payload)
-            
-            if response is not None:
-                if response.status_code == 201:
-                    logger.info(f"Order Placed: {action} {count} {side} @ {price}c for {ticker} (ID: {client_order_id})")
-                    ORDERS_PLACED_TOTAL.labels(ticker=ticker, action=action, side=side).inc()
-                    
-                    resp_json = response.json() if callable(getattr(response, "json", None)) else {}
-                    # Kalshi V2 events/orders returns root order_id; fallback to legacy/mocked {"order": {"order_id": ...}}
-                    kalshi_order_id = resp_json.get("order_id") or resp_json.get("order", {}).get("order_id")
-                    
-                    self.active_orders[client_order_id] = {
-                        "ticker": ticker,
-                        "side": side,
-                        "action": action,
-                        "count": count,
-                        "price": price,
-                        "kalshi_order_id": kalshi_order_id
-                    }
-                    
-                    # Persist to database
-                    self._update_db_order_status(
-                        client_order_id, 
-                        "resting", 
-                        kalshi_order_id=kalshi_order_id,
-                        order_details=self.active_orders[client_order_id]
-                    )
-                    
-                    return client_order_id
+        self._pending_client_ids.add(client_order_id)
+        try:
+            for attempt in range(max_retries + 1):
+                # 1. Wait for token to enforce overall rate limit
+                await self.rate_limiter.acquire()
                 
-                elif response.status_code == 429:
-                    if attempt < max_retries:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"Rate limited (429) placing order. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})")
-                        await asyncio.sleep(delay)
-                        continue # Retry
-                    else:
-                        logger.error(f"Failed to place order after {max_retries} retries due to rate limits.")
-                        ORDER_ERRORS_TOTAL.labels(type="place_rate_limit").inc()
-                        return None
+                # 2. Perform REST request without blocking the async loop
+                response = await asyncio.to_thread(self._post_request, sign_path, payload)
                 
-            err_text = response.text if response is not None else "No response"
-            logger.error(f"Failed to place order: {payload}. Error: {err_text}")
-            ORDER_ERRORS_TOTAL.labels(type="place_api_error").inc()
-            return None
+                if response is not None:
+                    if response.status_code == 201:
+                        logger.info(f"Order Placed: {action} {count} {side} @ {price}c for {ticker} (ID: {client_order_id})")
+                        ORDERS_PLACED_TOTAL.labels(ticker=ticker, action=action, side=side).inc()
+                        
+                        resp_json = response.json() if callable(getattr(response, "json", None)) else {}
+                        # Kalshi V2 events/orders returns root order_id; fallback to legacy/mocked {"order": {"order_id": ...}}
+                        kalshi_order_id = resp_json.get("order_id") or resp_json.get("order", {}).get("order_id")
+                        
+                        self.active_orders[client_order_id] = {
+                            "ticker": ticker,
+                            "side": side,
+                            "action": action,
+                            "count": count,
+                            "price": price,
+                            "kalshi_order_id": kalshi_order_id
+                        }
+                        
+                        # Persist to database
+                        self._update_db_order_status(
+                            client_order_id, 
+                            "resting", 
+                            kalshi_order_id=kalshi_order_id,
+                            order_details=self.active_orders[client_order_id]
+                        )
+                        
+                        return client_order_id
+                    
+                    elif response.status_code == 429:
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(f"Rate limited (429) placing order. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})")
+                            await asyncio.sleep(delay)
+                            continue # Retry
+                        else:
+                            logger.error(f"Failed to place order after {max_retries} retries due to rate limits.")
+                            ORDER_ERRORS_TOTAL.labels(type="place_rate_limit").inc()
+                            return None
+                    
+                err_text = response.text if response is not None else "No response"
+                logger.error(f"Failed to place order: {payload}. Error: {err_text}")
+                ORDER_ERRORS_TOTAL.labels(type="place_api_error").inc()
+                return None
+        finally:
+            self._pending_client_ids.discard(client_order_id)
 
     async def cancel_order(self, client_order_id: str) -> bool:
         """
@@ -386,7 +392,10 @@ class OrderManager:
                     else:
                         # We lacked a verified kalshi_order_id; 404 indicates Kalshi rejected client_order_id.
                         logger.warning(f"DELETE 404 for unverified order {order_id}; reconciling resting orders...")
-                        recon_result = await self.reconcile_resting_orders(target_client_order_id=client_order_id)
+                        recon_result = await self.reconcile_resting_orders(
+                            ticker=(order_to_cancel or {}).get("ticker"),
+                            target_client_order_id=client_order_id,
+                        )
                         if recon_result is not None:
                             self.active_orders.pop(client_order_id, None)
                             self._update_db_order_status(client_order_id, "reconciled_after_404")
@@ -530,7 +539,7 @@ class OrderManager:
             tracked_kalshi_ids = {
                 v.get("kalshi_order_id") for v in self.active_orders.values() if v.get("kalshi_order_id")
             }
-            tracked_client_ids = set(self.active_orders.keys())
+            tracked_client_ids = set(self.active_orders.keys()) | set(self._pending_client_ids)
             
             cancelled_count = 0
             cancel_tasks = []
@@ -543,8 +552,12 @@ class OrderManager:
                 if ticker and order_ticker != ticker:
                     continue
                 
-                is_target = target_client_order_id and cid == target_client_order_id
-                is_orphan = oid not in tracked_kalshi_ids and cid not in tracked_client_ids
+                is_target = bool(target_client_order_id and cid == target_client_order_id)
+                is_orphan = (
+                    target_client_order_id is None
+                    and oid not in tracked_kalshi_ids
+                    and cid not in tracked_client_ids
+                )
 
                 if is_target or is_orphan:
                     logger.warning(

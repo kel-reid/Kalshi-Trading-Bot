@@ -436,6 +436,41 @@ class TestSessionRiskSafeguards:
         bot.rotate_market.assert_called_once_with("KXREPLACEMENT-TICKER")
 
     @pytest.mark.asyncio
+    async def test_fee_churn_uses_session_fees_not_lifetime_market_fees(self):
+        """When lifetime market fees are high but current session fees are low, circuit breaker does not trigger."""
+        ticker = "KXCHURN-PREV-LIFETIME"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            auto_rotate=True,
+            max_session_fees_cents=150,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.rotate_market = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Lifetime total fees are 300c, but session fees are only 40c (< 150c limit)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": 50.0,
+            "session_realized_pnl_cents": 10.0,
+            "unrealized_pnl_cents": 0.0,
+            "total_fees_cents": 300.0,
+            "session_fees_cents": 40.0,
+        })
+
+        await bot._tick()
+
+        # Quoting proceeds normally, circuit breaker does NOT trip
+        bot._cancel_all_quotes.assert_not_called()
+        bot.rotate_market.assert_not_called()
+        bot._update_quotes.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_session_stop_loss_cancels_and_rotates(self, monkeypatch):
         """When net session PnL breaches max_session_loss_cents, quotes are cancelled and bot rotates."""
         ticker = "KXLOSS-TICKER"

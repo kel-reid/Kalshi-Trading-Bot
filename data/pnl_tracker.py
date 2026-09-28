@@ -39,6 +39,7 @@ class MarketPnL:
     total_fees_cents: float = 0.0
     reconciliation_adjustment_cents: float = 0.0  # MTM adjustments realized during REST inventory reconciliation
     session_start_realized_cents: float = 0.0  # Realized PnL baseline at rotation session start
+    session_start_fees_cents: float = 0.0  # Total fees baseline at rotation session start
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -71,6 +72,7 @@ class PnLTracker:
         market = self.get_or_create_market(ticker)
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
         market.session_start_realized_cents = market.realized_pnl_cents
+        market.session_start_fees_cents = market.total_fees_cents
         return market.rotation_session_id
 
     def seed_initial_inventory(self, ticker: str, position: Union[int, float], cost_basis_cents: Optional[float] = None):
@@ -484,6 +486,8 @@ class PnLTracker:
         unrealized = round(market.unrealized_pnl_cents, 4)
         total_pnl = round(realized + unrealized, 4)
         total_fees = round(market.total_fees_cents, 4)
+        session_fees = round(market.total_fees_cents - market.session_start_fees_cents, 4)
+        session_realized = round(market.realized_pnl_cents - market.session_start_realized_cents, 4)
         net_inventory = self.get_open_inventory(ticker)
 
         return {
@@ -492,8 +496,9 @@ class PnLTracker:
             "unrealized_pnl_cents": unrealized,
             "total_pnl_cents": total_pnl,
             "total_fees_cents": total_fees,
+            "session_fees_cents": session_fees,
             "reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents, 4),
-            "session_realized_pnl_cents": round(market.realized_pnl_cents - market.session_start_realized_cents, 4),
+            "session_realized_pnl_cents": session_realized,
             "net_inventory": net_inventory,
             "open_lots_count": len(market.open_lots),
             "round_trips_count": market.round_trips_count,
