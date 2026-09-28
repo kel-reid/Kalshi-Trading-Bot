@@ -386,10 +386,14 @@ class OrderManager:
                     else:
                         # We lacked a verified kalshi_order_id; 404 indicates Kalshi rejected client_order_id.
                         logger.warning(f"DELETE 404 for unverified order {order_id}; reconciling resting orders...")
-                        self.active_orders.pop(client_order_id, None)
-                        await self.reconcile_resting_orders()
-                        self._update_db_order_status(client_order_id, "reconciled_after_404")
-                        return True
+                        recon_result = await self.reconcile_resting_orders(target_client_order_id=client_order_id)
+                        if recon_result is not None:
+                            self.active_orders.pop(client_order_id, None)
+                            self._update_db_order_status(client_order_id, "reconciled_after_404")
+                            return True
+                        else:
+                            logger.error(f"Failed to verify/reconcile unverified order {client_order_id} after 404.")
+                            return False
                 elif response.status_code == 429:
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -448,7 +452,7 @@ class OrderManager:
             logger.error(f"DELETE Request Exception: {e}")
             return None
 
-    async def _cancel_by_kalshi_id(self, order_id: str, client_order_id: Optional[str]):
+    async def _cancel_by_kalshi_id(self, order_id: str, client_order_id: Optional[str]) -> bool:
         """Helper method to cancel an order directly by Kalshi order ID (used during recovery)."""
         cancel_path = f"/trade-api/v2/portfolio/events/orders/{order_id}"
         resp = await asyncio.to_thread(self._delete_request, cancel_path)
@@ -456,9 +460,16 @@ class OrderManager:
             logger.info(f"Successfully cancelled orphaned order {cancel_path}")
             if client_order_id:
                 self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
+            return True
+        elif resp and resp.status_code == 404:
+            logger.info(f"Orphaned order {cancel_path} already cleared on exchange (404).")
+            if client_order_id:
+                self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
+            return True
         else:
             err = resp.text if resp else "No response"
             logger.error(f"Failed to cancel orphaned order {cancel_path}: {err}")
+            return False
 
     def get_tracked_active_orders(self, ticker: str = None) -> List[Dict[str, Any]]:
         """Return list of active orders we are currently tracking, optionally filtered by ticker."""
@@ -469,11 +480,16 @@ class OrderManager:
                 order_copy["client_order_id"] = cid
                 orders.append(order_copy)
         return orders
-    async def reconcile_resting_orders(self, ticker: Optional[str] = None) -> int:
+    async def reconcile_resting_orders(
+        self,
+        ticker: Optional[str] = None,
+        target_client_order_id: Optional[str] = None,
+    ) -> Optional[int]:
         """
         Actively queries Kalshi for all resting orders on the exchange.
-        Cancels any order resting on Kalshi that does not correspond to an active tracked order.
-        Returns the count of orphaned orders cancelled.
+        Cancels any order resting on Kalshi that does not correspond to an active tracked order,
+        or that matches target_client_order_id.
+        Returns the count of orphaned orders cancelled on success, or None on failure.
         """
         sign_path = "/trade-api/v2/portfolio/orders"
         query_params = {"status": "resting", "limit": 100}
@@ -510,24 +526,30 @@ class OrderManager:
                     if ticker and order_ticker != ticker:
                         continue
                     
-                    if oid not in tracked_kalshi_ids and cid not in tracked_client_ids:
+                    is_target = target_client_order_id and cid == target_client_order_id
+                    is_orphan = oid not in tracked_kalshi_ids and cid not in tracked_client_ids
+
+                    if is_target or is_orphan:
                         logger.warning(
-                            f"Reconciling orphaned resting order on exchange: {oid} "
+                            f"Reconciling {'target' if is_target else 'orphaned'} resting order on exchange: {oid} "
                             f"(client_id: {cid}, ticker: {order_ticker})"
                         )
                         cancel_tasks.append(self._cancel_by_kalshi_id(oid, cid))
                         cancelled_count += 1
                         
                 if cancel_tasks:
-                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                    results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                    if any(result is not True for result in results):
+                        logger.error("Failed to cancel one or more orphaned resting orders during reconciliation.")
+                        return None
                     logger.info(f"Reconciliation cancelled {cancelled_count} orphaned resting orders.")
                 return cancelled_count
             else:
                 logger.error(f"Failed to fetch resting orders for reconciliation: {response.status_code} - {response.text}")
-                return 0
+                return None
         except Exception as e:
             logger.error(f"Error during resting order reconciliation: {e}")
-            return 0
+            return None
 
     async def sync_and_recover_state(self):
         """

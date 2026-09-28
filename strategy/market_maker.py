@@ -817,10 +817,22 @@ class AvellanedaStoikovBot:
 
         # 1. Withdraw all active quotes on the previous ticker and ensure no active orders remain
         quotes_cancelled = await self._cancel_all_quotes()
+        reconciliation_succeeded = False
         try:
-            await self.om.reconcile_resting_orders(ticker=old_ticker)
+            recon_res = await self.om.reconcile_resting_orders(ticker=old_ticker)
+            reconciliation_succeeded = (recon_res is not None)
         except Exception as e_rec:
-            logger.debug(f"Exchange resting order sweep skipped during market rotation: {e_rec}")
+            logger.error(f"Exchange resting order sweep failed during market rotation: {e_rec}")
+            reconciliation_succeeded = False
+
+        if not reconciliation_succeeded:
+            logger.error(
+                f"Aborting market rotation from {old_ticker} to {new_ticker}; "
+                f"resting-order reconciliation failed or was unconfirmed."
+            )
+            await self._escalate_to_kill_switch(context=f"resting-order reconciliation failure during rotation from {old_ticker}")
+            return False
+
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
             logger.error(

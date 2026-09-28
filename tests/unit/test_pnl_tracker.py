@@ -895,6 +895,7 @@ class TestMarketMakerPnLLifecycle:
         bot.ob_manager.unsubscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()
         bot.om.record_pnl_snapshot_async = AsyncMock()
+        bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
 
         # Successful snapshot during rotation
         res = await bot.rotate_market("KXTEST-MM-ROT2")
