@@ -5,7 +5,7 @@
 - Always remind the user to run the local `terraform validate` syntax check and `tfsec` security scan commands whenever changes are made to the Terraform configurations.
 - Never alter external API query parameters, response payload validations, or endpoint URLs based on static code review suggestions or test fixture inconsistencies without empirical verification against the live vendor API. When multi-value status predicates exist (e.g. `status in ("open", "active")`), treat them as intentional vendor API quirks unless proven otherwise by live telemetry; always preserve both values in parsing and unit tests.
 - Whenever fixes addressing PR review comments are committed and pushed, always mark the corresponding GitHub review threads as resolved via the GitHub API.
-- Whenever code is committed and pushed to a PR branch, always request a CodeRabbit review by posting `@coderabbit full review` on the pull request.
+- Whenever code is committed and pushed to a PR branch, always request a CodeRabbit review by posting `@coderabbit full review` on the pull request. If the review was not started immediately (e.g. due to rate limits or fair usage policies), inspect CodeRabbit's response comment for when the next review will become available, wait for that duration, and re-trigger `@coderabbit full review` once the window opens until confirmed started ("Full review triggered").
 - After each successful deploy to DigitalOcean, always inspect the droplet container logs (e.g. via SSH `ssh -i infra/kalshi_deploy_key.pem root@<DROPLET_IP> "docker logs --tail 100 kalshi-bot"`) to empirically verify startup hydration, market discovery, and healthy quoting without runtime errors.
 
 ## Senior Engineering Protocols
