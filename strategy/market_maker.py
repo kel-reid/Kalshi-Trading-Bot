@@ -19,7 +19,15 @@ from data.inventory_manager import InventoryManager
 from execution.order_manager import OrderManager
 from utils.alerting import send_alert
 from utils.market_discovery import discover_active_market_async, is_market_active_async
-from utils.metrics import start_metrics_server, BOT_INVENTORY_NET_POSITION, BOT_PNL_CENTS
+from utils.metrics import (
+    start_metrics_server,
+    BOT_INVENTORY_NET_POSITION,
+    BOT_PNL_CENTS,
+    KALSHI_REALIZED_PNL_CENTS,
+    KALSHI_UNREALIZED_PNL_CENTS,
+    KALSHI_FEES_PAID_CENTS,
+    SAFEGUARD_EVENTS_TOTAL,
+)
 from config import (
     RISK_GAMMA,
     MIN_SPREAD,
@@ -27,6 +35,11 @@ from config import (
     ORDER_DOLLARS,
     MAX_ORDER_CONTRACTS,
     MAX_HEDGE_INVENTORY,
+    MIN_MID_PRICE,
+    MAX_MID_PRICE,
+    MIN_TIME_TO_CLOSE_SECONDS,
+    MAX_SESSION_FEES_CENTS,
+    MAX_SESSION_LOSS_CENTS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -59,6 +72,10 @@ class AvellanedaStoikovBot:
         target_preference: Optional[str] = None,
         auto_rotate: bool = True,
         starvation_timeout: float = 900.0, # 15 minutes
+        min_mid_price: Optional[int] = None,
+        max_mid_price: Optional[int] = None,
+        max_session_fees_cents: Optional[int] = None,
+        max_session_loss_cents: Optional[int] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -69,6 +86,10 @@ class AvellanedaStoikovBot:
         self.target_preference = target_preference if target_preference is not None else ticker
         self.auto_rotate = auto_rotate
         self.starvation_timeout = starvation_timeout
+        self.min_mid_price = min_mid_price if min_mid_price is not None else MIN_MID_PRICE
+        self.max_mid_price = max_mid_price if max_mid_price is not None else MAX_MID_PRICE
+        self.max_session_fees_cents = max_session_fees_cents if max_session_fees_cents is not None else MAX_SESSION_FEES_CENTS
+        self.max_session_loss_cents = max_session_loss_cents if max_session_loss_cents is not None else MAX_SESSION_LOSS_CENTS
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -107,8 +128,8 @@ class AvellanedaStoikovBot:
         self._starvation_start_time: Optional[float] = None
         self._starvation_alert_sent: bool = False
 
-        # Periodic market settlement/status check (every 60s)
-        self._last_market_status_check: float = time.time()
+        # Periodic market settlement/status check (initialized to 0.0 to enforce on startup tick)
+        self._last_market_status_check: float = 0.0
         self._market_status_check_interval: float = 60.0
         self._market_inactive: bool = False
         self._last_inactive_retry: float = 0.0
@@ -117,6 +138,14 @@ class AvellanedaStoikovBot:
         # Periodic PnL snapshot tracking
         self._last_pnl_snapshot: float = time.time()
         self._pnl_snapshot_interval: float = 60.0
+
+        # Order placement failure cooldown tracking to prevent runaway rate limit spam
+        self._last_order_error_time: float = 0.0
+        self._order_error_cooldown: float = 5.0
+
+        # Periodic exchange resting order reconciliation
+        self._last_reconciliation_time: float = time.time()
+        self._reconciliation_interval: float = 60.0
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
@@ -209,6 +238,12 @@ class AvellanedaStoikovBot:
         balance = self.inv_manager.get_balance()
         BOT_PNL_CENTS.labels(ticker=self.ticker).set(balance)
 
+        try:
+            KALSHI_REALIZED_PNL_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_realized_pnl(self.ticker))
+            KALSHI_FEES_PAID_CENTS.labels(ticker=self.ticker).set(self.inv_manager.pnl_tracker.get_total_fees(self.ticker))
+        except Exception as e_m:
+            logger.debug(f"Telemetry update skipped for {self.ticker}: {e_m}")
+
         # 0. Active Inactive Market Recovery: Retry unconfirmed cancellations and retry finding replacement
         if self._market_inactive:
             if self.current_bid_id or self.current_ask_id:
@@ -220,7 +255,9 @@ class AvellanedaStoikovBot:
                 logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
                 replacement = await discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker]
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
                 )
                 if replacement:
                     if await self.rotate_market(replacement):
@@ -232,31 +269,40 @@ class AvellanedaStoikovBot:
             self._maybe_schedule_pnl_snapshot(now, inventory)
             return
 
-        # Periodic market settlement and expiry detection
-        if self.auto_rotate and (now - self._last_market_status_check >= self._market_status_check_interval):
+        # Periodic market settlement and expiry detection (evaluated on startup tick and every interval)
+        if now - self._last_market_status_check >= self._market_status_check_interval:
             self._last_market_status_check = now
             is_active = await is_market_active_async(self.ticker)
             if is_active is False:
-                logger.warning(f"Market {self.ticker} is no longer active (settled or expired). Initiating rotation...")
-                replacement = await discover_active_market_async(
-                    target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker]
-                )
-                if replacement:
-                    if await self.rotate_market(replacement):
-                        self._market_inactive = False
+                logger.warning(f"Market {self.ticker} is no longer active (settled, expired, or reached cutoff). Withdrawing quotes...")
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="expiry_cutoff", ticker=self.ticker).inc()
+                except Exception as e_metric:
+                    logger.debug(f"Safeguard metric update failed: {e_metric}")
+                await self._cancel_all_quotes()
+                if self.auto_rotate:
+                    replacement = await discover_active_market_async(
+                        target_preference=self.target_preference,
+                        exclude_tickers=[self.ticker],
+                        min_mid_price=self.min_mid_price,
+                        max_mid_price=self.max_mid_price,
+                    )
+                    if replacement:
+                        if await self.rotate_market(replacement):
+                            self._market_inactive = False
+                            logger.info(f"Successfully rotated from inactive market to {replacement}.")
+                        else:
+                            self._market_inactive = True
+                            self._last_inactive_retry = now
+                            logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                     else:
+                        logger.error(f"No replacement market found for {self.ticker}.")
                         self._market_inactive = True
                         self._last_inactive_retry = now
-                    self._maybe_schedule_pnl_snapshot(now, inventory)
-                    return
                 else:
-                    logger.error(f"No replacement market found for {self.ticker}.")
                     self._market_inactive = True
-                    self._last_inactive_retry = now
-                    await self._cancel_all_quotes()
-                    self._maybe_schedule_pnl_snapshot(now, inventory)
-                    return
+                self._maybe_schedule_pnl_snapshot(now, inventory)
+                return
             elif is_active is True:
                 self._market_inactive = False
             else:
@@ -291,7 +337,9 @@ class AvellanedaStoikovBot:
                         )
                         replacement = await discover_active_market_async(
                             target_preference=self.target_preference,
-                            exclude_tickers=[self.ticker]
+                            exclude_tickers=[self.ticker],
+                            min_mid_price=self.min_mid_price,
+                            max_mid_price=self.max_mid_price,
                         )
                         if replacement:
                             if await self.rotate_market(replacement):
@@ -332,16 +380,160 @@ class AvellanedaStoikovBot:
             # 1. Calculate Mid Price
             mid_price = (bid_price + ask_price) / 2.0
         
-        # 2. Mark open inventory to market against current mid price
+        # 2. Mark open inventory to market against current mid price and update unrealized PnL gauge
         self.inv_manager.update_orderbook_mid(self.ticker, mid_price)
+        try:
+            KALSHI_UNREALIZED_PNL_CENTS.labels(ticker=self.ticker).set(
+                self.inv_manager.pnl_tracker.get_unrealized_pnl(self.ticker)
+            )
+        except Exception as e_m:
+            logger.debug(f"Telemetry unrealized update skipped for {self.ticker}: {e_m}")
         self._maybe_schedule_pnl_snapshot(now, inventory)
 
-        # 3. Get Inventory
-        # Convention: positive inventory = holding net YES
-        
-        # Determine dynamic quote size for current market price
+        # Periodic exchange resting order reconciliation
+        if now - self._last_reconciliation_time >= self._reconciliation_interval:
+            self._last_reconciliation_time = now
+            rec_task = asyncio.create_task(self.om.reconcile_resting_orders(ticker=self.ticker))
+            self._background_tasks.add(rec_task)
+            rec_task.add_done_callback(self._background_tasks.discard)
+
+        # 3. Determine dynamic quote size and hedge threshold for current market price
         quote_size = self.calculate_order_size(mid_price)
         self._current_quote_size = quote_size
+        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
+        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
+
+        # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
+        pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
+        session_fees = pnl_summary.get("session_fees_cents", pnl_summary.get("total_fees_cents", 0.0))
+        session_net_pnl = pnl_summary.get("session_realized_pnl_cents", pnl_summary.get("realized_pnl_cents", 0.0)) + pnl_summary.get("unrealized_pnl_cents", 0.0)
+
+        if session_fees >= self.max_session_fees_cents or session_net_pnl <= -self.max_session_loss_cents:
+            reason = "fee_churn" if session_fees >= self.max_session_fees_cents else "session_stop_loss"
+            logger.warning(
+                f"[{reason.upper()} TRIGGERED] Market {self.ticker} session metrics: "
+                f"fees={session_fees:.1f}c (limit: {self.max_session_fees_cents}c), "
+                f"net_pnl={session_net_pnl:.1f}c (loss limit: -{self.max_session_loss_cents}c)."
+            )
+            try:
+                SAFEGUARD_EVENTS_TOTAL.labels(safeguard=reason, ticker=self.ticker).inc()
+            except Exception as e_metric:
+                logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+            # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
+            if abs(inventory) >= hedge_threshold:
+                if inventory >= hedge_threshold:
+                    logger.warning(
+                        f"[{reason.upper()} - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
+                        f"Halting BIDs, crossing ASKs to exit."
+                    )
+                    optimal_bid = None
+                    optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                else:
+                    logger.warning(
+                        f"[{reason.upper()} - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
+                        f"Halting ASKs, crossing BIDs to exit."
+                    )
+                    optimal_ask = None
+                    optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+
+                realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+                unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                logger.info(
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"→ Bid={optimal_bid}c  Ask={optimal_ask}c ({reason} Hedged) | "
+                    f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
+                )
+                await self._update_quotes(optimal_bid, optimal_ask)
+                return
+
+            # Otherwise (inventory below hedge threshold), cancel all active quotes and rotate/quiesce.
+            await self._cancel_all_quotes()
+            if self.auto_rotate:
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                        logger.info(f"Successfully rotated from {reason} market to {replacement}.")
+                    else:
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                else:
+                    logger.error(f"No replacement market found after {reason} on {self.ticker}.")
+                    self._market_inactive = True
+                    self._last_inactive_retry = now
+            else:
+                self._market_inactive = True
+            return
+
+        # 2a. Extreme Price Collar Safeguard:
+        # If orderbook midpoint drifts outside [min_mid_price, max_mid_price]:
+        if mid_price < self.min_mid_price or mid_price > self.max_mid_price:
+            logger.warning(
+                f"[PRICE COLLAR BREACH] Market {self.ticker} mid price {mid_price:.2f}c is outside "
+                f"safety collar [{self.min_mid_price}c, {self.max_mid_price}c]."
+            )
+            try:
+                SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker=self.ticker).inc()
+            except Exception as e_metric:
+                logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+            # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
+            if abs(inventory) >= hedge_threshold:
+                if inventory >= hedge_threshold:
+                    logger.warning(
+                        f"[COLLAR BREACH - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
+                        f"Halting BIDs outside collar, crossing ASKs to exit."
+                    )
+                    optimal_bid = None
+                    optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                else:
+                    logger.warning(
+                        f"[COLLAR BREACH - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
+                        f"Halting ASKs outside collar, crossing BIDs to exit."
+                    )
+                    optimal_ask = None
+                    optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+
+                realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
+                unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                logger.info(
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Collar Breach Hedged) | "
+                    f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
+                )
+                await self._update_quotes(optimal_bid, optimal_ask)
+                return
+
+            # Otherwise (inventory below hedge threshold), cancel all active quotes and rotate/quiesce.
+            await self._cancel_all_quotes()
+            if self.auto_rotate:
+                replacement = await discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
+                )
+                if replacement:
+                    if await self.rotate_market(replacement):
+                        self._market_inactive = False
+                        logger.info(f"Successfully rotated from collar-breached market to {replacement}.")
+                    else:
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                        logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
+                else:
+                    logger.error(f"No replacement market found for collar-breached market {self.ticker}.")
+                    self._market_inactive = True
+                    self._last_inactive_retry = now
+            else:
+                self._market_inactive = True
+            return
 
         # 4. Calculate Reservation Price (R)
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
@@ -363,9 +555,6 @@ class AvellanedaStoikovBot:
             
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
-        # Threshold scales with quote size (5 order units), bounded by max_hedge_inventory
-        base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
-        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
         if inventory >= hedge_threshold:
             logger.warning(f"[HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). Halting BIDs, crossing ASKs to exit.")
             optimal_bid = None # Do not buy more YES
@@ -456,7 +645,10 @@ class AvellanedaStoikovBot:
 
 
         # Place new BID if needed
-        if bid_needs_update:
+        now = time.time()
+        in_error_cooldown = (now - self._last_order_error_time < self._order_error_cooldown)
+
+        if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
                 logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c")
                 self.current_bid_id = await self.om.place_order(
@@ -466,11 +658,12 @@ class AvellanedaStoikovBot:
                     self.current_bid_price = new_bid
                     self.current_bid_size = target_bid_size
                 else:
+                    self._last_order_error_time = time.time()
                     self.current_bid_price = None
                     self.current_bid_size = None
 
         # Place new ASK if needed
-        if ask_needs_update:
+        if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
                 logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c")
                 self.current_ask_id = await self.om.place_order(
@@ -480,6 +673,7 @@ class AvellanedaStoikovBot:
                     self.current_ask_price = new_ask
                     self.current_ask_size = target_ask_size
                 else:
+                    self._last_order_error_time = time.time()
                     self.current_ask_price = None
                     self.current_ask_size = None
 
@@ -496,31 +690,40 @@ class AvellanedaStoikovBot:
             tasks.append(self.om.cancel_order(self.current_ask_id))
             cancel_targets.append(("ask", self.current_ask_id))
              
-        if not tasks:
-            return True
-
-        logger.info("Withdrawing quotes...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
         all_cancelled = True
 
-        for (side, order_id), result in zip(cancel_targets, results):
-            if isinstance(result, Exception):
-                logger.error(f"Failed to cancel {side} quote {order_id}: {result}")
-                all_cancelled = False
-                continue
-            if result is not True:
-                logger.error(f"Failed to cancel {side} quote {order_id}.")
-                all_cancelled = False
-                continue
+        if tasks:
+            logger.info("Withdrawing quotes...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if side == "bid":
-                self.current_bid_id = None
-                self.current_bid_price = None
-                self.current_bid_size = None
-            else:
-                self.current_ask_id = None
-                self.current_ask_price = None
-                self.current_ask_size = None
+            for (side, order_id), result in zip(cancel_targets, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to cancel {side} quote {order_id}: {result}")
+                    all_cancelled = False
+                    continue
+                if result is not True:
+                    logger.error(f"Failed to cancel {side} quote {order_id}.")
+                    all_cancelled = False
+                    continue
+
+                if side == "bid":
+                    self.current_bid_id = None
+                    self.current_bid_price = None
+                    self.current_bid_size = None
+                else:
+                    self.current_ask_id = None
+                    self.current_ask_price = None
+                    self.current_ask_size = None
+
+        # Actively sweep any resting orders on the exchange for this market ticker
+        try:
+            recon_res = await self.om.reconcile_resting_orders(ticker=self.ticker)
+            if recon_res is None:
+                logger.error(f"Resting-order reconciliation failed for {self.ticker} during quote withdrawal.")
+                all_cancelled = False
+        except Exception as e_rec:
+            logger.error(f"Exchange resting order sweep failed during quote withdrawal: {e_rec}")
+            all_cancelled = False
 
         return all_cancelled
 
@@ -617,6 +820,22 @@ class AvellanedaStoikovBot:
 
         # 1. Withdraw all active quotes on the previous ticker and ensure no active orders remain
         quotes_cancelled = await self._cancel_all_quotes()
+        reconciliation_succeeded = False
+        try:
+            recon_res = await self.om.reconcile_resting_orders(ticker=old_ticker)
+            reconciliation_succeeded = (recon_res is not None)
+        except Exception as e_rec:
+            logger.error(f"Exchange resting order sweep failed during market rotation: {e_rec}")
+            reconciliation_succeeded = False
+
+        if not reconciliation_succeeded:
+            logger.error(
+                f"Aborting market rotation from {old_ticker} to {new_ticker}; "
+                f"resting-order reconciliation failed or was unconfirmed."
+            )
+            await self._escalate_to_kill_switch(context=f"resting-order reconciliation failure during rotation from {old_ticker}")
+            return False
+
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
             logger.error(

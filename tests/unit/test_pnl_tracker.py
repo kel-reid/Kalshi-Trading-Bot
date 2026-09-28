@@ -236,6 +236,39 @@ class TestSessionAttributionAndRotation:
         assert s2 != s1
         assert tracker.get_or_create_market(ticker).rotation_session_id == s2
 
+    def test_rotation_session_resets_session_fees_and_realized_deltas(self):
+        """Resetting market session resets session_fees_cents and session_realized_pnl_cents to zero while preserving cumulatives."""
+        tracker = PnLTracker()
+        ticker = "KXTEST-26SEP-FEES-ROT"
+
+        # Trade 1 in session 1: Buy 10 @ 40c, fee = 15c
+        tracker.record_fill(ticker, action="buy", side="yes", count=10, price_cents=40, fee_cents=15.0)
+        # Sell 10 @ 60c, fee = 15c -> Realized PnL = +200c, Total Fees = 30c
+        tracker.record_fill(ticker, action="sell", side="yes", count=10, price_cents=60, fee_cents=15.0)
+
+        s1_summary = tracker.get_market_summary(ticker)
+        assert s1_summary["realized_pnl_cents"] == 170.0  # (60 - 40) * 10 - 15 (entry fee) - 15 (exit fee)
+        assert s1_summary["total_fees_cents"] == 30.0
+        assert s1_summary["session_realized_pnl_cents"] == 170.0
+        assert s1_summary["session_fees_cents"] == 30.0
+
+        # Rotate away / reset session
+        tracker.reset_market_session(ticker)
+
+        s2_summary = tracker.get_market_summary(ticker)
+        # Cumulative totals are conserved
+        assert s2_summary["realized_pnl_cents"] == 170.0
+        assert s2_summary["total_fees_cents"] == 30.0
+        # Session deltas reset to 0
+        assert s2_summary["session_realized_pnl_cents"] == 0.0
+        assert s2_summary["session_fees_cents"] == 0.0
+
+        # Trade in session 2: Buy 5 @ 50c, fee = 10c
+        tracker.record_fill(ticker, action="buy", side="yes", count=5, price_cents=50, fee_cents=10.0)
+        s2_mid_summary = tracker.get_market_summary(ticker)
+        assert s2_mid_summary["total_fees_cents"] == 40.0
+        assert s2_mid_summary["session_fees_cents"] == 10.0
+
 
 class TestInventoryManagerPnLIntegration:
     """Verifies InventoryManager correctly integrates PnLTracker."""
@@ -895,6 +928,7 @@ class TestMarketMakerPnLLifecycle:
         bot.ob_manager.unsubscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()
         bot.om.record_pnl_snapshot_async = AsyncMock()
+        bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
 
         # Successful snapshot during rotation
         res = await bot.rotate_market("KXTEST-MM-ROT2")
@@ -1549,19 +1583,29 @@ class TestMarketMakerPnLLifecycle:
         # Cost: 5 * 60c + 1.5c fee = 301.5c -> balance = 9549.0 - 301.5 = 9247.5
         assert im.balance_cents == 9247.5
 
-    def test_fetch_and_apply_positions_rejects_non_integral_positions(self):
-        """Verify _fetch_positions and _apply_positions reject non-integral position values instead of truncating."""
+    def test_fetch_and_apply_positions_supports_fractional_and_integral_positions(self):
+        """Verify _fetch_positions and _apply_positions parse both fractional and integral position values accurately."""
         im = InventoryManager(ws_client=MagicMock())
 
-        # 1. _fetch_positions rejects fractional position string or float
+        # 1. _fetch_positions accepts fractional and integral positions
         mock_resp_frac1 = MagicMock(status_code=200)
         mock_resp_frac1.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position": "1.5"}]}
         with patch("requests.get", return_value=mock_resp_frac1):
-            assert im._fetch_positions() is None
+            pos_list = im._fetch_positions()
+            assert pos_list is not None
+            assert pos_list[0]["position"] == "1.5"
 
         mock_resp_frac2 = MagicMock(status_code=200)
-        mock_resp_frac2.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC", "position_fp": 2.7}]}
+        mock_resp_frac2.json.return_value = {"market_positions": [{"ticker": "KXTEST-FRAC2", "position_fp": "1.69"}]}
         with patch("requests.get", return_value=mock_resp_frac2):
+            pos_list = im._fetch_positions()
+            assert pos_list is not None
+            assert pos_list[0]["position_fp"] == "1.69"
+
+        # Rejects non-finite positions
+        mock_resp_nan = MagicMock(status_code=200)
+        mock_resp_nan.json.return_value = {"market_positions": [{"ticker": "KXTEST-NAN", "position": "nan"}]}
+        with patch("requests.get", return_value=mock_resp_nan):
             assert im._fetch_positions() is None
 
         # Integral float (e.g. 5.0) is accepted
@@ -1573,11 +1617,17 @@ class TestMarketMakerPnLLifecycle:
             assert len(pos_list) == 1
             assert pos_list[0]["ticker"] == "KXTEST-INT"
 
-        # 2. _apply_positions rejects fractional position values
-        assert im._apply_positions([{"ticker": "KXTEST-FRAC-1", "position": "3.5"}]) is False
-        assert im._apply_positions([{"ticker": "KXTEST-FRAC-2", "position": 4.2}]) is False
+        # 2. _apply_positions parses fractional and integral positions
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-1", "position": "3.5"}]) is True
+        assert im.get_position("KXTEST-FRAC-1") == 3.5
+        assert im._apply_positions([{"ticker": "KXTEST-FRAC-2", "position_fp": "1.69"}]) is True
+        assert im.get_position("KXTEST-FRAC-2") == 1.69
         assert im._apply_positions([{"ticker": "KXTEST-INT-OK", "position": 4.0}]) is True
         assert im.get_position("KXTEST-INT-OK") == 4
+        assert isinstance(im.get_position("KXTEST-INT-OK"), int)
+
+        # Rejects non-finite position values
+        assert im._apply_positions([{"ticker": "KXTEST-INF", "position": float("inf")}]) is False
 
     @pytest.mark.asyncio
     async def test_rotate_market_escalates_to_kill_switch_when_active_orders_remain(self):
