@@ -771,7 +771,12 @@ class AvellanedaStoikovBot:
 
             # Clean up any un-executed portion if order is still resting
             if order_id and order_id in self.om.active_orders:
-                await self.om.cancel_order(order_id)
+                if not await self.om.cancel_order(order_id):
+                    logger.error(
+                        f"Failed to cancel liquidation order {order_id} on {target_ticker}; "
+                        f"aborting to prevent overfill or unintended position exposure."
+                    )
+                    return False
 
             await self.om.reconcile_resting_orders(ticker=target_ticker)
 
@@ -965,9 +970,13 @@ class AvellanedaStoikovBot:
             liquidation_ok = await self.liquidate_inventory(ticker=old_ticker)
             if not liquidation_ok:
                 logger.error(
-                    f"Liquidation of {old_ticker} failed or partially filled. "
+                    f"Aborting rotation from {old_ticker} to {new_ticker}: failed to liquidate existing inventory. "
                     f"Remaining inventory: {self.inv_manager.get_position(old_ticker)}"
                 )
+                await send_alert(
+                    f"⚠️ Rotation aborted: liquidation of {old_ticker} incomplete. Remaining on {old_ticker}."
+                )
+                return False
 
         # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
         await asyncio.sleep(0)
@@ -1031,7 +1040,9 @@ class AvellanedaStoikovBot:
         # 1b. Liquidate any open inventory on shutdown
         if self.inv_manager.get_position(self.ticker) != 0:
             logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
-            await self.liquidate_inventory(self.ticker)
+            if not await self.liquidate_inventory(self.ticker):
+                logger.error(f"Failed to fully liquidate inventory on {self.ticker} during shutdown.")
+                quotes_cancelled = False
 
         # Quiesce fills and drain running background snapshot tasks before final write
         await asyncio.sleep(0)
