@@ -765,12 +765,18 @@ class AvellanedaStoikovBot:
                 count=slice_count,
                 price=price,
             )
+            if not order_id:
+                logger.error(
+                    f"Failed to place liquidation order on {target_ticker}; "
+                    f"order outcome unconfirmed. Aborting liquidation to avoid untracked exposure."
+                )
+                return False
 
             # Wait briefly for execution / WebSocket fill propagation
             await asyncio.sleep(0.5)
 
             # Clean up any un-executed portion if order is still resting
-            if order_id and order_id in self.om.active_orders:
+            if order_id in self.om.active_orders:
                 if not await self.om.cancel_order(order_id):
                     logger.error(
                         f"Failed to cancel liquidation order {order_id} on {target_ticker}; "
@@ -779,6 +785,21 @@ class AvellanedaStoikovBot:
                     return False
 
             await self.om.reconcile_resting_orders(ticker=target_ticker)
+
+            # Drain any pending WebSocket fill tasks from the event loop before sizing next slice
+            await asyncio.sleep(0.1)
+
+            new_inv = self.inv_manager.get_position(target_ticker)
+            if (inv > 0 and new_inv < 0) or (inv < 0 and new_inv > 0):
+                logger.error(
+                    f"Liquidation position flipped from {inv} to {new_inv} on {target_ticker}; "
+                    f"aborting to prevent oscillation."
+                )
+                return False
+
+            if new_inv == 0:
+                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is 0.")
+                return True
 
         # Final position verification
         remaining_inv = self.inv_manager.get_position(target_ticker)
