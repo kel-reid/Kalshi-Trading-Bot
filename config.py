@@ -41,14 +41,20 @@ if "pytest" not in sys.modules and not has_env_key and not PRIVATE_KEY_PATH.exis
 # Alerting
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
-def _get_float_env(name: str, default: float) -> float:
+def _get_float_env(name: str, default: float, allow_zero: bool = False) -> float:
     val = os.getenv(name)
     if val is None or not str(val).strip():
         return default
     try:
         f = float(val)
-        if not math.isfinite(f) or f <= 0.0:
+        if not math.isfinite(f):
             return default
+        if allow_zero:
+            if f < 0.0:
+                return default
+        else:
+            if f <= 0.0:
+                return default
         return f
     except (ValueError, TypeError):
         return default
@@ -107,7 +113,7 @@ MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
 
 # Post-Fill Adverse Selection Protection (Seconds)
 # Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
-POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0)
+POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0, allow_zero=True)
 
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")
