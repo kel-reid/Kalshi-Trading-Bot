@@ -660,3 +660,66 @@ async def test_liquidate_inventory_aborts_on_position_flip():
     assert success is False
     bot.om.place_order.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_cancel_all_quotes_fails():
+    """Verify liquidate_inventory immediately aborts and returns False if _cancel_all_quotes fails."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=False)
+    bot.om.place_order = AsyncMock()
+    bot.inv_manager.get_position = MagicMock(return_value=15)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=3)
+
+    assert success is False
+    bot._cancel_all_quotes.assert_awaited_once_with(ticker="TEST-TICKER")
+    bot.om.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_continues_slicing_when_progress_is_made():
+    """Verify liquidate_inventory continues past max_retries slices when each slice successfully reduces position."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4, max_order_contracts=10)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 50))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 50))
+
+    # Initial position 35 contracts. With max_order_contracts=10, takes 4 slices: 10, 10, 10, 5.
+    current_pos = 35
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: current_pos)
+
+    async def mock_place_order(**kwargs):
+        nonlocal current_pos
+        current_pos -= kwargs["count"]
+        return f"order-{current_pos}"
+
+    bot.om.place_order = AsyncMock(side_effect=mock_place_order)
+
+    # max_retries is set to 2; total slices needed is 4 (4 > max_retries).
+    # Since progress is made on each slice, it must succeed without aborting.
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is True
+    assert bot.om.place_order.await_count == 4
+    assert [call.kwargs["count"] for call in bot.om.place_order.await_args_list] == [10, 10, 10, 5]
+
+
+@pytest.mark.asyncio
+async def test_inactive_market_recovery_retries_liquidation_and_alerts_on_failure():
+    """Verify that when market is inactive and position is nonzero, liquidation is retried and alerts on failure."""
+    bot = AvellanedaStoikovBot(ticker="INACTIVE_TICKER", gamma=0.5, min_spread=4, order_size=1, auto_rotate=False)
+    bot._market_inactive = True
+    bot._last_inactive_retry = time.time() - 10.0  # Elapse the retry interval
+    bot.inv_manager.get_position = MagicMock(return_value=8)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.liquidate_inventory = AsyncMock(return_value=False)
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+        await bot._tick()
+
+        bot.liquidate_inventory.assert_awaited_once_with("INACTIVE_TICKER")
+        mock_alert.assert_awaited_once()
+        assert "Inactive market liquidation retry failed for INACTIVE_TICKER" in mock_alert.await_args[0][0]
+
+
