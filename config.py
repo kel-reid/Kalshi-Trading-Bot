@@ -101,9 +101,13 @@ MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 3600, allo
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
 # Fee Churn & Session Stop-Loss Safeguards (Cents)
-# Cease quoting and rotate away if fees or net loss on a single market session exceed these thresholds.
-MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 150)
-MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 200)
+# Cease quoting, liquidate inventory, and rotate away if fees or net loss on a single market session exceed these thresholds.
+MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 250)
+MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
+
+# Post-Fill Adverse Selection Protection (Seconds)
+# Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
+POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0)
 
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")

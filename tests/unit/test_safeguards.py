@@ -609,3 +609,183 @@ class TestSessionRiskSafeguards:
         # Second attempt immediately after: within 5s cooldown, should NOT call place_order again
         await bot._update_quotes(new_bid=48, new_ask=52)
         assert bot.om.place_order.call_count == call_count_1
+
+    @pytest.mark.asyncio
+    async def test_session_stop_loss_quiesce_liquidates_inventory_without_autorotate(self):
+        """When session stop loss triggers with auto_rotate=False and open inventory, inventory is liquidated."""
+        ticker = "KXLOSS-QUIESCE"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            auto_rotate=False,
+            max_session_loss_cents=200,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.liquidate_inventory = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        # Open long position of 4 contracts (< hedge_threshold, so it doesn't hedge)
+        bot.inv_manager.get_position = MagicMock(return_value=4)
+
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": -210.0,
+            "unrealized_pnl_cents": 0.0,
+            "total_fees_cents": 10.0,
+        })
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot.liquidate_inventory.assert_awaited_once_with(ticker)
+        assert bot._market_inactive is True
+
+    @pytest.mark.asyncio
+    async def test_fee_churn_quiesce_liquidates_inventory_without_autorotate(self):
+        """When fee churn triggers with auto_rotate=False and open inventory, inventory is liquidated."""
+        ticker = "KXCHURN-QUIESCE"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            auto_rotate=False,
+            max_session_fees_cents=100,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.liquidate_inventory = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        # Open short position of -3 contracts
+        bot.inv_manager.get_position = MagicMock(return_value=-3)
+
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "session_fees_cents": 150.0,
+            "session_realized_pnl_cents": 0.0,
+            "unrealized_pnl_cents": 0.0,
+        })
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot.liquidate_inventory.assert_awaited_once_with(ticker)
+        assert bot._market_inactive is True
+
+    @pytest.mark.asyncio
+    async def test_price_collar_quiesce_liquidates_inventory_without_autorotate(self):
+        """When price collar is breached with auto_rotate=False and open inventory, inventory is liquidated."""
+        ticker = "KXCOLLAR-QUIESCE"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            min_mid_price=10,
+            max_mid_price=90,
+            auto_rotate=False,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.liquidate_inventory = AsyncMock(return_value=True)
+        # Mid price 5c (below 10c collar)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(4, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(6, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=2)
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot.liquidate_inventory.assert_awaited_once_with(ticker)
+        assert bot._market_inactive is True
+
+    @pytest.mark.asyncio
+    async def test_bot_stop_liquidates_open_inventory(self):
+        """When bot.stop() is called with open inventory, it executes liquidation."""
+        ticker = "KXSTOP-LIQ"
+        bot = AvellanedaStoikovBot(ticker=ticker)
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.liquidate_inventory = AsyncMock(return_value=True)
+        bot.inv_manager.get_position = MagicMock(return_value=7)
+
+        stopped = await bot.stop()
+
+        assert stopped is True
+        bot.liquidate_inventory.assert_awaited_once_with(ticker)
+
+
+class TestPostFillAdverseSelectionBackoff:
+    """Verify post-fill adverse selection backoff pause mechanics."""
+
+    @pytest.mark.asyncio
+    async def test_post_fill_pause_cancels_quotes_and_suppresses_placement(self):
+        """When a fill occurred recently within post_fill_pause_seconds, quotes are withdrawn and placement skipped."""
+        import time
+        ticker = "KXPAUSE-TICKER"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            post_fill_pause_seconds=3.0,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.current_bid_id = "bid-pause-1"
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Fill occurred 1.0 second ago (< 3.0s pause)
+        bot.inv_manager._last_fill_times[ticker] = time.time() - 1.0
+
+        await bot._tick()
+
+        # Quotes must be withdrawn, and no new quotes placed
+        bot._cancel_all_quotes.assert_called_once()
+        bot._update_quotes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_fill_pause_resumes_after_duration_expires(self):
+        """When elapsed time since fill exceeds post_fill_pause_seconds, quoting proceeds normally."""
+        import time
+        ticker = "KXPAUSE-EXPIRED"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            post_fill_pause_seconds=3.0,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Fill occurred 4.0 seconds ago (> 3.0s pause)
+        bot.inv_manager._last_fill_times[ticker] = time.time() - 4.0
+
+        await bot._tick()
+
+        # Quoting proceeded normally
+        bot._update_quotes.assert_called_once_with(48, 52)
+
+    @pytest.mark.asyncio
+    async def test_post_fill_pause_zero_disables_backoff(self):
+        """When post_fill_pause_seconds is 0.0, quoting is never suppressed."""
+        import time
+        ticker = "KXPAUSE-ZERO"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            post_fill_pause_seconds=0.0,
+        )
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Fill just occurred
+        bot.inv_manager._last_fill_times[ticker] = time.time()
+
+        await bot._tick()
+
+        # Quoting proceeded without pause
+        bot._update_quotes.assert_called_once_with(48, 52)
+
