@@ -541,7 +541,9 @@ class InventoryManager:
         return self.pnl_tracker.get_market_summary(ticker)
 
     def get_position(self, ticker: str) -> int:
+        """Returns the net inventory position for a given ticker (+ for YES, - for NO)."""
         return self.positions.get(ticker, 0)
         
     def get_balance(self) -> int:
+        """Returns current available cash balance in cents."""
         return self.balance_cents

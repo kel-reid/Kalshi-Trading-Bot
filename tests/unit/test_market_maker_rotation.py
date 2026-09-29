@@ -565,4 +565,65 @@ async def test_liquidation_financial_accounting_invariants():
     assert round(post_summary["total_fees_cents"], 4) == 7.0
 
 
+@pytest.mark.asyncio
+async def test_rotate_market_aborts_when_liquidation_fails():
+    """Verify that rotate_market aborts and does not swap subscriptions when liquidation of old ticker fails."""
+    bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.liquidate_inventory = AsyncMock(return_value=False)
+
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: 10 if t == "OLD-TICKER" else 0)
+
+    with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+        rotated = await bot.rotate_market("NEW-TICKER")
+
+    assert rotated is False
+    bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    assert bot.ticker == "OLD-TICKER"
+    mock_alert.assert_awaited_once()
+    assert "Rotation aborted" in mock_alert.await_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_cancel_order_fails():
+    """Verify liquidate_inventory immediately aborts and returns False if cancelling a resting order fails."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-stuck")
+    bot.om.cancel_order = AsyncMock(return_value=False)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+
+    bot.om.active_orders["order-stuck"] = {"ticker": "TEST-TICKER"}
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is False
+    bot.om.cancel_order.assert_awaited_once_with("order-stuck")
+    bot.om.place_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_reports_false_when_liquidation_fails():
+    """Verify stop() returns False if liquidation of open inventory fails on shutdown."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.liquidate_inventory = AsyncMock(return_value=False)
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.stop()
+
+    assert success is False
+    bot.liquidate_inventory.assert_awaited_once_with("TEST-TICKER")
+
+
+
 
