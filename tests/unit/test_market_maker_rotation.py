@@ -625,5 +625,38 @@ async def test_stop_reports_false_when_liquidation_fails():
     bot.liquidate_inventory.assert_awaited_once_with("TEST-TICKER")
 
 
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_place_order_fails():
+    """Verify liquidate_inventory immediately aborts and returns False if place_order returns None."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value=None)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)
 
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=3)
+
+    assert success is False
+    bot.om.place_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_on_position_flip():
+    """Verify liquidate_inventory aborts if an overfill causes the position sign to flip."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-flip")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+
+    # Position was +5, but unexpectedly flipped to -3 after execution
+    positions = [5, 5, -3]
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.pop(0) if positions else -3)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=3)
+
+    assert success is False
+    bot.om.place_order.assert_awaited_once()
 
