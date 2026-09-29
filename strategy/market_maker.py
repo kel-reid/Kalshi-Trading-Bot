@@ -40,6 +40,7 @@ from config import (
     MIN_TIME_TO_CLOSE_SECONDS,
     MAX_SESSION_FEES_CENTS,
     MAX_SESSION_LOSS_CENTS,
+    POST_FILL_PAUSE_SECONDS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -76,6 +77,7 @@ class AvellanedaStoikovBot:
         max_mid_price: Optional[int] = None,
         max_session_fees_cents: Optional[int] = None,
         max_session_loss_cents: Optional[int] = None,
+        post_fill_pause_seconds: Optional[float] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -90,6 +92,11 @@ class AvellanedaStoikovBot:
         self.max_mid_price = max_mid_price if max_mid_price is not None else MAX_MID_PRICE
         self.max_session_fees_cents = max_session_fees_cents if max_session_fees_cents is not None else MAX_SESSION_FEES_CENTS
         self.max_session_loss_cents = max_session_loss_cents if max_session_loss_cents is not None else MAX_SESSION_LOSS_CENTS
+        self.post_fill_pause_seconds = (
+            max(0.0, float(post_fill_pause_seconds))
+            if post_fill_pause_seconds is not None
+            else POST_FILL_PAUSE_SECONDS
+        )
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -297,9 +304,13 @@ class AvellanedaStoikovBot:
                             logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                     else:
                         logger.error(f"No replacement market found for {self.ticker}.")
+                        if inventory != 0:
+                            await self.liquidate_inventory(self.ticker)
                         self._market_inactive = True
                         self._last_inactive_retry = now
                 else:
+                    if inventory != 0:
+                        await self.liquidate_inventory(self.ticker)
                     self._market_inactive = True
                 self._maybe_schedule_pnl_snapshot(now, inventory)
                 return
@@ -354,6 +365,8 @@ class AvellanedaStoikovBot:
                             self._market_inactive = True
                             self._last_inactive_retry = now
                             await self._cancel_all_quotes()
+                            if inventory != 0:
+                                await self.liquidate_inventory(self.ticker)
                             self._maybe_schedule_pnl_snapshot(now, inventory)
                             return
 
@@ -465,9 +478,13 @@ class AvellanedaStoikovBot:
                         self._last_inactive_retry = now
                 else:
                     logger.error(f"No replacement market found after {reason} on {self.ticker}.")
+                    if inventory != 0:
+                        await self.liquidate_inventory(self.ticker)
                     self._market_inactive = True
                     self._last_inactive_retry = now
             else:
+                if inventory != 0:
+                    await self.liquidate_inventory(self.ticker)
                 self._market_inactive = True
             return
 
@@ -529,11 +546,28 @@ class AvellanedaStoikovBot:
                         logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                 else:
                     logger.error(f"No replacement market found for collar-breached market {self.ticker}.")
+                    if inventory != 0:
+                        await self.liquidate_inventory(self.ticker)
                     self._market_inactive = True
                     self._last_inactive_retry = now
             else:
+                if inventory != 0:
+                    await self.liquidate_inventory(self.ticker)
                 self._market_inactive = True
             return
+
+        # Check post-fill adverse selection backoff pause
+        if self.post_fill_pause_seconds > 0:
+            last_fill_time = self.inv_manager.get_last_fill_time(self.ticker)
+            if last_fill_time > 0 and (now - last_fill_time) < self.post_fill_pause_seconds:
+                remaining = self.post_fill_pause_seconds - (now - last_fill_time)
+                logger.info(
+                    f"Post-fill adverse selection pause active for {self.ticker} "
+                    f"({remaining:.2f}s remaining). Withdrawing quotes."
+                )
+                if self.current_bid_id or self.current_ask_id:
+                    await self._cancel_all_quotes()
+                return
 
         # 4. Calculate Reservation Price (R)
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
@@ -679,21 +713,97 @@ class AvellanedaStoikovBot:
 
 
 
-    async def _cancel_all_quotes(self) -> bool:
+    async def liquidate_inventory(self, ticker: Optional[str] = None, max_retries: int = 3) -> bool:
+        """
+        Aggressively liquidates open inventory for a ticker by crossing the orderbook
+        spread in slices up to self.max_order_contracts until position is flat (0).
+        Cancels resting quotes before placing liquidation orders.
+        Returns True if inventory is confirmed flat (0), False otherwise.
+        """
+        target_ticker = ticker or self.ticker
+        current_inv = self.inv_manager.get_position(target_ticker)
+        if current_inv == 0:
+            logger.info(f"Inventory for {target_ticker} is already flat (0). No liquidation needed.")
+            return True
+
+        logger.warning(
+            f"Initiating aggressive liquidation for {target_ticker}: "
+            f"net position = {current_inv} contracts."
+        )
+
+        # Cancel any active quotes for target ticker
+        await self._cancel_all_quotes(ticker=target_ticker)
+
+        for attempt in range(1, max_retries + 1):
+            inv = self.inv_manager.get_position(target_ticker)
+            if inv == 0:
+                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is 0.")
+                return True
+
+            best_bid = self.ob_manager.get_best_bid(target_ticker)
+            best_ask = self.ob_manager.get_best_ask(target_ticker)
+
+            slice_count = min(abs(inv), self.max_order_contracts)
+            if inv > 0:
+                action = "sell"
+                # Cross spread to sell YES: hit best bid if available, else floor at 1c
+                price = max(1, min(int(round(best_bid[0])), 99)) if best_bid else 1
+            else:
+                action = "buy"
+                # Cross spread to buy YES: hit best ask if available, else cap at 99c
+                price = max(1, min(int(round(best_ask[0])), 99)) if best_ask else 99
+
+            logger.warning(
+                f"[LIQUIDATION {attempt}/{max_retries}] Placing {action.upper()} {slice_count} YES "
+                f"@ {price}c for {target_ticker} (current position: {inv})"
+            )
+
+            order_id = await self.om.place_order(
+                ticker=target_ticker,
+                side="yes",
+                action=action,
+                count=slice_count,
+                price=price,
+            )
+
+            # Wait briefly for execution / WebSocket fill propagation
+            await asyncio.sleep(0.5)
+
+            # Clean up any un-executed portion if order is still resting
+            if order_id and order_id in self.om.active_orders:
+                await self.om.cancel_order(order_id)
+
+            await self.om.reconcile_resting_orders(ticker=target_ticker)
+
+        # Final position verification
+        remaining_inv = self.inv_manager.get_position(target_ticker)
+        if remaining_inv == 0:
+            logger.info(f"Liquidation successfully flattened inventory for {target_ticker}.")
+            return True
+        else:
+            logger.error(
+                f"Liquidation incomplete for {target_ticker} after {max_retries} attempts. "
+                f"Remaining inventory: {remaining_inv} contracts."
+            )
+            return False
+
+    async def _cancel_all_quotes(self, ticker: Optional[str] = None) -> bool:
         """Withdraws all active quotes from the market."""
+        target_ticker = ticker or self.ticker
         tasks = []
         cancel_targets = []
-        if self.current_bid_id:
-            tasks.append(self.om.cancel_order(self.current_bid_id))
-            cancel_targets.append(("bid", self.current_bid_id))
-        if self.current_ask_id:
-            tasks.append(self.om.cancel_order(self.current_ask_id))
-            cancel_targets.append(("ask", self.current_ask_id))
+        if target_ticker == self.ticker:
+            if self.current_bid_id:
+                tasks.append(self.om.cancel_order(self.current_bid_id))
+                cancel_targets.append(("bid", self.current_bid_id))
+            if self.current_ask_id:
+                tasks.append(self.om.cancel_order(self.current_ask_id))
+                cancel_targets.append(("ask", self.current_ask_id))
              
         all_cancelled = True
 
         if tasks:
-            logger.info("Withdrawing quotes...")
+            logger.info(f"Withdrawing quotes for {target_ticker}...")
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for (side, order_id), result in zip(cancel_targets, results):
@@ -717,9 +827,9 @@ class AvellanedaStoikovBot:
 
         # Actively sweep any resting orders on the exchange for this market ticker
         try:
-            recon_res = await self.om.reconcile_resting_orders(ticker=self.ticker)
+            recon_res = await self.om.reconcile_resting_orders(ticker=target_ticker)
             if recon_res is None:
-                logger.error(f"Resting-order reconciliation failed for {self.ticker} during quote withdrawal.")
+                logger.error(f"Resting-order reconciliation failed for {target_ticker} during quote withdrawal.")
                 all_cancelled = False
         except Exception as e_rec:
             logger.error(f"Exchange resting order sweep failed during quote withdrawal: {e_rec}")
@@ -845,6 +955,20 @@ class AvellanedaStoikovBot:
             await self._escalate_to_kill_switch(context=f"market rotation from {old_ticker} to {new_ticker}")
             return False
 
+        # 1b. Liquidate any open inventory on old_ticker before unsubscribing
+        old_inv = self.inv_manager.get_position(old_ticker)
+        if old_inv != 0:
+            logger.warning(
+                f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation. "
+                f"Liquidating position to prevent unhedged inventory decay..."
+            )
+            liquidation_ok = await self.liquidate_inventory(ticker=old_ticker)
+            if not liquidation_ok:
+                logger.error(
+                    f"Liquidation of {old_ticker} failed or partially filled. "
+                    f"Remaining inventory: {self.inv_manager.get_position(old_ticker)}"
+                )
+
         # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
         await asyncio.sleep(0)
         if self._snapshot_task and not self._snapshot_task.done():
@@ -903,6 +1027,11 @@ class AvellanedaStoikovBot:
         has_active_orders = bool(self.current_bid_id or self.current_ask_id or self.om.active_orders)
         if not quotes_cancelled or has_active_orders:
             quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
+
+        # 1b. Liquidate any open inventory on shutdown
+        if self.inv_manager.get_position(self.ticker) != 0:
+            logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
+            await self.liquidate_inventory(self.ticker)
 
         # Quiesce fills and drain running background snapshot tasks before final write
         await asyncio.sleep(0)

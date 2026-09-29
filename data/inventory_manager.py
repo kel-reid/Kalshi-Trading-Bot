@@ -10,6 +10,7 @@ import logging
 import requests
 import asyncio
 import math
+import time
 import certifi
 from typing import Dict, Any, Optional, List
 
@@ -48,8 +49,16 @@ class InventoryManager:
         self.positions: Dict[str, int] = {}
         self.pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
         self._fill_count: int = 0
+        self._last_fill_time: float = 0.0
+        self._last_fill_times: Dict[str, float] = {}
         
         self.ws_client.add_message_handler(self._handle_message)
+
+    def get_last_fill_time(self, ticker: Optional[str] = None) -> float:
+        """Returns the unix timestamp of the most recent fill for the ticker (or globally)."""
+        if ticker:
+            return self._last_fill_times.get(ticker, 0.0)
+        return self._last_fill_time
 
     def _fetch_balance(self) -> Optional[int]:
         """Fetch cash balance via REST."""
@@ -416,6 +425,9 @@ class InventoryManager:
 
         # All preconditions validated; state mutation and counter increment can now safely occur
         self._fill_count += 1
+        now = time.time()
+        self._last_fill_time = now
+        self._last_fill_times[ticker] = now
         fee = round(fee, 4)
 
         # Adjust balance based on action, preserving sub-cent precision to reconcile with PnLTracker
