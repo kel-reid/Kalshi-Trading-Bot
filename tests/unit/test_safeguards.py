@@ -709,6 +709,37 @@ class TestSessionRiskSafeguards:
         assert stopped is True
         bot.liquidate_inventory.assert_awaited_once_with(ticker)
 
+    @pytest.mark.asyncio
+    async def test_quiesce_liquidation_failure_sends_alert(self):
+        """When safeguard quiescence liquidation fails, send_alert is triggered to notify of unhedged exposure."""
+        ticker = "KXFAIL-LIQ-ALERT"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            auto_rotate=False,
+            max_session_loss_cents=200,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.liquidate_inventory = AsyncMock(return_value=False)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "realized_pnl_cents": -250.0,
+            "unrealized_pnl_cents": 0.0,
+            "total_fees_cents": 10.0,
+        })
+
+        with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+            await bot._tick()
+
+            bot.liquidate_inventory.assert_awaited_once_with(ticker)
+            assert bot._market_inactive is True
+            mock_alert.assert_awaited_once()
+            assert f"Safeguard liquidation failed after session_stop_loss on {ticker}" in mock_alert.await_args[0][0]
+
+
 
 class TestPostFillAdverseSelectionBackoff:
     """Verify post-fill adverse selection backoff pause mechanics."""
