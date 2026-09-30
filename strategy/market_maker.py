@@ -11,6 +11,7 @@ import logging
 import time
 import math
 import os
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
 from data.websocket_client import KalshiWebsocketClient
@@ -834,15 +835,38 @@ class AvellanedaStoikovBot:
             if new_inv == inv and hasattr(self.om, "get_order_status"):
                 order_status = await self.om.get_order_status(order_id)
                 if order_status is not None:
-                    count_orig = order_status.get("count", slice_count)
-                    rem_count = order_status.get("remaining_count")
+                    count_raw = order_status.get(
+                        "initial_count_fp",
+                        order_status.get("count_fp", order_status.get("count", slice_count)),
+                    )
+                    rem_raw = order_status.get(
+                        "remaining_count_fp",
+                        order_status.get("remaining_count"),
+                    )
+                    fill_raw = order_status.get(
+                        "fill_count_fp",
+                        order_status.get("fill_count"),
+                    )
                     status_str = order_status.get("status")
-                    if rem_count is not None:
-                        exec_count = max(0, count_orig - rem_count)
-                    elif status_str == "executed":
-                        exec_count = count_orig
-                    else:
-                        exec_count = 0
+
+                    try:
+                        if fill_raw is not None:
+                            exec_count = max(Decimal("0"), Decimal(str(fill_raw)))
+                        elif rem_raw is not None:
+                            exec_count = max(
+                                Decimal("0"),
+                                Decimal(str(count_raw)) - Decimal(str(rem_raw)),
+                            )
+                        elif status_str == "executed":
+                            exec_count = Decimal(str(count_raw))
+                        else:
+                            exec_count = Decimal("0")
+                    except (InvalidOperation, TypeError, ValueError) as exc:
+                        logger.error(
+                            f"Invalid execution quantities for order {order_id} on {target_ticker}: {exc}; "
+                            f"aborting liquidation to prevent unverified exposure."
+                        )
+                        return False
 
                     if exec_count > 0:
                         logger.info(
