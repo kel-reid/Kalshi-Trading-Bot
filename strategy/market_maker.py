@@ -811,7 +811,17 @@ class AvellanedaStoikovBot:
                     )
                     return False
 
-            await self.om.reconcile_resting_orders(ticker=target_ticker)
+            try:
+                recon_res = await self.om.reconcile_resting_orders(ticker=target_ticker)
+                if recon_res is None:
+                    logger.error(
+                        f"Resting-order reconciliation failed during liquidation on {target_ticker}; "
+                        f"aborting to prevent overfill."
+                    )
+                    return False
+            except Exception as e_rec:
+                logger.error(f"Resting-order reconciliation raised during liquidation on {target_ticker}: {e_rec}")
+                return False
 
             # Drain any pending WebSocket fill tasks from the event loop before sizing next slice
             await asyncio.sleep(0.1)
