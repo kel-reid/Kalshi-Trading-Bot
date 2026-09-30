@@ -723,3 +723,40 @@ async def test_inactive_market_recovery_retries_liquidation_and_alerts_on_failur
         assert "Inactive market liquidation retry failed for INACTIVE_TICKER" in mock_alert.await_args[0][0]
 
 
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_reconciliation_returns_none():
+    """Verify liquidate_inventory aborts and returns False if reconcile_resting_orders returns None."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-1")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=None)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=3)
+
+    assert success is False
+    bot.om.place_order.assert_awaited_once()
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="TEST-TICKER")
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_reconciliation_raises_exception():
+    """Verify liquidate_inventory catches exceptions from reconcile_resting_orders and returns False."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-1")
+    bot.om.reconcile_resting_orders = AsyncMock(side_effect=RuntimeError("Exchange connection dropped"))
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=3)
+
+    assert success is False
+    bot.om.place_order.assert_awaited_once()
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="TEST-TICKER")
+
+
+
