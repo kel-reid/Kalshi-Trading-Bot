@@ -849,6 +849,60 @@ async def test_liquidate_inventory_aborts_when_execution_confirmed_but_hydrated_
     bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
 
 
+@pytest.mark.asyncio
+async def test_liquidate_inventory_parses_fixed_point_fill_count():
+    """Verify liquidate_inventory correctly recognizes execution from fill_count_fp string."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-fp-fill")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={
+        "status": "canceled",
+        "initial_count_fp": "10.00",
+        "remaining_count_fp": "5.00",
+        "fill_count_fp": "5.00",
+    })
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+
+    # Initial position is 10.
+    # 1st call: loop entry reads 10.
+    # 2nd call: new_inv reads 10 (barrier triggers get_order_status).
+    # 3rd call: 1st polling loop check reads 10.
+    # 4th call: 2nd polling loop check reads 5 (partial fill arrived).
+    # Next iteration loop entry reads 5. Slices remaining 5, then flat.
+    positions = [10, 10, 10, 5, 5, 5, 0]
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.pop(0) if positions else 0)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is True
+    assert bot.om.get_order_status.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_on_malformed_order_quantities():
+    """Verify liquidate_inventory fails closed when quantity fields cannot be parsed as numeric."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-corrupt")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={
+        "status": "resting",
+        "remaining_count": "not-a-number",
+        "count": "invalid",
+    })
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is False
+    bot.om.get_order_status.assert_awaited_once_with("order-corrupt")
+
+
+
 
 
 
