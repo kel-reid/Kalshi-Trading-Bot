@@ -827,6 +827,64 @@ class AvellanedaStoikovBot:
             await asyncio.sleep(0.1)
 
             new_inv = self.inv_manager.get_position(target_ticker)
+
+            # Authoritative Execution and Fill Barrier:
+            # If local inventory has not changed, verify execution on exchange before sizing next slice.
+            # Prevents submitting duplicate slices if WebSocket fill notifications are delayed.
+            if new_inv == inv and hasattr(self.om, "get_order_status"):
+                order_status = await self.om.get_order_status(order_id)
+                if order_status is not None:
+                    count_orig = order_status.get("count", slice_count)
+                    rem_count = order_status.get("remaining_count")
+                    status_str = order_status.get("status")
+                    if rem_count is not None:
+                        exec_count = max(0, count_orig - rem_count)
+                    elif status_str == "executed":
+                        exec_count = count_orig
+                    else:
+                        exec_count = 0
+
+                    if exec_count > 0:
+                        logger.info(
+                            f"Order {order_id} executed {exec_count} contracts on exchange; "
+                            f"awaiting WebSocket fill processing..."
+                        )
+                        # Wait up to 2 seconds for WebSocket fill to be dispatched locally
+                        for _ in range(20):
+                            await asyncio.sleep(0.1)
+                            new_inv = self.inv_manager.get_position(target_ticker)
+                            if new_inv != inv:
+                                break
+
+                        # If WebSocket fill still hasn't arrived after wait, perform authoritative REST hydration
+                        if new_inv == inv:
+                            logger.warning(
+                                f"WebSocket fill delayed for order {order_id} on {target_ticker}; "
+                                f"performing authoritative REST position hydration..."
+                            )
+                            hydrated = await self.inv_manager.hydrate(is_startup=False)
+                            new_inv = self.inv_manager.get_position(target_ticker)
+                            if not hydrated and new_inv == inv:
+                                logger.error(
+                                    f"Authoritative position confirmation failed for {target_ticker} after order {order_id}; "
+                                    f"aborting liquidation to prevent unverified exposure."
+                                )
+                                return False
+                else:
+                    # Order status query failed; attempt authoritative position hydration as fallback
+                    logger.warning(
+                        f"Order status query unconfirmed for {order_id}; "
+                        f"attempting authoritative REST position check for {target_ticker}..."
+                    )
+                    hydrated = await self.inv_manager.hydrate(is_startup=False)
+                    new_inv = self.inv_manager.get_position(target_ticker)
+                    if not hydrated and new_inv == inv:
+                        logger.error(
+                            f"Execution outcome of liquidation order {order_id} unconfirmed on {target_ticker}; "
+                            f"aborting liquidation to prevent overfill."
+                        )
+                        return False
+
             if (inv > 0 and new_inv < 0) or (inv < 0 and new_inv > 0):
                 logger.error(
                     f"Liquidation position flipped from {inv} to {new_inv} on {target_ticker}; "
