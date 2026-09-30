@@ -500,6 +500,61 @@ class OrderManager:
                 return False
         return False
 
+    async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query Kalshi for the current execution status of an order.
+        Supports lookup by client_order_id or Kalshi order_id.
+        Returns the order dictionary from Kalshi with 'status', 'count', 'remaining_count',
+        or None on failure.
+        """
+        kalshi_id = order_id
+        if order_id in self.active_orders and self.active_orders[order_id].get("kalshi_order_id"):
+            kalshi_id = self.active_orders[order_id]["kalshi_order_id"]
+
+        sign_path = f"/trade-api/v2/portfolio/orders/{kalshi_id}"
+        max_retries = 2
+        base_delay = 0.5
+
+        for attempt in range(max_retries + 1):
+            await self.rate_limiter.acquire()
+            try:
+                headers = get_auth_headers(method="GET", sign_path=sign_path)
+                with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
+                    resp = await asyncio.to_thread(
+                        requests.get,
+                        BASE_URL + sign_path,
+                        headers=headers,
+                        timeout=10,
+                        verify=certifi.where()
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("order", data)
+                elif resp.status_code == 404 and kalshi_id != order_id:
+                    alt_path = f"/trade-api/v2/portfolio/orders/{order_id}"
+                    headers_alt = get_auth_headers(method="GET", sign_path=alt_path)
+                    with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
+                        resp_alt = await asyncio.to_thread(
+                            requests.get,
+                            BASE_URL + alt_path,
+                            headers=headers_alt,
+                            timeout=10,
+                            verify=certifi.where()
+                        )
+                    if resp_alt.status_code == 200:
+                        data = resp_alt.json()
+                        return data.get("order", data)
+                elif resp.status_code == 429:
+                    if attempt < max_retries:
+                        await asyncio.sleep(base_delay * (2 ** attempt))
+                        continue
+                logger.error(f"Failed to fetch order status for {order_id}: {resp.status_code} - {resp.text}")
+                return None
+            except Exception as e:
+                logger.error(f"Exception fetching order status for {order_id}: {e}")
+                return None
+        return None
+
     def get_tracked_active_orders(self, ticker: str = None) -> List[Dict[str, Any]]:
         """Return list of active orders we are currently tracking, optionally filtered by ticker."""
         orders = []

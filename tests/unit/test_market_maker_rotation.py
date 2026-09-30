@@ -458,6 +458,7 @@ async def test_liquidate_inventory_cancels_resting_order_if_unfilled():
     bot.om.place_order = AsyncMock(return_value="order-unfilled")
     bot.om.cancel_order = AsyncMock(return_value=True)
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={"status": "canceled", "count": 5, "remaining_count": 5})
 
     bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
@@ -497,6 +498,7 @@ async def test_liquidate_inventory_returns_false_when_retries_exhausted():
     bot._cancel_all_quotes = AsyncMock(return_value=True)
     bot.om.place_order = AsyncMock(return_value="order-fail")
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={"status": "canceled", "count": 10, "remaining_count": 10})
     bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
 
@@ -757,6 +759,75 @@ async def test_liquidate_inventory_aborts_when_reconciliation_raises_exception()
     assert success is False
     bot.om.place_order.assert_awaited_once()
     bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="TEST-TICKER")
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_awaits_websocket_fill_when_exchange_confirms_execution():
+    """Verify liquidate_inventory awaits WebSocket fill dispatch when order status confirms execution."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-exec-1")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={"status": "executed", "count": 5, "remaining_count": 0})
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+
+    # Position is 5 initially. On the 2nd check inside the await loop, WebSocket fill arrives and sets it to 0.
+    positions = [5, 5, 5, 0]
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.pop(0) if positions else 0)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is True
+    bot.om.get_order_status.assert_awaited_once_with("order-exec-1")
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_hydrates_rest_positions_when_websocket_fill_delayed():
+    """Verify liquidate_inventory triggers REST hydration when WebSocket fill fails to arrive within wait window."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-exec-2")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={"status": "executed", "count": 5, "remaining_count": 0})
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+
+    current_pos = 5
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: current_pos)
+
+    async def mock_hydrate(is_startup=False):
+        nonlocal current_pos
+        current_pos = 0
+        return True
+
+    bot.inv_manager.hydrate = AsyncMock(side_effect=mock_hydrate)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is True
+    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_order_outcome_unconfirmed():
+    """Verify liquidate_inventory aborts when both order status and REST hydration fail to confirm execution."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-unconfirmed")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value=None)
+    bot.inv_manager.hydrate = AsyncMock(return_value=False)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is False
+    bot.om.get_order_status.assert_awaited_once_with("order-unconfirmed")
+    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
+
 
 
 
