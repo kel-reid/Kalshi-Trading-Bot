@@ -864,7 +864,7 @@ class AvellanedaStoikovBot:
                             )
                             hydrated = await self.inv_manager.hydrate(is_startup=False)
                             new_inv = self.inv_manager.get_position(target_ticker)
-                            if not hydrated and new_inv == inv:
+                            if new_inv == inv:
                                 logger.error(
                                     f"Authoritative position confirmation failed for {target_ticker} after order {order_id}; "
                                     f"aborting liquidation to prevent unverified exposure."

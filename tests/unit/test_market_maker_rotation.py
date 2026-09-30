@@ -829,5 +829,26 @@ async def test_liquidate_inventory_aborts_when_order_outcome_unconfirmed():
     bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
 
 
+@pytest.mark.asyncio
+async def test_liquidate_inventory_aborts_when_execution_confirmed_but_hydrated_position_unchanged():
+    """Verify liquidate_inventory aborts when execution is confirmed on exchange but refreshed position is stale."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock(return_value="order-stale-hydrate")
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.get_order_status = AsyncMock(return_value={"status": "executed", "count": 5, "remaining_count": 0})
+    bot.inv_manager.hydrate = AsyncMock(return_value=True)  # REST call succeeded but returned stale/unchanged data
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.0, 10))
+    bot.inv_manager.get_position = MagicMock(return_value=5)  # Position remains 5
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER", max_retries=2)
+
+    assert success is False
+    bot.om.get_order_status.assert_awaited_once_with("order-stale-hydrate")
+    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
+
+
+
 
 
