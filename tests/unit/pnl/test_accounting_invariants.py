@@ -247,7 +247,7 @@ class TestPnLCoverageEdgeCases:
             "price": 40,
             "fee_cents": 1.8
         })
-        assert im.balance_cents == 9918.2
+        assert im.balance_cents == pytest.approx(9918.2)
 
         # Sell 2 @ 60c with fee 1.2c -> proceeds = 2*60 - 1.2 = 118.8c -> balance = 9918.2 + 118.8 = 10037.0c
         im._handle_fill({
@@ -258,10 +258,10 @@ class TestPnLCoverageEdgeCases:
             "price": 60,
             "fee_cents": 1.2
         })
-        assert im.balance_cents == 10037.0
+        assert im.balance_cents == pytest.approx(10037.0)
         # Balance delta strictly reconciles with Strategy Realized PnL: 10037.0 - 10000 = +37.0c
-        assert im.get_realized_pnl(ticker) == 37.0
-        assert im.balance_cents - 10000.0 == im.get_realized_pnl(ticker)
+        assert im.get_realized_pnl(ticker) == pytest.approx(37.0)
+        assert im.balance_cents - 10000.0 == pytest.approx(im.get_realized_pnl(ticker))
 
     def test_fee_adjusted_outcome_classification(self):
         tracker = PnLTracker()

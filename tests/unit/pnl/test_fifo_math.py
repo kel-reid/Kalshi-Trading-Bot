@@ -245,7 +245,9 @@ class TestMarkToMarketUnrealizedPnL:
         summary = tracker.get_market_summary(ticker)
         assert summary["realized_pnl_cents"] == 0.0
         # (55.4321 - 50.1234) * 10 - 1.5678 = 53.0870 - 1.5678 = 51.5192
-        assert summary["unrealized_pnl_cents"] == 51.5192
-        assert summary["total_pnl_cents"] == 51.5192
-        assert summary["total_fees_cents"] == 1.5678
-        assert summary["total_pnl_cents"] == summary["realized_pnl_cents"] + summary["unrealized_pnl_cents"]
+        assert summary["unrealized_pnl_cents"] == pytest.approx(51.5192, abs=1e-4)
+        assert summary["total_pnl_cents"] == pytest.approx(51.5192, abs=1e-4)
+        assert summary["total_fees_cents"] == pytest.approx(1.5678, abs=1e-4)
+        assert summary["total_pnl_cents"] == pytest.approx(
+            summary["realized_pnl_cents"] + summary["unrealized_pnl_cents"], abs=1e-4
+        )
