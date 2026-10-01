@@ -35,6 +35,13 @@ class TestSafeguardConfigValidation:
 
         try:
             with monkeypatch.context() as m:
+                m.delenv("MIN_MID_PRICE", raising=False)
+                m.delenv("MAX_MID_PRICE", raising=False)
+                importlib.reload(config)
+                assert config.MIN_MID_PRICE == 10
+                assert config.MAX_MID_PRICE == 90
+                assert 1 <= config.MIN_MID_PRICE < config.MAX_MID_PRICE <= 99
+
                 m.setenv("MIN_MID_PRICE", "95")
                 m.setenv("MAX_MID_PRICE", "10")
                 with pytest.raises(ValueError, match="must be strictly less than MAX_MID_PRICE"):
