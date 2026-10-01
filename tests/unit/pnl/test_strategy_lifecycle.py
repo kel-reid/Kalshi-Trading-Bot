@@ -487,4 +487,5 @@ class TestMarketMakerPnLLifecycle:
         await bot.stop()
         assert mock_sync.cancelled()
         assert mock_snap.done()
+        assert not mock_snap.cancelled()
         assert bot.om.record_pnl_snapshot_async.call_count == 1
