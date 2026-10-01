@@ -64,6 +64,11 @@ class TestSessionAttributionAndRotation:
 class TestOrderManagerPnLPersistence:
     """Verifies OrderManager persists PnL attribution snapshots to DB."""
 
+    @pytest.fixture(autouse=True)
+    def mock_db_pool(self):
+        with patch("execution.order_manager.pool.ThreadedConnectionPool", side_effect=MagicMock):
+            yield
+
     def test_record_pnl_snapshot_sql(self):
         om = OrderManager()
         mock_conn = MagicMock()

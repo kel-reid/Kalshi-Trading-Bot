@@ -164,7 +164,7 @@ class TestSessionRiskSafeguards:
 
     @pytest.mark.asyncio
     async def test_session_stop_loss_with_inventory_executes_exit_hedge_only(self, monkeypatch):
-        """When net session PnL breaches max_session_loss_cents with high inventory, exit hedge runs before rotation."""
+        """When net session PnL breaches max_session_loss_cents with high inventory, only the single-sided exit hedge runs; cancellation and rotation are skipped on this tick."""
         ticker = "KXLOSS-HEDGE-TICKER"
         bot = AvellanedaStoikovBot(
             ticker=ticker,

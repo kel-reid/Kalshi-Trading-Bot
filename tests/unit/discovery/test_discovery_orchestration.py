@@ -50,7 +50,8 @@ def test_discover_sports_keyword():
 
 def test_discover_category_sports():
     """Verify general 'SPORTS' preference matches any active sport."""
-    with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
+    with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch, \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NBA", "MLB"]):
         mock_fetch.return_value = [
             {"ticker": "KXMLB-26SEP14-NYY", "status": "open"},
             {"ticker": "KXINX-26SEP14-5800", "status": "open"},
@@ -118,6 +119,7 @@ def test_discovery_wide_probe_budget_caps_total_requests():
     ]
 
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NBA", "MLB"]), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
         # Request with max_total_probes=6 across all in-season series
         result = discover_active_market(target_preference="SPORTS", max_total_probes=6)

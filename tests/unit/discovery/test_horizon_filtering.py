@@ -300,8 +300,8 @@ def test_is_within_horizon_clock_seam_fallback():
     """Verify _is_within_horizon honors patched clock on utils.market_discovery and standalone fallback."""
     import sys
 
-    m = {"ticker": "KXTEST-1", "close_time": "2026-10-18T00:00:00Z"}
-    mock_now = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    m = {"ticker": "KXTEST-1", "close_time": "2020-01-04T00:00:00Z"}
+    mock_now = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
 
     # 1. Honors mocked datetime on utils.market_discovery
     with patch("utils.market_discovery.datetime") as mock_dt:
