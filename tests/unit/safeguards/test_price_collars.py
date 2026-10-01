@@ -30,22 +30,19 @@ class TestSafeguardConfigValidation:
 
     def test_price_collar_invariant_enforcement(self, monkeypatch):
         """MIN_MID_PRICE must be strictly less than MAX_MID_PRICE and within [1, 99]."""
-        # Valid bounds
-        min_p = _get_int_env("MIN_MID_PRICE", 10)
-        max_p = _get_int_env("MAX_MID_PRICE", 90)
-        assert min_p == 10
-        assert max_p == 90
-        assert 1 <= min_p < max_p <= 99
+        import importlib
+        import config
 
-        # Inverted bounds simulation
-        with pytest.raises(ValueError, match="must be strictly less than MAX_MID_PRICE"):
-            test_min = 95
-            test_max = 10
-            if test_min < 1 or test_max > 99 or test_min >= test_max:
-                raise ValueError(
-                    f"Invalid price collar configuration: MIN_MID_PRICE ({test_min}) "
-                    f"must be strictly less than MAX_MID_PRICE ({test_max}) and within [1, 99]."
-                )
+        monkeypatch.setenv("MIN_MID_PRICE", "95")
+        monkeypatch.setenv("MAX_MID_PRICE", "10")
+        try:
+            with pytest.raises(ValueError, match="must be strictly less than MAX_MID_PRICE"):
+                importlib.reload(config)
+        finally:
+            monkeypatch.delenv("MIN_MID_PRICE", raising=False)
+            monkeypatch.delenv("MAX_MID_PRICE", raising=False)
+            importlib.reload(config)
+
 
 
 class TestPriceCollarQuotingEngine:

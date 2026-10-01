@@ -25,6 +25,10 @@ from utils.market_scoring import _get_orderbook_checker
 
 def test_liquidity_key_v2_fields_and_horizon_weighting():
     """Verify _liquidity_key parses v2 float string fields and applies horizon multiplier."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    near_term_close = (now + datetime.timedelta(days=3)).isoformat()
+    distant_close = (now + datetime.timedelta(days=500)).isoformat()
+
     # Near term (3 days) contract with v2 float string fields
     near_term_market = {
         "ticker": "KXNFLGAME-26SEP17DETBUF",
@@ -32,7 +36,7 @@ def test_liquidity_key_v2_fields_and_horizon_weighting():
         "open_interest_fp": "1200.00",
         "yes_bid_dollars": "0.3200",
         "yes_ask_dollars": "0.3500",
-        "close_time": "2026-09-18T20:00:00Z",  # near-term
+        "close_time": near_term_close,  # near-term
     }
 
     # Distant futures prop (e.g. 2 years out) with high legacy volume
@@ -42,7 +46,7 @@ def test_liquidity_key_v2_fields_and_horizon_weighting():
         "open_interest": 2000,
         "yes_bid": 10,
         "yes_ask": 25,
-        "close_time": "2029-01-01T00:00:00Z",  # distant horizon (>365d)
+        "close_time": distant_close,  # distant horizon (>365d)
     }
 
     score_near = _liquidity_key(near_term_market)

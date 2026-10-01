@@ -148,11 +148,17 @@ async def test_bot_unknown_market_status_does_not_rotate():
 async def test_rotate_market_liquidates_open_inventory_before_switching():
     """Verify that rotate_market liquidates open inventory on old_ticker before switching."""
     bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    call_order = []
     bot._cancel_all_quotes = AsyncMock(return_value=True)
-    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.unsubscribe = AsyncMock(side_effect=lambda *a, **k: call_order.append("unsubscribe"))
     bot.ob_manager.subscribe = AsyncMock()
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
-    bot.liquidate_inventory = AsyncMock(return_value=True)
+
+    async def _liquidate(**kwargs):
+        call_order.append("liquidate")
+        return True
+
+    bot.liquidate_inventory = AsyncMock(side_effect=_liquidate)
 
     # Old ticker has 10 contracts open; new ticker is 0
     bot.inv_manager.get_position = MagicMock(side_effect=lambda t: 10 if t == "OLD-TICKER" else 0)
@@ -161,6 +167,7 @@ async def test_rotate_market_liquidates_open_inventory_before_switching():
         rotated = await bot.rotate_market("NEW-TICKER")
 
     assert rotated is True
+    assert call_order == ["liquidate", "unsubscribe"]
     bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
     bot.ob_manager.unsubscribe.assert_awaited_once_with(["OLD-TICKER"])
     bot.ob_manager.subscribe.assert_awaited_once_with(["NEW-TICKER"])
