@@ -306,8 +306,8 @@ def test_is_within_horizon_clock_seam_fallback():
     # 1. Honors mocked datetime on utils.market_discovery
     with patch("utils.market_discovery.datetime") as mock_dt:
         mock_dt.datetime.now.return_value = mock_now
-        mock_dt.datetime.timezone = datetime.timezone
         assert _is_within_horizon(m, max_days=7.0) is True
+        mock_dt.datetime.now.assert_called_once()
 
     # 2. Standalone fallback when utils.market_discovery is not in sys.modules
     saved_md = sys.modules.pop("utils.market_discovery", None)
