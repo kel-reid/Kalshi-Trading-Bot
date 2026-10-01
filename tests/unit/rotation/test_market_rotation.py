@@ -36,6 +36,8 @@ async def test_bot_rotate_market_aborts_when_quote_cancel_fails():
     """Verify that rotate_market aborts without changing subscription if quote cancellation fails."""
     bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
     bot._cancel_all_quotes = AsyncMock(return_value=False)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot._escalate_to_kill_switch = AsyncMock(return_value=False)
     bot.ob_manager.unsubscribe = AsyncMock()
     bot.ob_manager.subscribe = AsyncMock()
 
@@ -44,6 +46,9 @@ async def test_bot_rotate_market_aborts_when_quote_cancel_fails():
 
     assert rotated is False
     assert bot.ticker == "OLD-TICKER"
+    bot.om.reconcile_resting_orders.assert_awaited_once_with(ticker="OLD-TICKER")
+    bot._escalate_to_kill_switch.assert_awaited_once()
+    assert "market rotation" in bot._escalate_to_kill_switch.await_args.kwargs["context"]
     bot.ob_manager.unsubscribe.assert_not_awaited()
     bot.ob_manager.subscribe.assert_not_awaited()
     mock_alert.assert_not_awaited()
