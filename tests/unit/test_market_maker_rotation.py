@@ -902,6 +902,73 @@ async def test_liquidate_inventory_aborts_on_malformed_order_quantities():
     bot.om.get_order_status.assert_awaited_once_with("order-corrupt")
 
 
+@pytest.mark.asyncio
+async def test_liquidate_inventory_directionally_rounds_subcent_prices():
+    """Verify liquidate_inventory floors bids for sells and ceils asks for buys to guarantee crossing."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.om.place_order = AsyncMock(return_value="order-subcent")
+
+    # Long position (sells into 45.6c bid -> floors to 45c)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45.6, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(55.4, 10))
+    positions = [5, 5, 0]
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.pop(0) if positions else 0)
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER")
+    assert success is True
+    bot.om.place_order.assert_awaited_once_with(
+        ticker="TEST-TICKER",
+        side="yes",
+        action="sell",
+        count=5,
+        price=45,
+    )
+
+    # Short position (buys into 55.4c ask -> ceils to 56c)
+    bot.om.place_order.reset_mock()
+    positions_short = [-5, -5, 0]
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions_short.pop(0) if positions_short else 0)
+
+    success_short = await bot.liquidate_inventory(ticker="TEST-TICKER")
+    assert success_short is True
+    bot.om.place_order.assert_awaited_once_with(
+        ticker="TEST-TICKER",
+        side="yes",
+        action="buy",
+        count=5,
+        price=56,
+    )
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_refuses_when_opposing_book_is_empty():
+    """Verify liquidate_inventory fails closed without sending 1c/99c orders when opposing book is empty."""
+    bot = AvellanedaStoikovBot(ticker="TEST-TICKER", gamma=0.5, min_spread=4)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.place_order = AsyncMock()
+
+    # Long position with empty bids
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=None)
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(50.0, 10))
+
+    success = await bot.liquidate_inventory(ticker="TEST-TICKER")
+    assert success is False
+    bot.om.place_order.assert_not_awaited()
+
+    # Short position with empty asks
+    bot.inv_manager.get_position = MagicMock(return_value=-5)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(50.0, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=None)
+
+    success_short = await bot.liquidate_inventory(ticker="TEST-TICKER")
+    assert success_short is False
+    bot.om.place_order.assert_not_awaited()
+
+
+
 
 
 

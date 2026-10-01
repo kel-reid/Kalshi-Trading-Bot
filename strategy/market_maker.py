@@ -770,15 +770,22 @@ class AvellanedaStoikovBot:
             best_bid = self.ob_manager.get_best_bid(target_ticker)
             best_ask = self.ob_manager.get_best_ask(target_ticker)
 
+            if (inv > 0 and not best_bid) or (inv < 0 and not best_ask):
+                logger.error(
+                    f"No opposing liquidity on {target_ticker} for liquidation (position={inv}); "
+                    f"refusing to place an unprotected 1c/99c order."
+                )
+                return False
+
             slice_count = min(abs(inv), self.max_order_contracts)
             if inv > 0:
                 action = "sell"
-                # Cross spread to sell YES: hit best bid if available, else floor at 1c
-                price = max(1, min(int(round(best_bid[0])), 99)) if best_bid else 1
+                # Cross spread to sell YES: floor the bid so the limit order never sits above it
+                price = max(1, min(math.floor(best_bid[0]), 99))
             else:
                 action = "buy"
-                # Cross spread to buy YES: hit best ask if available, else cap at 99c
-                price = max(1, min(int(round(best_ask[0])), 99)) if best_ask else 99
+                # Cross spread to buy YES: ceil the ask so the limit order never sits below it
+                price = max(1, min(math.ceil(best_ask[0]), 99))
 
             total_slices += 1
             logger.warning(
