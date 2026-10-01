@@ -108,6 +108,7 @@ async def test_starvation_triggers_auto_rotation():
     bot._starvation_start_time = time.time() - 905
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert, \
+         patch("strategy.market_maker.is_market_active_async", new=AsyncMock(return_value=True)), \
          patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="REPLACEMENT_TICKER")) as mock_discover:
         await bot._tick()
 
@@ -184,6 +185,7 @@ async def test_starvation_rotation_failure_sets_retry_timestamp():
     bot._starvation_start_time = time.time() - 905
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock), \
+         patch("strategy.market_maker.is_market_active_async", new=AsyncMock(return_value=True)), \
          patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="REPLACEMENT_TICKER")):
         now_before = time.time()
         await bot._tick()
