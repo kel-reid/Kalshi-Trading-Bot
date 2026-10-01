@@ -1,0 +1,293 @@
+"""
+Unit Tests for Price Collar Safeguards
+
+Validates:
+1. Config validation & boundary enforcement for MIN_MID_PRICE and MAX_MID_PRICE.
+2. Market Maker quoting engine halts, cancels resting orders, and initiates rotation when mid-price breaches collar.
+3. Exit hedge only execution when inventory is non-zero despite collar breach.
+4. Pre-flight discovery orderbook checker rejects candidate markets with midpoints outside collar.
+"""
+
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
+
+from config import _get_int_env
+from strategy.market_maker import AvellanedaStoikovBot
+from utils.market_api import check_orderbook_has_quotes
+from utils.metrics import SAFEGUARD_EVENTS_TOTAL
+
+
+class TestSafeguardConfigValidation:
+    """Verify strict fail-fast validation for safeguard config parameters."""
+
+    def test_get_int_env_allow_zero(self, monkeypatch):
+        monkeypatch.setenv("TEST_EXPIRY_BUF", "0")
+        assert _get_int_env("TEST_EXPIRY_BUF", 3600, allow_zero=True) == 0
+
+        monkeypatch.setenv("TEST_EXPIRY_BUF", "-1")
+        with pytest.raises(ValueError, match="must be a non-negative integer"):
+            _get_int_env("TEST_EXPIRY_BUF", 3600, allow_zero=True)
+
+    def test_price_collar_invariant_enforcement(self, monkeypatch):
+        """MIN_MID_PRICE must be strictly less than MAX_MID_PRICE and within [1, 99]."""
+        import importlib
+        import config
+
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("MIN_MID_PRICE", raising=False)
+                m.delenv("MAX_MID_PRICE", raising=False)
+                importlib.reload(config)
+                assert config.MIN_MID_PRICE == 10
+                assert config.MAX_MID_PRICE == 90
+                assert 1 <= config.MIN_MID_PRICE < config.MAX_MID_PRICE <= 99
+
+                m.setenv("MIN_MID_PRICE", "95")
+                m.setenv("MAX_MID_PRICE", "10")
+                with pytest.raises(ValueError, match="must be strictly less than MAX_MID_PRICE"):
+                    importlib.reload(config)
+        finally:
+            importlib.reload(config)
+
+
+
+class TestPriceCollarQuotingEngine:
+    """Verify MarketMaker quoting behavior when midpoint approaches extreme territory."""
+
+    @pytest.mark.asyncio
+    async def test_mid_below_min_collar_cancels_and_quiesces(self):
+        """When mid-price drops below 10c (e.g. 1c-9c blowout), bot cancels quotes and halts."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-BLOWOUT",
+            gamma=0.5,
+            min_spread=2,
+            order_dollars=1.0,
+            min_mid_price=10,
+            max_mid_price=90,
+            auto_rotate=False,
+        )
+        bot._cancel_all_quotes = AsyncMock()
+        bot._update_quotes = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Extreme low odds: best bid = 1c, best ask = 3c -> mid = 2.0c
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(1, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(3, 10))
+
+        initial_count = SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker="KXNFLGAME-BLOWOUT")._value.get()
+
+        await bot._tick()
+
+        # Quotes must be immediately cancelled and no orders updated
+        bot._cancel_all_quotes.assert_called_once()
+        bot._update_quotes.assert_not_called()
+        assert bot._market_inactive is True
+
+        # Counter incremented
+        new_count = SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_collar", ticker="KXNFLGAME-BLOWOUT")._value.get()
+        assert new_count == initial_count + 1
+
+    @pytest.mark.asyncio
+    async def test_mid_above_max_collar_cancels_and_rotates(self):
+        """When mid-price exceeds 90c (e.g. 95c lock), bot cancels quotes and initiates rotation."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-LOCK",
+            gamma=0.5,
+            min_spread=2,
+            order_dollars=1.0,
+            min_mid_price=10,
+            max_mid_price=90,
+            auto_rotate=True,
+        )
+        bot._cancel_all_quotes = AsyncMock()
+        bot._update_quotes = AsyncMock()
+        bot.rotate_market = AsyncMock(return_value=True)
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Extreme high odds: best bid = 94c, best ask = 96c -> mid = 95.0c
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(94, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(96, 10))
+
+        with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="KXNFLGAME-REPLACEMENT")):
+            await bot._tick()
+
+        bot._cancel_all_quotes.assert_called_once()
+        bot._update_quotes.assert_not_called()
+        bot.rotate_market.assert_called_once_with("KXNFLGAME-REPLACEMENT")
+        assert bot._market_inactive is False
+
+    @pytest.mark.asyncio
+    async def test_mid_within_collar_quotes_normally(self):
+        """When mid-price is within [10c, 90c], quoting proceeds normally."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-BALANCED",
+            gamma=0.5,
+            min_spread=4,
+            order_dollars=1.0,
+            min_mid_price=10,
+            max_mid_price=90,
+        )
+        bot._update_quotes = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        # Balanced mid-price = 50.0c
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+
+        await bot._tick()
+
+        bot._update_quotes.assert_called_once_with(48, 52)
+        assert bot._market_inactive is False
+
+    @pytest.mark.asyncio
+    async def test_mid_below_min_collar_with_high_inventory_executes_exit_hedge_only(self):
+        """When mid-price breaches collar but inventory is at or above hedge threshold, bot executes only exit hedge."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-HEDGE-LONG",
+            gamma=0.5,
+            min_spread=2,
+            order_dollars=1.0,
+            min_mid_price=10,
+            max_mid_price=90,
+            auto_rotate=True,
+            max_hedge_inventory=10,
+        )
+        bot._cancel_all_quotes = AsyncMock()
+        bot._update_quotes = AsyncMock()
+        bot.rotate_market = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        # Inventory = 15 (high long inventory >= hedge_threshold)
+        bot.inv_manager.get_position = MagicMock(return_value=15)
+        bot.inv_manager.pnl_tracker.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.pnl_tracker.get_unrealized_pnl = MagicMock(return_value=-50.0)
+
+        # Extreme blowout mid: best bid = 1c, best ask = 3c -> mid = 2.0c (< 10c)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(1, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(3, 10))
+
+        await bot._tick()
+
+        # Quotes must NOT be cancelled across the board, and rotation must NOT be initiated yet
+        bot._cancel_all_quotes.assert_not_called()
+        bot.rotate_market.assert_not_called()
+
+        # Single-sided exit quote: BID is None, ASK crosses best bid (max(2, min(1, 99)) = 2c)
+        bot._update_quotes.assert_called_once_with(None, 2)
+        assert bot._market_inactive is False
+
+    @pytest.mark.asyncio
+    async def test_mid_above_max_collar_with_high_short_inventory_executes_exit_hedge_only(self):
+        """When mid-price exceeds collar but short inventory is at/above threshold, bot executes only exit hedge."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXNFLGAME-HEDGE-SHORT",
+            gamma=0.5,
+            min_spread=2,
+            order_dollars=1.0,
+            min_mid_price=10,
+            max_mid_price=90,
+            auto_rotate=True,
+            max_hedge_inventory=10,
+        )
+        bot._cancel_all_quotes = AsyncMock()
+        bot._update_quotes = AsyncMock()
+        bot.rotate_market = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        # Inventory = -15 (high short inventory <= -hedge_threshold)
+        bot.inv_manager.get_position = MagicMock(return_value=-15)
+        bot.inv_manager.pnl_tracker.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.pnl_tracker.get_unrealized_pnl = MagicMock(return_value=-50.0)
+
+        # Extreme high mid: best bid = 94c, best ask = 96c -> mid = 95.0c (> 90c)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(94, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(96, 10))
+
+        await bot._tick()
+
+        # Quotes must NOT be cancelled across the board, and rotation must NOT be initiated yet
+        bot._cancel_all_quotes.assert_not_called()
+        bot.rotate_market.assert_not_called()
+
+        # Single-sided exit quote: ASK is None, BID crosses best ask (max(1, min(96, 98)) = 96c)
+        bot._update_quotes.assert_called_once_with(96, None)
+        assert bot._market_inactive is False
+
+
+class TestPreflightDiscoveryCollar:
+    """Verify check_orderbook_has_quotes filters out markets outside collar."""
+
+    def test_preflight_orderbook_rejects_collar_breach(self):
+        """Preflight orderbook screening rejects markets with midpoint outside [10c, 90c]."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # YES bid = 2c, NO bid = 96c -> YES ask = 4c -> mid = 3.0c (< 10c)
+        mock_resp.json.return_value = {
+            "orderbook_fp": {
+                "yes_dollars_fp": [["0.0200", "50.00"]],
+                "no_dollars_fp": [["0.9600", "50.00"]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            assert check_orderbook_has_quotes("KXNFLGAME-EXTREME-LOW") is False
+
+    def test_preflight_orderbook_accepts_collar_compliant(self):
+        """Preflight orderbook screening accepts markets with midpoint within [10c, 90c]."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # YES bid = 48c, NO bid = 48c -> YES ask = 52c -> mid = 50.0c
+        mock_resp.json.return_value = {
+            "orderbook_fp": {
+                "yes_dollars_fp": [["0.4800", "50.00"]],
+                "no_dollars_fp": [["0.4800", "50.00"]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            assert check_orderbook_has_quotes("KXNFLGAME-COMPLIANT") is True
+
+    def test_preflight_orderbook_respects_custom_collar_bounds(self):
+        """Preflight screening uses custom collar bounds when passed instead of global defaults."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # YES bid = 14c, NO bid = 84c -> YES ask = 16c -> mid = 15.0c
+        # 15.0c is WITHIN global [10, 90], but OUTSIDE custom [20, 80]
+        mock_resp.json.return_value = {
+            "orderbook_fp": {
+                "yes_dollars_fp": [["0.1400", "50.00"]],
+                "no_dollars_fp": [["0.8400", "50.00"]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            # Passes default global collar
+            assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND") is True
+            # Fails custom tighter collar
+            assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND", min_mid_price=20.0, max_mid_price=80.0) is False
+
+    def test_preflight_orderbook_legacy_cents_unit_disambiguation(self):
+        """Legacy 'yes' and 'no' fields with value 1 or 1.0 are treated as 1 cent, not $1.00."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # Legacy format: yes bid = 1 cent, no bid = 97 cents -> implied ask = 3 cents -> mid = 2.0 cents (< 10c)
+        mock_resp.json.return_value = {
+            "orderbook": {
+                "yes": [[1.0, 10]],
+                "no": [[97.0, 10]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            # Mid = (1 + (100 - 97)) / 2 = 2c -> Outside collar [10, 90] -> Returns False
+            assert check_orderbook_has_quotes("KXNFLGAME-LEGACY-CENT") is False
+
+    def test_preflight_orderbook_fails_closed_on_invalid_data(self):
+        """Preflight fails closed (returns False) when orderbook prices are invalid or malformed."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "orderbook": {
+                "yes": [["invalid_price", 10]],
+                "no": [[50, 10]],
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            assert check_orderbook_has_quotes("KXNFLGAME-MALFORMED") is False
