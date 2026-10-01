@@ -1043,6 +1043,16 @@ def test_config_get_float_env_defensive_parsing():
     with patch.dict(os.environ, {"TEST_FLOAT_VAL": "14"}):
         assert _get_float_env("TEST_FLOAT_VAL", 8.0) == 14.0
 
+    # allow_zero=True tests
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "0"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 3.0, allow_zero=True) == 0.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "0.0"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 3.0, allow_zero=True) == 0.0
+
+    with patch.dict(os.environ, {"TEST_FLOAT_VAL": "-1.0"}):
+        assert _get_float_env("TEST_FLOAT_VAL", 3.0, allow_zero=True) == 3.0
+
 
 def test_config_get_int_env_fail_fast_validation():
     """Verify _get_int_env in config returns default for missing/empty and raises ValueError on invalid values."""

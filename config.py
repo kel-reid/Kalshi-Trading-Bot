@@ -41,14 +41,20 @@ if "pytest" not in sys.modules and not has_env_key and not PRIVATE_KEY_PATH.exis
 # Alerting
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
-def _get_float_env(name: str, default: float) -> float:
+def _get_float_env(name: str, default: float, allow_zero: bool = False) -> float:
     val = os.getenv(name)
     if val is None or not str(val).strip():
         return default
     try:
         f = float(val)
-        if not math.isfinite(f) or f <= 0.0:
+        if not math.isfinite(f):
             return default
+        if allow_zero:
+            if f < 0.0:
+                return default
+        else:
+            if f <= 0.0:
+                return default
         return f
     except (ValueError, TypeError):
         return default
@@ -101,9 +107,13 @@ MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 3600, allo
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
 # Fee Churn & Session Stop-Loss Safeguards (Cents)
-# Cease quoting and rotate away if fees or net loss on a single market session exceed these thresholds.
-MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 150)
-MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 200)
+# Cease quoting, liquidate inventory, and rotate away if fees or net loss on a single market session exceed these thresholds.
+MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 250)
+MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
+
+# Post-Fill Adverse Selection Protection (Seconds)
+# Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
+POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0, allow_zero=True)
 
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")
