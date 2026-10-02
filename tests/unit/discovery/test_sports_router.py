@@ -376,3 +376,37 @@ def test_october_quadruple_overlap_queries_mlb_when_nfl_ncaaf_nba_fallbacks_empt
 
         assert selected == "KXMLBGAME-26OCT15-WS"
         assert queried_series_calls == ["KXNFLGAME", "KXNCAAFGAME", "KXNBAGAME", "KXMLBGAME"]
+
+
+def test_targeted_discovery_continues_when_global_fetch_only_contains_excluded_ticker():
+    """
+    Verify that when the initial global fetch returns only the excluded ticker,
+    discovery does not prematurely abort with None, but instead continues to targeted
+    series queries (e.g., KXNCAAFGAME) to locate an active replacement.
+    """
+    excluded_ticker = "KXNCAAFGAME-OLD-SETTLED"
+    replacement_ticker = "KXNCAAFGAME-NEW-ACTIVE"
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker is None:
+            # Global fetch only returns the excluded ticker
+            return [
+                {"ticker": excluded_ticker, "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "50000.00"}
+            ]
+        elif series_ticker == "KXNCAAFGAME":
+            # Targeted query returns both the old excluded ticker and the new active replacement
+            return [
+                {"ticker": excluded_ticker, "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "50000.00"},
+                {"ticker": replacement_ticker, "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "40000.00"},
+            ]
+        return []
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NCAAF"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        selected = discover_active_market(
+            target_preference="CFB",
+            exclude_tickers=[excluded_ticker],
+            preflight_check=True,
+        )
+        assert selected == replacement_ticker
