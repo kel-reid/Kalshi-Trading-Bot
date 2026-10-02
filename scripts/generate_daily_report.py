@@ -95,6 +95,7 @@ def compute_fifo_round_trips(fills: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "exit_price": norm_price,
                     "count": match_cnt,
                     "gross_pnl": gross_pnl,
+                    "gross_pnl_cents": gross_pnl,
                     "direction": "long" if lot_side == 1 else "short",
                     "timestamp": f.get("created_at"),
                 })
@@ -173,8 +174,9 @@ def fetch_daily_metrics(
         "tickers": {},
         "totals": {
             "total_realized_delta_cents": 0.0,
-            "total_fees_delta_cents": 0.0,
+            "total_unrealized_delta_cents": 0.0,
             "total_ending_unrealized_cents": 0.0,
+            "total_fees_delta_cents": 0.0,
             "net_strategy_pnl_cents": 0.0,
             "total_orders": 0,
             "total_buy_orders": 0,
@@ -358,6 +360,7 @@ def fetch_daily_metrics(
             metrics["tickers"][ticker] = ticker_metrics
 
             metrics["totals"]["total_realized_delta_cents"] += realized_delta
+            metrics["totals"]["total_unrealized_delta_cents"] += unrealized_delta
             metrics["totals"]["total_fees_delta_cents"] += fees_delta
             metrics["totals"]["total_ending_unrealized_cents"] += ending_unrealized
             metrics["totals"]["net_strategy_pnl_cents"] += (realized_delta + unrealized_delta)
@@ -368,20 +371,32 @@ def fetch_daily_metrics(
             metrics["totals"]["total_cancels"] += cancels
             metrics["totals"]["total_contracts_quoted"] += total_contracts
 
-        # Overall FIFO round-trip trade totals
-        day_rt = compute_fifo_round_trips(all_day_fills)
-        metrics["totals"]["total_round_trips"] = day_rt["total_round_trips"]
-        metrics["totals"]["winning_trades"] = day_rt["winning_trades"]
-        metrics["totals"]["losing_trades"] = day_rt["losing_trades"]
-        metrics["totals"]["scratch_trades"] = day_rt["scratch_trades"]
-        metrics["totals"]["win_rate_pct"] = day_rt["win_rate_pct"]
-        metrics["totals"]["win_rate_ex_scratches_pct"] = day_rt["win_rate_ex_scratches_pct"]
-        metrics["totals"]["gross_wins_cents"] = day_rt["gross_wins_cents"]
-        metrics["totals"]["gross_losses_cents"] = day_rt["gross_losses_cents"]
-        metrics["totals"]["net_gross_realized_cents"] = day_rt["net_gross_realized_cents"]
-        metrics["totals"]["avg_win_cents"] = day_rt["avg_win_cents"]
-        metrics["totals"]["avg_loss_cents"] = day_rt["avg_loss_cents"]
-        metrics["totals"]["profit_factor"] = day_rt["profit_factor"]
+        # Overall FIFO round-trip trade totals aggregated per-ticker to avoid cross-ticker lot matching
+        all_round_trips = []
+        for t_data in metrics["tickers"].values():
+            all_round_trips.extend(t_data.get("trade_outcomes", {}).get("round_trips", []))
+
+        total_rts = len(all_round_trips)
+        wins = sum(1 for rt in all_round_trips if rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) > 0)
+        losses = sum(1 for rt in all_round_trips if rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) < 0)
+        scratches = sum(1 for rt in all_round_trips if rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) == 0)
+        gross_wins = sum(rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) for rt in all_round_trips if rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) > 0)
+        gross_losses = sum(rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) for rt in all_round_trips if rt.get("gross_pnl_cents", rt.get("gross_pnl", 0.0)) < 0)
+        net_gross = gross_wins + gross_losses
+
+        metrics["totals"]["total_round_trips"] = total_rts
+        metrics["totals"]["winning_trades"] = wins
+        metrics["totals"]["losing_trades"] = losses
+        metrics["totals"]["scratch_trades"] = scratches
+        metrics["totals"]["win_rate_pct"] = (wins / total_rts * 100.0) if total_rts > 0 else 0.0
+        decisive = wins + losses
+        metrics["totals"]["win_rate_ex_scratches_pct"] = (wins / decisive * 100.0) if decisive > 0 else 0.0
+        metrics["totals"]["gross_wins_cents"] = gross_wins
+        metrics["totals"]["gross_losses_cents"] = gross_losses
+        metrics["totals"]["net_gross_realized_cents"] = net_gross
+        metrics["totals"]["avg_win_cents"] = (gross_wins / wins) if wins > 0 else 0.0
+        metrics["totals"]["avg_loss_cents"] = (gross_losses / losses) if losses > 0 else 0.0
+        metrics["totals"]["profit_factor"] = (gross_wins / abs(gross_losses)) if gross_losses != 0 else (999.0 if gross_wins > 0 else 0.0)
 
     return metrics
 
@@ -485,13 +500,15 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
     recommendations = generate_recommendations(metrics)
 
     realized_cents = totals.get("total_realized_delta_cents", 0.0)
-    unrealized_cents = totals.get("total_ending_unrealized_cents", 0.0)
+    unrealized_delta_cents = totals.get("total_unrealized_delta_cents", 0.0)
+    ending_unrealized_cents = totals.get("total_ending_unrealized_cents", 0.0)
     fees_cents = totals.get("total_fees_delta_cents", 0.0)
     net_pnl_cents = totals.get("net_strategy_pnl_cents", 0.0)
 
     # Dollar conversions
     realized_dlr = realized_cents / 100.0
-    unrealized_dlr = unrealized_cents / 100.0
+    unrealized_delta_dlr = unrealized_delta_cents / 100.0
+    ending_unrealized_dlr = ending_unrealized_cents / 100.0
     fees_dlr = fees_cents / 100.0
     net_pnl_dlr = net_pnl_cents / 100.0
 
@@ -525,14 +542,15 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
         "",
         "| Metric | Value ($) | Accounting Status |",
         "| :--- | :---: | :--- |",
-        f"| **Session Realized PnL** | `${realized_dlr:+.2f}` | Locked-in round-trip cash delta |",
-        f"| **Ending Unrealized PnL** | `${unrealized_dlr:+.2f}` | Mark-to-Market on open lots |",
+        f"| **Session Realized PnL** | `${realized_dlr:+.2f}` | Locked-in round-trip cash delta ($\\Delta \\text{{Realized}}$) |",
+        f"| **Session Unrealized PnL** | `${unrealized_delta_dlr:+.2f}` | Mark-to-Market delta ($\\Delta \\text{{Unrealized}}$) |",
+        f"| **Ending Unrealized Value** | `${ending_unrealized_dlr:+.2f}` | Open inventory value at close |",
         f"| **Total Session Fees Paid** | `${fees_dlr:.2f}` | Kalshi exchange transaction costs |",
         f"| **Net Strategy PnL** | `${net_pnl_dlr:+.2f}` | $\\Delta \\text{{Realized}} + \\Delta \\text{{Unrealized}}$ |",
         "",
         "> [!NOTE]",
         f"> **Financial Invariant Check**: Total Strategy PnL reconciles strictly: "
-        f"$\\text{{Realized}} (${realized_dlr:+.2f}) + \\text{{Unrealized}} (${unrealized_dlr:+.2f}) = ${net_pnl_dlr:+.2f}$.",
+        f"$\\Delta \\text{{Realized}} (${realized_dlr:+.2f}) + \\Delta \\text{{Unrealized}} (${unrealized_delta_dlr:+.2f}) = ${net_pnl_dlr:+.2f}$.",
         "",
         "### Why Realized PnL Ended Where It Did",
         "",
@@ -585,14 +603,23 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
     ])
 
     if total_rts > 0:
-        lines.extend([
-            f"- **Asymmetric Directional Drift**: The win rate finished at **`{win_rate:.1f}%`** (`{wins}` wins, `{losses}` losses, `{scratches}` scratch). "
-            "In sports prediction markets (such as NFL game winner contracts), prices drift aggressively with in-game game state. "
-            "When the market experienced severe downward momentum (e.g. plunging from $0.78 down to $0.08), resting BID orders were repeatedly filled on the way down, "
-            "leaving the market maker with long inventory that had to be offloaded at progressively lower prices.",
-            f"- **Asymmetric PnL Distribution (Payoff Ratio)**: Winning trades averaged **`${avg_win_dlr:+.2f}`** (capturing standard $0.02–$0.04 half-spreads), "
-            f"whereas losing trades averaged **`${avg_loss_dlr:+.2f}`** (absorbing adverse multi-cent price swings and late-game collar liquidation).",
-        ])
+        if win_rate >= 50.0:
+            lines.append(
+                f"- **Spread Capture Dominance**: The win rate finished strong at **`{win_rate:.1f}%`** "
+                f"({wins} wins, {losses} losses, {scratches} scratch), indicating effective two-sided inventory turnover "
+                "where quotes were regularly matched at favorable spreads."
+            )
+        else:
+            lines.append(
+                f"- **Directional Drift & Adverse Selection**: The win rate finished at **`{win_rate:.1f}%`** "
+                f"({wins} wins, {losses} losses, {scratches} scratch). During periods of strong directional momentum, "
+                "resting quotes on the contra-trend side are filled before orderbook repricing can occur, "
+                "forcing round trips to be closed at less favorable levels."
+            )
+        lines.append(
+            f"- **Payoff Ratio Dynamics**: Winning trades averaged **`${avg_win_dlr:+.2f}`**, "
+            f"whereas losing trades averaged **`${avg_loss_dlr:+.2f}`**."
+        )
     else:
         lines.append("- **No Round Trips**: Quoting was purely passive without executed fills.")
 
@@ -616,11 +643,35 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
         "",
         "### Why Trade Outcomes Ended Where They Did",
         "",
-        f"- **Quoting Velocity vs Fill Ratio**: Quoted {orders:,} orders across the session ({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs), "
-        f"with {fills} executed fills ({fill_rate:.1f}% fill conversion rate).",
-        "- **Late-Game Liquidation Impact**: When market mid-price breached the lower safety collar (<$0.10), passive quoting was safely halted, "
-        "and aggressive market liquidation unwound the remaining open position to guarantee zero overnight inventory risk. "
-        "While this protected the bot against a total $0.00 wipeout upon settlement, the liquidation trades crystallized the majority of session losses.",
+        f"- **Quoting Velocity vs Fill Ratio**: Quoted {orders:,} orders across the session "
+        f"({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs), "
+        f"yielding {fills} executed fills ({fill_rate:.1f}% fill conversion rate) and "
+        f"{totals.get('total_cancels', 0):,} cancellations or quote replacements.",
+    ])
+
+    if profit_factor >= 1.0:
+        lines.append(
+            f"- **Positive Profit Factor ({profit_factor:.2f})**: Gross trading profits (${gross_wins_dlr:+.2f}) "
+            f"exceeded gross losses (${gross_losses_dlr:+.2f}), indicating positive structural edge before fees."
+        )
+    elif profit_factor > 0:
+        lines.append(
+            f"- **Sub-Unit Profit Factor ({profit_factor:.2f})**: Cumulative gross losses (${gross_losses_dlr:+.2f}) "
+            f"outweighed gross trading profits (${gross_wins_dlr:+.2f}), reflecting adverse moves or inventory offloading friction."
+        )
+
+    liquidated_tickers = [
+        t for t, d in tickers.items()
+        if d.get("realized_delta_cents", 0.0) < -50.0 and (abs(d.get("min_inventory", 0)) >= 4 or abs(d.get("max_inventory", 0)) >= 4)
+    ]
+    if liquidated_tickers:
+        t_names = ", ".join([f"`{t}`" for t in liquidated_tickers])
+        lines.append(
+            f"- **Collar & De-risking Impact**: Significant inventory offloading occurred in {t_names}, "
+            "where safety collars or stop-loss mechanisms intervened to protect against total settlement-at-zero wipeout."
+        )
+
+    lines.extend([
         "",
         "---",
         "",
