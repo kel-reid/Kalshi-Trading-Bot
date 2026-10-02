@@ -80,8 +80,8 @@ def _get_int_env(name: str, default: int, allow_zero: bool = False) -> int:
 
 
 # Strategy Tuning Parameters
-# Default: Gamma 0.5 (Risk Aversion), 4 cent minimum spread, $1.00 minimum dynamic order size
-RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.5"))
+# Default: Gamma 0.7 (Risk Aversion), 4 cent minimum spread, $1.00 minimum dynamic order size
+RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.7"))
 MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
 ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 1.0))
@@ -100,9 +100,15 @@ if MIN_MID_PRICE < 1 or MAX_MID_PRICE > 99 or MIN_MID_PRICE >= MAX_MID_PRICE:
         f"must be strictly less than MAX_MID_PRICE ({MAX_MID_PRICE}) and within [1, 99]."
     )
 
-# Expiration Cutoff Safeguard (Seconds)
-# Cease quoting and rotate away when market close_time is within this buffer (default 3600s = 60 mins).
-MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 3600, allow_zero=True)
+# Expiration Cutoff Safeguard (Seconds / Minutes)
+# Cease quoting, liquidate inventory, and rotate away when market close_time is within this buffer.
+# Supports either EXPIRATION_BUFFER_MINUTES (Doppler/env) or MIN_TIME_TO_CLOSE_SECONDS (default 90 mins = 5400s).
+if os.getenv("EXPIRATION_BUFFER_MINUTES"):
+    EXPIRATION_BUFFER_MINUTES = _get_int_env("EXPIRATION_BUFFER_MINUTES", 90, allow_zero=True)
+    MIN_TIME_TO_CLOSE_SECONDS = EXPIRATION_BUFFER_MINUTES * 60
+else:
+    MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 5400, allow_zero=True)
+    EXPIRATION_BUFFER_MINUTES = MIN_TIME_TO_CLOSE_SECONDS // 60
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 
