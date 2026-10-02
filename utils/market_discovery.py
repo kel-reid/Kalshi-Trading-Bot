@@ -18,6 +18,7 @@ See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal matrix.
 import asyncio
 import datetime
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import certifi
@@ -96,8 +97,8 @@ def discover_active_market(
     
     Priority:
     1. Exact match for target_preference (if active and not excluded)
-    2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month):
-       - Tier 1A: Primary Moneylines across active in-season leagues (NFL -> NBA -> MLB)
+    2. In-Season Sports Router (waterfall across NFL, NCAAF, NBA, MLB suites based on calendar month):
+       - Tier 1A: Primary Moneylines across active in-season leagues (NFL -> NCAAF -> NBA -> MLB)
        - Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
        - Tier 2: Player Props across active in-season leagues (NFL -> NBA -> MLB)
        - Tier 3: General League tradeable sports markets
@@ -123,20 +124,19 @@ def discover_active_market(
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
 
-    if not tradeable_markets:
-        logger.warning("No tradeable markets available matching criteria.")
-        return None
-
     target_leagues: Optional[List[str]] = None
 
     # Check if target preference indicates sports or is default/unspecified
     is_sports_pref = pref in (
         "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
+        "CFB", "NCAAF", "COLLEGE FOOTBALL",
         "SPORTS", "SPORT", "MAJOR SPORTS"
     ) or not pref
 
     if is_sports_pref:
-        if pref in ("NFL", "FOOTBALL"):
+        if pref in ("NCAAF", "CFB", "COLLEGE FOOTBALL"):
+            target_leagues = ["NCAAF"]
+        elif pref in ("NFL", "FOOTBALL"):
             target_leagues = ["NFL"]
         elif pref in ("NBA", "BASKETBALL"):
             target_leagues = ["NBA"]
@@ -194,7 +194,10 @@ def discover_active_market(
 
         # 4. Unmatched or excluded exact ticker (e.g. during auto-rotation after settlement/starvation)
         # Route to its detected league or seasonal fallback so rotation can find an active replacement.
-        if pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
+        if pref.startswith("KXNCAAF") or bool(re.search(r"\b(?:NCAAF|CFB|COLLEGE FOOTBALL)\b", pref)):
+            target_leagues = ["NCAAF"]
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to NCAAF suite for auto-rotation.")
+        elif pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
             target_leagues = ["NFL"]
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to NFL suite for auto-rotation.")
         elif pref.startswith("KXNBA") or "NBA" in pref or "BASKETBALL" in pref:
@@ -206,6 +209,13 @@ def discover_active_market(
         else:
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
+
+    if target_leagues and max_targeted_series_fallbacks == DEFAULT_MAX_TARGETED_SERIES_FALLBACKS:
+        # Dynamically guarantee at least one primary fallback query per active league within available probe budget
+        budget_tracker["targeted_fallbacks_remaining"] = max(
+            budget_tracker["targeted_fallbacks_remaining"],
+            min(len(target_leagues), budget_tracker["remaining"] if preflight_check else len(target_leagues)),
+        )
 
     queried_series: set[str] = set()
 
