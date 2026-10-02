@@ -47,6 +47,22 @@ The router inspects the current UTC month to determine active league priorities:
 
 
 
+### Day-of-Week Football Scheduling Dynamics (Sep – Jan)
+
+During football season (September through January), both the NFL and College Football (NCAAF) are active. To maximize liquidity capture based on real-world scheduling, the router evaluates calendar priority using **US Eastern Time (`America/New_York`)**:
+
+- **Friday & Saturday (College Football Primetime)**:
+  - College Football is the dominant national event across Friday night games and the full Saturday slate.
+  - **NCAAF is elevated to Priority 1**, ahead of NFL, NBA, and MLB.
+  - *October Example*: `NCAAF` $\rightarrow$ `NFL` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+- **Sunday, Monday, Thursday (NFL Game Days)**:
+  - The NFL holds its primary slate on Sunday (early, afternoon, and Sunday Night Football), Monday Night Football, and Thursday Night Football.
+  - **NFL retains Priority 1**, ahead of NCAAF, NBA, and MLB.
+  - *October Example*: `NFL` $\rightarrow$ `NCAAF` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+- **Tuesday & Wednesday (Midweek Lulls)**:
+  - Standard seasonal priority applies; when no active NFL/NCAAF games are live, the waterfall seamlessly cascades to midweek NBA or MLB postseason games.
+
+
 ## 3. Routing & Selection Architecture
 
 ```mermaid

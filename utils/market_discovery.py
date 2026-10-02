@@ -143,7 +143,7 @@ def discover_active_market(
         elif pref in ("MLB", "BASEBALL"):
             target_leagues = ["MLB"]
         else:
-            target_leagues = SportsSeasonRouter.get_in_season_leagues()
+            target_leagues = SportsSeasonRouter.get_in_season_leagues(now_utc)
     else:
         # 2. Exact match by ticker (if explicitly targeted and not a category keyword)
         # Operators explicitly targeting a specific contract are permitted regardless of horizon.
@@ -207,7 +207,7 @@ def discover_active_market(
             target_leagues = ["MLB"]
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to MLB suite for auto-rotation.")
         else:
-            target_leagues = SportsSeasonRouter.get_in_season_leagues()
+            target_leagues = SportsSeasonRouter.get_in_season_leagues(now_utc)
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
     if target_leagues and max_targeted_series_fallbacks == DEFAULT_MAX_TARGETED_SERIES_FALLBACKS:
