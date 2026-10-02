@@ -2,7 +2,7 @@
 Sports Season Router & Seasonal Priority Matrix
 
 Routes market discovery to the optimal in-season sports suites based on calendar dynamics.
-Defines the full suites (game lines + player props) for NFL, NBA, and MLB.
+Defines the full suites (game lines + player props) for NFL, NCAAF (College Football), NBA, and MLB.
 Excludes low-liquidity leagues and penalizes distant multi-year futures.
 See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority calendar.
 """
@@ -11,13 +11,16 @@ import datetime
 from typing import List, Optional
 
 
-SPORTS_KEYWORDS = ("NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL")
+SPORTS_KEYWORDS = (
+    "NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL",
+    "CFB", "NCAAF", "COLLEGE FOOTBALL"
+)
 
 
 class SportsSeasonRouter:
     """
     Routes market discovery to the optimal in-season sports suites based on calendar dynamics.
-    Defines the full suites (game lines + player props) for NFL, NBA, and MLB.
+    Defines the full suites (game lines + player props) for NFL, NCAAF, NBA, and MLB.
     Excludes low-liquidity leagues and penalizes distant multi-year futures.
     See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority calendar.
     """
@@ -27,6 +30,10 @@ class SportsSeasonRouter:
         "KXNFLTD", "KXNFLPASSYDS", "KXNFLRSHYDS", "KXNFLRECYDS", "KXNFLPASSTDS"
     )
     NFL_SERIES = NFL_GAME_LINES + NFL_PROPS
+
+    NCAAF_GAME_LINES = ("KXNCAAFGAME", "KXNCAAFSPREAD", "KXNCAAFTOTAL")
+    NCAAF_PROPS: tuple[str, ...] = ()
+    NCAAF_SERIES = NCAAF_GAME_LINES + NCAAF_PROPS
 
     NBA_GAME_LINES = ("KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL")
     NBA_PROPS = (
@@ -40,17 +47,19 @@ class SportsSeasonRouter:
     )
     MLB_SERIES = MLB_GAME_LINES + MLB_PROPS
 
-    ALL_IN_SEASON_PREFIXES = ("KXNFL", "KXNBA", "KXMLB")
+    ALL_IN_SEASON_PREFIXES = ("KXNFL", "KXNBA", "KXMLB", "KXNCAAF")
 
     @classmethod
     def get_in_season_leagues(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
         """
-        Return ordered list of active leagues ('NFL', 'NBA', 'MLB') based on calendar month.
-        - Sep: NFL primary, MLB secondary (postseason race; NBA excluded)
-        - Oct: Triple overlap: NFL primary, NBA secondary, MLB tertiary (World Series)
-        - Nov - Feb: NFL primary, NBA secondary (MLB season concluded)
+        Return ordered list of active leagues ('NFL', 'NCAAF', 'NBA', 'MLB') based on calendar month.
+        - Sep: NFL primary, NCAAF secondary, MLB tertiary (postseason race; NBA excluded)
+        - Oct: Quadruple overlap: NFL primary, NCAAF secondary, NBA tertiary, MLB quaternary (World Series)
+        - Nov - Dec: NFL primary, NCAAF secondary (bowl season / CFP), NBA tertiary (MLB concluded)
+        - Jan: NFL primary (playoffs), NCAAF secondary (CFP semifinals / championship), NBA tertiary
+        - Feb: NFL primary (Super Bowl), NBA secondary (NCAAF and MLB concluded)
         - Mar - Jun: NBA primary (playoffs), MLB secondary (opening/regular season)
-        - Jul - Aug: MLB primary (summer lull: MLB only; NFL preseason excluded)
+        - Jul - Aug: MLB primary (summer lull: MLB only; NFL/NCAAF preseason excluded)
         """
         if dt is None:
             import sys
@@ -60,14 +69,16 @@ class SportsSeasonRouter:
         month = dt.month
 
         if month == 9:
-            return ["NFL", "MLB"]
+            return ["NFL", "NCAAF", "MLB"]
         elif month == 10:
-            return ["NFL", "NBA", "MLB"]
-        elif month in (11, 12, 1, 2):
+            return ["NFL", "NCAAF", "NBA", "MLB"]
+        elif month in (11, 12, 1):
+            return ["NFL", "NCAAF", "NBA"]
+        elif month == 2:
             return ["NFL", "NBA"]
         elif month in (3, 4, 5, 6):
             return ["NBA", "MLB"]
-        else:  # July, August (Summer lull: MLB only; NFL preseason excluded)
+        else:  # July, August (Summer lull: MLB only; NFL/NCAAF preseason excluded)
             return ["MLB"]
 
     @classmethod
@@ -75,6 +86,8 @@ class SportsSeasonRouter:
         """Return the primary game lines series ticker for a given league, or empty string if unsupported."""
         mapping = {
             "NFL": "KXNFLGAME",
+            "NCAAF": "KXNCAAFGAME",
+            "CFB": "KXNCAAFGAME",
             "NBA": "KXNBAGAME",
             "MLB": "KXMLBGAME",
         }
@@ -85,6 +98,8 @@ class SportsSeasonRouter:
         """Return game lines series tickers for a given league."""
         mapping = {
             "NFL": list(cls.NFL_GAME_LINES),
+            "NCAAF": list(cls.NCAAF_GAME_LINES),
+            "CFB": list(cls.NCAAF_GAME_LINES),
             "NBA": list(cls.NBA_GAME_LINES),
             "MLB": list(cls.MLB_GAME_LINES),
         }
@@ -95,6 +110,8 @@ class SportsSeasonRouter:
         """Return player props series tickers for a given league."""
         mapping = {
             "NFL": list(cls.NFL_PROPS),
+            "NCAAF": list(cls.NCAAF_PROPS),
+            "CFB": list(cls.NCAAF_PROPS),
             "NBA": list(cls.NBA_PROPS),
             "MLB": list(cls.MLB_PROPS),
         }
@@ -105,6 +122,8 @@ class SportsSeasonRouter:
         """Return prioritized list of series tickers for a specific league, or empty list if unsupported."""
         mapping = {
             "NFL": list(cls.NFL_SERIES),
+            "NCAAF": list(cls.NCAAF_SERIES),
+            "CFB": list(cls.NCAAF_SERIES),
             "NBA": list(cls.NBA_SERIES),
             "MLB": list(cls.MLB_SERIES),
         }
