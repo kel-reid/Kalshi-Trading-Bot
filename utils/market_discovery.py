@@ -96,8 +96,8 @@ def discover_active_market(
     
     Priority:
     1. Exact match for target_preference (if active and not excluded)
-    2. In-Season Sports Router (waterfall across NFL, NBA, MLB suites based on calendar month):
-       - Tier 1A: Primary Moneylines across active in-season leagues (NFL -> NBA -> MLB)
+    2. In-Season Sports Router (waterfall across NFL, NCAAF, NBA, MLB suites based on calendar month):
+       - Tier 1A: Primary Moneylines across active in-season leagues (NFL -> NCAAF -> NBA -> MLB)
        - Tier 1B: Secondary Game Lines (Spreads & Totals) across active in-season leagues
        - Tier 2: Player Props across active in-season leagues (NFL -> NBA -> MLB)
        - Tier 3: General League tradeable sports markets
@@ -132,11 +132,14 @@ def discover_active_market(
     # Check if target preference indicates sports or is default/unspecified
     is_sports_pref = pref in (
         "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
+        "CFB", "NCAAF", "COLLEGE FOOTBALL",
         "SPORTS", "SPORT", "MAJOR SPORTS"
     ) or not pref
 
     if is_sports_pref:
-        if pref in ("NFL", "FOOTBALL"):
+        if pref in ("NCAAF", "CFB", "COLLEGE FOOTBALL"):
+            target_leagues = ["NCAAF"]
+        elif pref in ("NFL", "FOOTBALL"):
             target_leagues = ["NFL"]
         elif pref in ("NBA", "BASKETBALL"):
             target_leagues = ["NBA"]
@@ -194,7 +197,10 @@ def discover_active_market(
 
         # 4. Unmatched or excluded exact ticker (e.g. during auto-rotation after settlement/starvation)
         # Route to its detected league or seasonal fallback so rotation can find an active replacement.
-        if pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
+        if pref.startswith("KXNCAAF") or "NCAAF" in pref or "CFB" in pref or "COLLEGE FOOTBALL" in pref:
+            target_leagues = ["NCAAF"]
+            logger.info(f"Routing unmatched/excluded target '{target_preference}' to NCAAF suite for auto-rotation.")
+        elif pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
             target_leagues = ["NFL"]
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to NFL suite for auto-rotation.")
         elif pref.startswith("KXNBA") or "NBA" in pref or "BASKETBALL" in pref:
