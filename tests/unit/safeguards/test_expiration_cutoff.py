@@ -121,3 +121,18 @@ class TestExpirationCutoffSafeguard:
         bot._cancel_all_quotes.assert_called_once()
         bot._update_quotes.assert_not_called()
         assert bot._market_inactive is True
+
+    def test_expiration_buffer_minutes_doppler_env_override(self):
+        """Validates that EXPIRATION_BUFFER_MINUTES translates to MIN_TIME_TO_CLOSE_SECONDS in seconds."""
+        import importlib
+        import os
+        import config
+
+        with patch.dict(os.environ, {"EXPIRATION_BUFFER_MINUTES": "45"}, clear=False):
+            importlib.reload(config)
+            assert config.EXPIRATION_BUFFER_MINUTES == 45
+            assert config.MIN_TIME_TO_CLOSE_SECONDS == 2700
+
+        # Clean reload back to environment state
+        importlib.reload(config)
+

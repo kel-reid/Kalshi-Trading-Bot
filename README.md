@@ -69,8 +69,9 @@ The bot loads configuration parameters dynamically from environment variables or
 | `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26SEP21NYGLAR-NYG`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
 | `ORDER_SIZE` | `integer` | `1` | Number of contracts to quote per side. |
 | `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
-| `RISK_GAMMA` | `float` | `0.5` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
+| `RISK_GAMMA` | `float` | `0.7` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
 | `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Maximum contract expiration window (days) to enforce weekly liquidity and prevent capital lockup. |
+| `EXPIRATION_BUFFER_MINUTES` | `integer` | `90` | Expiration cutoff buffer (minutes) to cease quoting, liquidate, and rotate out before settlement. |
 | `DB_HOST` | `string` | `localhost` | PostgreSQL host address (`db` inside Docker Compose). |
 | `DB_PORT` | `integer` | `5432` | PostgreSQL port. |
 | `DB_NAME` | `string` | `kalshi_bot` | PostgreSQL database name. |
