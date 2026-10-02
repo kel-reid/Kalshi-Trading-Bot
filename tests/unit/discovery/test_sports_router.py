@@ -337,3 +337,42 @@ def test_unmatched_target_containing_cfb_substring_does_not_route_to_ncaaf():
         )
         # Should route to seasonal fallback and pick NFL primary moneyline, NOT NCAAF
         assert selected == "KXNFLGAME-ACTIVE-1"
+
+
+def test_october_quadruple_overlap_queries_mlb_when_nfl_ncaaf_nba_fallbacks_empty():
+    """
+    Verify that in October's 4-league overlap (NFL, NCAAF, NBA, MLB), when global /events fetch
+    omits sports markets and the first three targeted fallback queries (KXNFLGAME, KXNCAAFGAME, KXNBAGAME)
+    return empty, discovery preserves a targeted fallback for the fourth league and selects active KXMLBGAME.
+    """
+    global_markets = [
+        {"ticker": "INX-DAILY-26OCT15", "status": "open", "volume_fp": "100000.00"}
+    ]
+    queried_series_calls = []
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker is None:
+            return global_markets
+        queried_series_calls.append(series_ticker)
+        if series_ticker == "KXMLBGAME":
+            return [
+                {
+                    "ticker": "KXMLBGAME-26OCT15-WS",
+                    "series_ticker": "KXMLBGAME",
+                    "status": "open",
+                    "volume_fp": "45000.00",
+                }
+            ]
+        return []
+
+    dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NCAAF", "NBA", "MLB"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = dt_oct
+        mock_dt.datetime.timezone = datetime.timezone
+        selected = discover_active_market(target_preference="SPORTS", preflight_check=True)
+
+        assert selected == "KXMLBGAME-26OCT15-WS"
+        assert queried_series_calls == ["KXNFLGAME", "KXNCAAFGAME", "KXNBAGAME", "KXMLBGAME"]

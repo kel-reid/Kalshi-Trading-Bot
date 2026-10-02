@@ -214,6 +214,13 @@ def discover_active_market(
             target_leagues = SportsSeasonRouter.get_in_season_leagues()
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to seasonal sports fallback for auto-rotation.")
 
+    if target_leagues and max_targeted_series_fallbacks == DEFAULT_MAX_TARGETED_SERIES_FALLBACKS:
+        # Dynamically guarantee at least one primary fallback query per active league within available probe budget
+        budget_tracker["targeted_fallbacks_remaining"] = max(
+            budget_tracker["targeted_fallbacks_remaining"],
+            min(len(target_leagues), budget_tracker["remaining"] if preflight_check else len(target_leagues)),
+        )
+
     queried_series: set[str] = set()
 
     # Helper: retrieve candidate markets for a specific series within the rolling weekly horizon,

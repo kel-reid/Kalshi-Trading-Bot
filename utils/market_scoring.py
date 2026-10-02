@@ -16,7 +16,7 @@ logger = logging.getLogger("MarketDiscovery")
 
 DEFAULT_MAX_TOTAL_PROBES: int = 10
 DEFAULT_MAX_PROBES_PER_SERIES: int = 2
-DEFAULT_MAX_TARGETED_SERIES_FALLBACKS: int = 3
+DEFAULT_MAX_TARGETED_SERIES_FALLBACKS: int = 4
 
 
 def _get_orderbook_checker() -> Callable[..., bool]:
