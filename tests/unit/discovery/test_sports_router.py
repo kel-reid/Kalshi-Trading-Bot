@@ -314,3 +314,26 @@ def test_tier_1a_probes_ncaaf_primary_moneyline_when_nfl_dormant():
         assert "KXNCAAFGAME-OCT-ACTIVE" in probed_tickers
         # KXNFLSPREAD must not be probed because KXNCAAFGAME was resolved in Tier 1A
         assert "KXNFLSPREAD-OCT-ACTIVE" not in probed_tickers
+
+
+def test_unmatched_target_containing_cfb_substring_does_not_route_to_ncaaf():
+    """
+    Verify that an unmatched target ticker containing 'CFB' only as an embedded substring
+    (e.g., 'INX-NONCFB-2026') does NOT erroneously route to the NCAAF suite, but instead
+    falls back to the seasonal multi-league router.
+    """
+    mock_markets = [
+        {"ticker": "INX-NONCFB-2026", "status": "open", "volume_fp": "50000.00"},
+        {"ticker": "KXNFLGAME-ACTIVE-1", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "20000.00"},
+        {"ticker": "KXNCAAFGAME-ACTIVE-1", "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "20000.00"},
+    ]
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NCAAF"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
+        selected = discover_active_market(
+            target_preference="INX-NONCFB-2026",
+            exclude_tickers=["INX-NONCFB-2026"],
+            preflight_check=True,
+        )
+        # Should route to seasonal fallback and pick NFL primary moneyline, NOT NCAAF
+        assert selected == "KXNFLGAME-ACTIVE-1"

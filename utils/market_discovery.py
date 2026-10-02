@@ -18,6 +18,7 @@ See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal matrix.
 import asyncio
 import datetime
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import certifi
@@ -197,7 +198,7 @@ def discover_active_market(
 
         # 4. Unmatched or excluded exact ticker (e.g. during auto-rotation after settlement/starvation)
         # Route to its detected league or seasonal fallback so rotation can find an active replacement.
-        if pref.startswith("KXNCAAF") or "NCAAF" in pref or "CFB" in pref or "COLLEGE FOOTBALL" in pref:
+        if pref.startswith("KXNCAAF") or bool(re.search(r"\b(?:NCAAF|CFB|COLLEGE FOOTBALL)\b", pref)):
             target_leagues = ["NCAAF"]
             logger.info(f"Routing unmatched/excluded target '{target_preference}' to NCAAF suite for auto-rotation.")
         elif pref.startswith("KXNFL") or "NFL" in pref or "FOOTBALL" in pref:
