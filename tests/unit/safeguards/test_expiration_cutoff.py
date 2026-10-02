@@ -128,10 +128,10 @@ class TestExpirationCutoffSafeguard:
         import os
         import config
 
-        with patch.dict(os.environ, {"EXPIRATION_BUFFER_MINUTES": "90"}, clear=False):
+        with patch.dict(os.environ, {"EXPIRATION_BUFFER_MINUTES": "45"}, clear=False):
             importlib.reload(config)
-            assert config.EXPIRATION_BUFFER_MINUTES == 90
-            assert config.MIN_TIME_TO_CLOSE_SECONDS == 5400
+            assert config.EXPIRATION_BUFFER_MINUTES == 45
+            assert config.MIN_TIME_TO_CLOSE_SECONDS == 2700
 
         # Clean reload back to environment state
         importlib.reload(config)
