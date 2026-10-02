@@ -13,6 +13,10 @@ import json
 import asyncio
 from unittest.mock import patch, MagicMock
 
+# Ensure mock credentials exist for pytest runs when .env is absent
+os.environ.setdefault("KALSHI_API_KEY", "mock-test-key")
+os.environ.setdefault("KALSHI_PRIVATE_KEY", "mock-private-key")
+
 # Define Mock HTTP Responses
 class MockResponse:
     def __init__(self, json_data, status_code):
