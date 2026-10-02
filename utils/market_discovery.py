@@ -124,10 +124,6 @@ def discover_active_market(
     eligible = fetch_eligible_markets()
     tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
 
-    if not tradeable_markets:
-        logger.warning("No tradeable markets available matching criteria.")
-        return None
-
     target_leagues: Optional[List[str]] = None
 
     # Check if target preference indicates sports or is default/unspecified
