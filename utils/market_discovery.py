@@ -382,7 +382,14 @@ def discover_active_market(
                         series_groups[s_ticker] = []
                     series_groups[s_ticker].append(m)
 
-                for fallback_series, group_markets in series_groups.items():
+                # Prioritize series groups by their highest candidate liquidity score
+                sorted_groups = sorted(
+                    series_groups.items(),
+                    key=lambda item: max((_liquidity_key(m) for m in item[1]), default=-1.0),
+                    reverse=True,
+                )
+
+                for fallback_series, group_markets in sorted_groups:
                     if preflight_check and budget_tracker["remaining"] <= 0:
                         break
                     selected = _select_best_market(
