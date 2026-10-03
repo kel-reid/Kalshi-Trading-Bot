@@ -79,13 +79,13 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
 
     # Penalize blowout / decided markets (odds <= 5c or >= 95c) which fail price collars
     price_penalty_multiplier = 1.0
-    last_price = _parse_float(
-        m.get("last_price_dollars") if m.get("last_price_dollars") is not None else m.get("last_price")
-    )
-    if last_price is not None:
-        norm_price = last_price if last_price <= 1.0 else last_price / 100.0
-        if norm_price <= 0.05 or norm_price >= 0.95:
-            price_penalty_multiplier = 0.01
+    raw_last_price = m.get("last_price_dollars") if m.get("last_price_dollars") is not None else m.get("last_price")
+    if raw_last_price is not None and str(raw_last_price).strip() != "":
+        last_price = _parse_float(raw_last_price)
+        if last_price > 0.0:
+            norm_price = last_price if last_price <= 1.0 else last_price / 100.0
+            if norm_price <= 0.05 or norm_price >= 0.95:
+                price_penalty_multiplier = 0.01
 
     base_score = (has_quotes * 1_000_000.0) + series_bonus + vol + (oi * 0.5)
     return base_score * horizon_multiplier * price_penalty_multiplier
