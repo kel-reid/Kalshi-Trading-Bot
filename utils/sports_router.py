@@ -10,6 +10,12 @@ See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority cal
 import datetime
 from typing import List, Optional
 
+try:
+    import zoneinfo
+    ET_TZ = zoneinfo.ZoneInfo("America/New_York")
+except (ImportError, Exception):  # pragma: no cover
+    ET_TZ = datetime.timezone(datetime.timedelta(hours=-4))
+
 
 SPORTS_KEYWORDS = (
     "NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL",
@@ -78,15 +84,10 @@ class SportsSeasonRouter:
             dt = dt_module.datetime.now(datetime.timezone.utc)
 
         # Standardize to US Eastern Time (America/New_York) to match US sports scheduling calendars
-        try:
-            import zoneinfo
-            et_tz = zoneinfo.ZoneInfo("America/New_York")
-            if dt.tzinfo is None:
-                dt_et = dt.replace(tzinfo=datetime.timezone.utc).astimezone(et_tz)
-            else:
-                dt_et = dt.astimezone(et_tz)
-        except Exception:
-            dt_et = dt
+        if dt.tzinfo is None:
+            dt_et = dt.replace(tzinfo=datetime.timezone.utc).astimezone(ET_TZ)
+        else:
+            dt_et = dt.astimezone(ET_TZ)
 
         month = dt_et.month
         # dt_et.weekday(): Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6

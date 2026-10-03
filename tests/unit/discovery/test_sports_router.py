@@ -65,6 +65,15 @@ def test_sports_season_router_calendar_priorities():
     dt_aug = datetime.datetime(2026, 8, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_aug) == ["MLB"]
 
+    # Default dt=None resolves to live system time without error
+    default_leagues = SportsSeasonRouter.get_in_season_leagues()
+    assert isinstance(default_leagues, list)
+    assert len(default_leagues) > 0
+
+    # Naive datetime (without tzinfo) is properly localized to Eastern Time
+    dt_naive = datetime.datetime(2026, 10, 15, 18, 0)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_naive) == ["NFL", "NCAAF", "NBA", "MLB"]
+
 
 def test_sports_season_router_full_product_suites():
     """Verify in-season series include Game Lines and Player Props for all major leagues during active overlap."""

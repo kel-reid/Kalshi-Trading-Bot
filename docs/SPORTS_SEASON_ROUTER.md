@@ -28,7 +28,7 @@ Low-liquidity leagues and off-market sports are permanently excluded from automa
 
 ## 2. Annual Calendar Priority Matrix
 
-The router inspects the current UTC month to determine active league priorities:
+The router inspects the current US Eastern Time (ET) date and month to determine active league priorities:
 
 | Month | Active Sports Phase | Priority 1 | Priority 2 | Priority 3 | Priority 4 | Behavior if Dormant |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -79,7 +79,7 @@ flowchart TD
 
     DetectLeague --> Matrix[/Lookup Priority Sequence/]
     ManualOverride --> Matrix
-    Router --> CheckDate[Check Current UTC Month]
+    Router --> CheckDate[Check Current Eastern Date & Month]
     CheckDate --> Matrix
 
     Matrix --> NextTier{Next Tier in<br>Waterfall?}
