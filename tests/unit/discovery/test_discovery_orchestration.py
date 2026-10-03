@@ -534,3 +534,27 @@ def test_tier_3_general_fallback_groups_by_series_and_caps_per_series():
         assert res is None
         # Each fallback series should be capped at DEFAULT_MAX_PROBES_PER_SERIES (15), so 15 + 15 = 30 probes total
         assert mock_probe.call_count == 30
+
+
+def test_tier_3_general_fallback_prioritizes_higher_liquidity_series():
+    """Verify that Tier 3 fallback prioritizes the series group with higher liquidity candidates."""
+    # Low liquidity series appears first in the returned pool
+    fallback_markets = [
+        {"ticker": "KXNFLLOW-1", "series_ticker": "KXNFLLOW", "status": "open", "volume_fp": "10.0"},
+        {"ticker": "KXNFLHIGH-1", "series_ticker": "KXNFLHIGH", "status": "open", "volume_fp": "50000.0"},
+    ]
+
+    probed_order = []
+
+    def mock_probe(ticker, **kwargs):
+        probed_order.append(ticker)
+        return True
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=fallback_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", side_effect=mock_probe):
+        res = discover_active_market(target_preference="NFL")
+        # High liquidity series should be probed and selected first despite appearing second in pool
+        assert res == "KXNFLHIGH-1"
+        assert probed_order[0] == "KXNFLHIGH-1"
+
