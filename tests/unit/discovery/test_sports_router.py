@@ -30,40 +30,49 @@ def test_discover_active_market_prioritizes_kxnflgame_series():
 
 
 def test_sports_season_router_calendar_priorities():
-    """Verify SportsSeasonRouter resolves seasonal league priorities correctly by month."""
-    # Early Fall: September (month 9) -> NFL, NCAAF, MLB (NBA not started)
-    dt_sep = datetime.datetime(2026, 9, 15, tzinfo=datetime.timezone.utc)
+    """Verify SportsSeasonRouter resolves seasonal league priorities correctly by month during standard days."""
+    # Early Fall: September (month 9, Tuesday) -> NFL, NCAAF, MLB (NBA not started)
+    dt_sep = datetime.datetime(2026, 9, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_sep) == ["NFL", "NCAAF", "MLB"]
 
-    # Fall/Winter: October (month 10) -> NFL, NCAAF, NBA, MLB
-    dt_oct = datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc)
+    # Fall/Winter: October (month 10, Thursday) -> NFL, NCAAF, NBA, MLB
+    dt_oct = datetime.datetime(2026, 10, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_oct) == ["NFL", "NCAAF", "NBA", "MLB"]
 
-    # Late Fall / Winter: November & December -> NFL, NCAAF, NBA
-    dt_nov = datetime.datetime(2026, 11, 15, tzinfo=datetime.timezone.utc)
+    # Late Fall / Winter: November & December (Sunday & Tuesday) -> NFL, NCAAF, NBA
+    dt_nov = datetime.datetime(2026, 11, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_nov) == ["NFL", "NCAAF", "NBA"]
-    dt_dec = datetime.datetime(2026, 12, 15, tzinfo=datetime.timezone.utc)
+    dt_dec = datetime.datetime(2026, 12, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_dec) == ["NFL", "NCAAF", "NBA"]
 
-    # Mid-Winter: January (month 1) -> NFL, NCAAF, NBA
-    dt_jan = datetime.datetime(2026, 1, 10, tzinfo=datetime.timezone.utc)
+    # Mid-Winter: January (month 1, Wednesday) -> NFL, NCAAF, NBA
+    dt_jan = datetime.datetime(2026, 1, 14, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_jan) == ["NFL", "NCAAF", "NBA"]
 
     # Post-Season: February (month 2) -> NFL, NBA (NCAAF concluded)
-    dt_feb = datetime.datetime(2026, 2, 10, tzinfo=datetime.timezone.utc)
+    dt_feb = datetime.datetime(2026, 2, 10, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_feb) == ["NFL", "NBA"]
 
     # Spring: April (month 4) -> NBA, MLB
-    dt_apr = datetime.datetime(2026, 4, 15, tzinfo=datetime.timezone.utc)
+    dt_apr = datetime.datetime(2026, 4, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_apr) == ["NBA", "MLB"]
 
     # Summer Lull: July (month 7) -> MLB
-    dt_jul = datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc)
+    dt_jul = datetime.datetime(2026, 7, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_jul) == ["MLB"]
 
     # Late Summer: August (month 8) -> MLB only (NFL/NCAAF preseason excluded)
-    dt_aug = datetime.datetime(2026, 8, 15, tzinfo=datetime.timezone.utc)
+    dt_aug = datetime.datetime(2026, 8, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_aug) == ["MLB"]
+
+    # Default dt=None resolves to live system time without error
+    default_leagues = SportsSeasonRouter.get_in_season_leagues()
+    assert isinstance(default_leagues, list)
+    assert len(default_leagues) > 0
+
+    # Naive datetime (without tzinfo) is properly localized to Eastern Time
+    dt_naive = datetime.datetime(2026, 10, 15, 18, 0)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_naive) == ["NFL", "NCAAF", "NBA", "MLB"]
 
 
 def test_sports_season_router_full_product_suites():
@@ -410,3 +419,95 @@ def test_targeted_discovery_continues_when_global_fetch_only_contains_excluded_t
             preflight_check=True,
         )
         assert selected == replacement_ticker
+
+
+def test_sports_season_router_day_of_week_football_dynamics():
+    """
+    Verify that on Friday and Saturday during football season (Sep - Jan),
+    NCAAF is elevated to Priority #1 ahead of NFL.
+    On Sunday, Monday, and Thursday, NFL retains Priority #1.
+    """
+    # 1. September:
+    # Friday Sep 18, 2026 (18:00 UTC = 14:00 EDT)
+    dt_sep_fri = datetime.datetime(2026, 9, 18, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep_fri) == ["NCAAF", "NFL", "MLB"]
+    # Saturday Sep 19, 2026
+    dt_sep_sat = datetime.datetime(2026, 9, 19, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep_sat) == ["NCAAF", "NFL", "MLB"]
+    # Sunday Sep 20, 2026
+    dt_sep_sun = datetime.datetime(2026, 9, 20, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep_sun) == ["NFL", "NCAAF", "MLB"]
+    # Monday Sep 21, 2026
+    dt_sep_mon = datetime.datetime(2026, 9, 21, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep_mon) == ["NFL", "NCAAF", "MLB"]
+    # Thursday Sep 24, 2026
+    dt_sep_thu = datetime.datetime(2026, 9, 24, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_sep_thu) == ["NFL", "NCAAF", "MLB"]
+
+    # 2. October (Quadruple Overlap):
+    # Friday Oct 2, 2026
+    dt_oct_fri = datetime.datetime(2026, 10, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct_fri) == ["NCAAF", "NFL", "NBA", "MLB"]
+    # Saturday Oct 3, 2026
+    dt_oct_sat = datetime.datetime(2026, 10, 3, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct_sat) == ["NCAAF", "NFL", "NBA", "MLB"]
+    # Sunday Oct 4, 2026
+    dt_oct_sun = datetime.datetime(2026, 10, 4, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct_sun) == ["NFL", "NCAAF", "NBA", "MLB"]
+
+    # 3. November / December / January:
+    dt_nov_sat = datetime.datetime(2026, 11, 21, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_nov_sat) == ["NCAAF", "NFL", "NBA"]
+    dt_nov_sun = datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_nov_sun) == ["NFL", "NCAAF", "NBA"]
+
+    # 4. Out-of-season / Concluded (e.g. February): Day of week does not change priority
+    dt_feb_sat = datetime.datetime(2026, 2, 14, 18, 0, tzinfo=datetime.timezone.utc)
+    assert SportsSeasonRouter.get_in_season_leagues(dt_feb_sat) == ["NFL", "NBA"]
+
+
+def test_sports_router_discovery_prefers_cfb_on_friday_and_saturday():
+    """
+    Verify that when discovery runs on Friday or Saturday under general sports routing,
+    the seasonal waterfall queries and selects NCAAF ahead of NFL.
+    """
+    mock_markets = [
+        {"ticker": "KXNFLGAME-26OCT04KCLV-LV", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "60000.00"},
+        {"ticker": "KXNCAAFGAME-26OCT02LIBDEL", "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "30000.00"},
+    ]
+    # Friday Oct 2, 2026 18:00 UTC (14:00 EDT)
+    dt_friday = datetime.datetime(2026, 10, 2, 18, 0, tzinfo=datetime.timezone.utc)
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = dt_friday
+        mock_dt.timezone = datetime.timezone
+        mock_dt.timedelta = datetime.timedelta
+
+        selected = discover_active_market(target_preference="SPORTS", preflight_check=True)
+        assert selected == "KXNCAAFGAME-26OCT02LIBDEL"
+
+
+def test_sports_router_discovery_prefers_nfl_on_sunday():
+    """
+    Verify that when discovery runs on Sunday under general sports routing,
+    the seasonal waterfall queries and selects NFL ahead of NCAAF.
+    """
+    mock_markets = [
+        {"ticker": "KXNFLGAME-26OCT04KCLV-LV", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "60000.00"},
+        {"ticker": "KXNCAAFGAME-26OCT02LIBDEL", "series_ticker": "KXNCAAFGAME", "status": "open", "volume_fp": "30000.00"},
+    ]
+    # Sunday Oct 4, 2026 18:00 UTC (14:00 EDT)
+    dt_sunday = datetime.datetime(2026, 10, 4, 18, 0, tzinfo=datetime.timezone.utc)
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = dt_sunday
+        mock_dt.timezone = datetime.timezone
+        mock_dt.timedelta = datetime.timedelta
+
+        selected = discover_active_market(target_preference="SPORTS", preflight_check=True)
+        assert selected == "KXNFLGAME-26OCT04KCLV-LV"
+

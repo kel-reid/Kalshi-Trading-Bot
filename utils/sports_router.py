@@ -10,6 +10,12 @@ See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority cal
 import datetime
 from typing import List, Optional
 
+try:
+    import zoneinfo
+    ET_TZ = zoneinfo.ZoneInfo("America/New_York")
+except (ImportError, Exception):  # pragma: no cover
+    ET_TZ = datetime.timezone(datetime.timedelta(hours=-4))
+
 
 SPORTS_KEYWORDS = (
     "NFL", "MLB", "NBA", "FOOTBALL", "BASKETBALL", "BASEBALL",
@@ -52,28 +58,48 @@ class SportsSeasonRouter:
     @classmethod
     def get_in_season_leagues(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
         """
-        Return ordered list of active leagues ('NFL', 'NCAAF', 'NBA', 'MLB') based on calendar month.
-        - Sep: NFL primary, NCAAF secondary, MLB tertiary (postseason race; NBA excluded)
-        - Oct: Quadruple overlap: NFL primary, NCAAF secondary, NBA tertiary, MLB quaternary (World Series)
-        - Nov - Dec: NFL primary, NCAAF secondary (bowl season / CFP), NBA tertiary (MLB concluded)
-        - Jan: NFL primary (playoffs), NCAAF secondary (CFP semifinals / championship), NBA tertiary
-        - Feb: NFL primary (Super Bowl), NBA secondary (NCAAF and MLB concluded)
-        - Mar - Jun: NBA primary (playoffs), MLB secondary (opening/regular season)
-        - Jul - Aug: MLB primary (summer lull: MLB only; NFL/NCAAF preseason excluded)
+        Return ordered list of active leagues ('NFL', 'NCAAF', 'NBA', 'MLB') based on calendar month
+        and day-of-week scheduling dynamics in US Eastern Time (ET).
+
+        Day-of-Week Football Scheduling Dynamics (Sep - Jan):
+        - Friday & Saturday: College Football (NCAAF) is the primary attraction across the country.
+          NCAAF is elevated to Priority #1, followed by NFL, NBA, MLB.
+        - Sunday, Monday, Thursday: NFL is live (Sunday main slate, Monday Night Football, Thursday Night Football).
+          NFL retains Priority #1, followed by NCAAF, NBA, MLB.
+        - Tuesday & Wednesday: Midweek football lull; standard seasonal priority applies.
+
+        Monthly Calendar Overview:
+        - Sep: NFL/NCAAF kickoff, MLB pennant chase (NBA excluded)
+        - Oct: Quadruple overlap: NFL/NCAAF, NBA tip-off, MLB World Series
+        - Nov - Dec: NFL playoff push, NCAAF rivalry month & bowl season/CFP, NBA reg season
+        - Jan: NFL playoffs, NCAAF CFP semifinals / championship, NBA reg season
+        - Feb: NFL Super Bowl, NBA reg season (NCAAF and MLB concluded)
+        - Mar - Jun: NBA playoffs, MLB opening/regular season
+        - Jul - Aug: Summer lull: MLB only; NFL/NCAAF preseason excluded
         """
         if dt is None:
             import sys
             md = sys.modules.get("utils.market_discovery")
             dt_module = getattr(md, "datetime", datetime) if md else datetime
             dt = dt_module.datetime.now(datetime.timezone.utc)
-        month = dt.month
+
+        # Standardize to US Eastern Time (America/New_York) to match US sports scheduling calendars
+        if dt.tzinfo is None:
+            dt_et = dt.replace(tzinfo=datetime.timezone.utc).astimezone(ET_TZ)
+        else:
+            dt_et = dt.astimezone(ET_TZ)
+
+        month = dt_et.month
+        # dt_et.weekday(): Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
+        weekday = dt_et.weekday()
+        is_cfb_primetime = weekday in (4, 5)  # Friday & Saturday
 
         if month == 9:
-            return ["NFL", "NCAAF", "MLB"]
+            return ["NCAAF", "NFL", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "MLB"]
         elif month == 10:
-            return ["NFL", "NCAAF", "NBA", "MLB"]
+            return ["NCAAF", "NFL", "NBA", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA", "MLB"]
         elif month in (11, 12, 1):
-            return ["NFL", "NCAAF", "NBA"]
+            return ["NCAAF", "NFL", "NBA"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA"]
         elif month == 2:
             return ["NFL", "NBA"]
         elif month in (3, 4, 5, 6):
