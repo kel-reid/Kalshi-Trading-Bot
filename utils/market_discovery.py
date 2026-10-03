@@ -37,6 +37,9 @@ from utils.market_api import (
     fetch_eligible_markets,
 )
 from utils.market_scoring import (
+    DEFAULT_MAX_PROBES_GAME_LINES,
+    DEFAULT_MAX_PROBES_PRIMARY_GAME,
+    DEFAULT_MAX_PROBES_PROPS,
     DEFAULT_MAX_PROBES_PER_SERIES,
     DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
     DEFAULT_MAX_TOTAL_PROBES,
@@ -53,6 +56,12 @@ logger = logging.getLogger("MarketDiscovery")
 
 __all__ = [
     "BASE_URL",
+    "DEFAULT_MAX_PROBES_GAME_LINES",
+    "DEFAULT_MAX_PROBES_PER_SERIES",
+    "DEFAULT_MAX_PROBES_PRIMARY_GAME",
+    "DEFAULT_MAX_PROBES_PROPS",
+    "DEFAULT_MAX_TARGETED_SERIES_FALLBACKS",
+    "DEFAULT_MAX_TOTAL_PROBES",
     "SPORTS_KEYWORDS",
     "SportsSeasonRouter",
     "_is_within_horizon",
@@ -66,9 +75,6 @@ __all__ = [
     "check_market_status",
     "check_market_status_async",
     "check_orderbook_has_quotes",
-    "DEFAULT_MAX_PROBES_PER_SERIES",
-    "DEFAULT_MAX_TARGETED_SERIES_FALLBACKS",
-    "DEFAULT_MAX_TOTAL_PROBES",
     "discover_active_market",
     "discover_active_market_async",
     "fetch_eligible_markets",
@@ -283,7 +289,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_PRIMARY_GAME,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
@@ -311,7 +317,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_GAME_LINES,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
@@ -336,7 +342,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_PROPS,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
@@ -366,17 +372,37 @@ def discover_active_market(
                 and _is_within_horizon(m, max_expiration_days, now_utc)
             ]
             if league_markets:
-                selected = _select_best_market(
-                    league_markets,
-                    preflight_check=preflight_check,
-                    max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
-                    budget_tracker=budget_tracker,
-                    min_mid_price=min_mid_price,
-                    max_mid_price=max_mid_price,
+                # Group fallback markets by series_ticker so each unconfigured series gets up to DEFAULT_MAX_PROBES_PER_SERIES
+                series_groups: Dict[str, List[Dict[str, Any]]] = {}
+                for m in league_markets:
+                    s_ticker = str(m.get("series_ticker") or "").upper()
+                    if not s_ticker:
+                        s_ticker = str(m.get("ticker", "")).split("-")[0].upper()
+                    if s_ticker not in series_groups:
+                        series_groups[s_ticker] = []
+                    series_groups[s_ticker].append(m)
+
+                # Prioritize series groups by their highest candidate liquidity score
+                sorted_groups = sorted(
+                    series_groups.items(),
+                    key=lambda item: max((_liquidity_key(m) for m in item[1]), default=-1.0),
+                    reverse=True,
                 )
-                if selected:
-                    logger.info(f"SportsSeasonRouter selected active general {league} market: {selected}")
-                    return selected
+
+                for fallback_series, group_markets in sorted_groups:
+                    if preflight_check and budget_tracker["remaining"] <= 0:
+                        break
+                    selected = _select_best_market(
+                        group_markets,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        budget_tracker=budget_tracker,
+                        min_mid_price=min_mid_price,
+                        max_mid_price=max_mid_price,
+                    )
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected active general {league} market ({fallback_series}): {selected}")
+                        return selected
 
     logger.warning("No active in-season sports markets with two-sided quotes found. Idling until market activity resumes.")
     return None
