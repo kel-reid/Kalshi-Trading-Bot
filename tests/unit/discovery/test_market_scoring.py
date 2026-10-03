@@ -143,3 +143,29 @@ def test_market_scoring_missing_coverage_branches():
     with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
         res = _select_best_market([{"ticker": ""}, {"ticker": "VALID"}], preflight_check=True)
         assert res == "VALID"
+
+
+def test_liquidity_key_penalizes_blowout_markets():
+    """Verify that markets with extreme blowout prices (<= 5c or >= 95c) are heavily penalized in ranking."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    close_time = (now + datetime.timedelta(days=2)).isoformat()
+
+    # Blowout game with high volume but priced at 99c
+    blowout_market = {
+        "ticker": "KXNCAAFGAME-BLOWOUT-ALA",
+        "volume_fp": "5000000.00",
+        "last_price_dollars": "0.9900",
+        "close_time": close_time,
+    }
+
+    # Competitive game with lower volume but priced at 55c
+    competitive_market = {
+        "ticker": "KXNCAAFGAME-COMPETITIVE-FLA",
+        "volume_fp": "20000.00",
+        "last_price_dollars": "0.5500",
+        "close_time": close_time,
+    }
+
+    # Competitive market should outscore blowout market despite 250x volume difference
+    assert _liquidity_key(competitive_market) > _liquidity_key(blowout_market)
+

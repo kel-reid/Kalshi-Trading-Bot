@@ -132,15 +132,16 @@ def test_per_series_probe_limit_caps_probes_per_series():
     """Verify that a single series with many candidates only probes up to DEFAULT_MAX_PROBES_PER_SERIES."""
     mock_markets = [
         {"ticker": f"KXNFLGAME-CAND-{i}", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": f"{10000 - i * 100}.00"}
-        for i in range(10)
+        for i in range(30)
     ]
 
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
-        result = discover_active_market(target_preference="NFL", max_total_probes=10)
+        result = discover_active_market(target_preference="NFL", max_total_probes=35)
         assert result is None
-        # KXNFLGAME had 10 candidates, but per-series limit is 2; subsequent series had 0
-        assert mock_probe.call_count == 2
+        # KXNFLGAME had 30 candidates, but per-series limit is 25; subsequent series had 0
+        assert mock_probe.call_count == 25
+
 
 
 def test_discover_exact_match_with_preflight_check():
