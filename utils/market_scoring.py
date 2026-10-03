@@ -14,8 +14,11 @@ from utils.sports_router import SportsSeasonRouter
 
 logger = logging.getLogger("MarketDiscovery")
 
-DEFAULT_MAX_TOTAL_PROBES: int = 10
-DEFAULT_MAX_PROBES_PER_SERIES: int = 2
+DEFAULT_MAX_TOTAL_PROBES: int = 50
+DEFAULT_MAX_PROBES_PER_SERIES: int = 15
+DEFAULT_MAX_PROBES_PRIMARY_GAME: int = 15
+DEFAULT_MAX_PROBES_GAME_LINES: int = 15
+DEFAULT_MAX_PROBES_PROPS: int = 10
 DEFAULT_MAX_TARGETED_SERIES_FALLBACKS: int = 4
 
 
@@ -34,6 +37,7 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     Score market liquidity using Kalshi v2 floating-point schema and horizon weighting.
     Supports volume_fp, open_interest_fp, yes_bid_dollars, yes_ask_dollars alongside legacy keys.
     Heavily discounts distant multi-year props in favor of near-term weekly game lines.
+    Penalizes settled or decided blowout markets (<5c or >95c) to favor active competitive games.
     """
     vol = _parse_float(m.get("volume_fp")) or _parse_float(m.get("volume"))
     oi = _parse_float(m.get("open_interest_fp")) or _parse_float(m.get("open_interest"))
@@ -73,8 +77,18 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     if any(ticker.startswith(s) for s in SportsSeasonRouter.ALL_IN_SEASON_PREFIXES):
         series_bonus = 500_000.0
 
+    # Penalize blowout / decided markets (odds <= 5c or >= 95c) which fail price collars
+    price_penalty_multiplier = 1.0
+    raw_last_price = m.get("last_price_dollars") if m.get("last_price_dollars") is not None else m.get("last_price")
+    if raw_last_price is not None and str(raw_last_price).strip() != "":
+        last_price = _parse_float(raw_last_price)
+        if last_price > 0.0:
+            norm_price = last_price if last_price <= 1.0 else last_price / 100.0
+            if norm_price <= 0.05 or norm_price >= 0.95:
+                price_penalty_multiplier = 0.01
+
     base_score = (has_quotes * 1_000_000.0) + series_bonus + vol + (oi * 0.5)
-    return base_score * horizon_multiplier
+    return base_score * horizon_multiplier * price_penalty_multiplier
 
 
 def _select_best_market(

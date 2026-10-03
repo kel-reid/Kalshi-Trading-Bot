@@ -143,3 +143,56 @@ def test_market_scoring_missing_coverage_branches():
     with patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True):
         res = _select_best_market([{"ticker": ""}, {"ticker": "VALID"}], preflight_check=True)
         assert res == "VALID"
+
+
+def test_liquidity_key_penalizes_blowout_markets():
+    """Verify that markets with extreme blowout prices (<= 5c or >= 95c) are heavily penalized in ranking."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    close_time = (now + datetime.timedelta(days=2)).isoformat()
+
+    # Blowout game with high volume but priced at 99c
+    blowout_market = {
+        "ticker": "KXNCAAFGAME-BLOWOUT-ALA",
+        "volume_fp": "5000000.00",
+        "last_price_dollars": "0.9900",
+        "close_time": close_time,
+    }
+
+    # Competitive game with lower volume but priced at 55c
+    competitive_market = {
+        "ticker": "KXNCAAFGAME-COMPETITIVE-FLA",
+        "volume_fp": "20000.00",
+        "last_price_dollars": "0.5500",
+        "close_time": close_time,
+    }
+
+    # Competitive market should outscore blowout market despite 250x volume difference
+    assert _liquidity_key(competitive_market) > _liquidity_key(blowout_market)
+
+
+def test_liquidity_key_does_not_penalize_untraded_markets():
+    """Verify that markets with no trade history (None or empty last_price) are not penalized as blowouts."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    close_time = (now + datetime.timedelta(days=2)).isoformat()
+
+    untraded_market = {
+        "ticker": "KXNCAAFGAME-UNTRADED",
+        "volume_fp": "1000.00",
+        "last_price_dollars": None,
+        "last_price": None,
+        "close_time": close_time,
+    }
+
+    blowout_market = {
+        "ticker": "KXNCAAFGAME-BLOWOUT",
+        "volume_fp": "1000.00",
+        "last_price_dollars": "0.0100",
+        "close_time": close_time,
+    }
+
+    # Untraded market has full multiplier (1.0), blowout market gets 0.01 penalty multiplier
+    score_untraded = _liquidity_key(untraded_market)
+    score_blowout = _liquidity_key(blowout_market)
+    assert score_untraded > score_blowout
+    assert score_untraded == pytest.approx(score_blowout * 100.0)
+

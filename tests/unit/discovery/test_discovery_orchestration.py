@@ -129,18 +129,20 @@ def test_discovery_wide_probe_budget_caps_total_requests():
 
 
 def test_per_series_probe_limit_caps_probes_per_series():
-    """Verify that a single series with many candidates only probes up to DEFAULT_MAX_PROBES_PER_SERIES."""
+    """Verify that a single series with many candidates only probes up to its dedicated probe limit."""
     mock_markets = [
         {"ticker": f"KXNFLGAME-CAND-{i}", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": f"{10000 - i * 100}.00"}
-        for i in range(10)
+        for i in range(30)
     ]
 
     with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
-        result = discover_active_market(target_preference="NFL", max_total_probes=10)
+        result = discover_active_market(target_preference="NFL", max_total_probes=50)
         assert result is None
-        # KXNFLGAME had 10 candidates, but per-series limit is 2; subsequent series had 0
-        assert mock_probe.call_count == 2
+        # KXNFLGAME had 30 candidates, but primary game limit is 15; subsequent series had 0
+        assert mock_probe.call_count == 15
+
+
 
 
 def test_discover_exact_match_with_preflight_check():
@@ -488,3 +490,71 @@ def test_market_discovery_missing_coverage_branches():
          patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False):
         res = discover_active_market(target_preference="SPORTS", max_total_probes=4)
         assert res is None
+
+
+def test_default_max_total_probes_starts_at_50():
+    """Verify that a default discover_active_market call uses DEFAULT_MAX_TOTAL_PROBES (50)."""
+    # 60 candidates spread across 4 series (20 each)
+    mock_markets = [
+        {"ticker": f"KXNFLGAME-CAND-{i}", "series_ticker": "KXNFLGAME", "status": "open", "volume_fp": "100.0"}
+        for i in range(20)
+    ] + [
+        {"ticker": f"KXNFLSPREAD-CAND-{i}", "series_ticker": "KXNFLSPREAD", "status": "open", "volume_fp": "100.0"}
+        for i in range(20)
+    ] + [
+        {"ticker": f"KXNFLTOTAL-CAND-{i}", "series_ticker": "KXNFLTOTAL", "status": "open", "volume_fp": "100.0"}
+        for i in range(20)
+    ]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=mock_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
+        # Call without max_total_probes argument
+        res = discover_active_market(target_preference="NFL")
+        assert res is None
+        # Primary GAME capped at 15, SPREAD capped at 15, TOTAL capped at 15 -> total 45 probes <= 50
+        assert mock_probe.call_count == 45
+
+
+def test_tier_3_general_fallback_groups_by_series_and_caps_per_series():
+    """Verify that Tier 3 fallback groups candidates by series_ticker and limits probes per series."""
+    # 20 markets in unconfigured fallback series A and 20 in fallback series B
+    fallback_markets = [
+        {"ticker": f"KXNFLUNKNOWN1-CAND-{i}", "series_ticker": "KXNFLUNKNOWN1", "status": "open", "volume_fp": f"{1000 - i}.0"}
+        for i in range(20)
+    ] + [
+        {"ticker": f"KXNFLUNKNOWN2-CAND-{i}", "series_ticker": "KXNFLUNKNOWN2", "status": "open", "volume_fp": f"{1000 - i}.0"}
+        for i in range(20)
+    ]
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=fallback_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=False) as mock_probe:
+        res = discover_active_market(target_preference="NFL")
+        assert res is None
+        # Each fallback series should be capped at DEFAULT_MAX_PROBES_PER_SERIES (15), so 15 + 15 = 30 probes total
+        assert mock_probe.call_count == 30
+
+
+def test_tier_3_general_fallback_prioritizes_higher_liquidity_series():
+    """Verify that Tier 3 fallback prioritizes the series group with higher liquidity candidates."""
+    # Low liquidity series appears first in the returned pool
+    fallback_markets = [
+        {"ticker": "KXNFLLOW-1", "series_ticker": "KXNFLLOW", "status": "open", "volume_fp": "10.0"},
+        {"ticker": "KXNFLHIGH-1", "series_ticker": "KXNFLHIGH", "status": "open", "volume_fp": "50000.0"},
+    ]
+
+    probed_order = []
+
+    def mock_probe(ticker, **kwargs):
+        probed_order.append(ticker)
+        return True
+
+    with patch("utils.market_discovery.fetch_eligible_markets", return_value=fallback_markets), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL"]), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", side_effect=mock_probe):
+        res = discover_active_market(target_preference="NFL")
+        # High liquidity series should be probed and selected first despite appearing second in pool
+        assert res == "KXNFLHIGH-1"
+        assert probed_order[0] == "KXNFLHIGH-1"
+
