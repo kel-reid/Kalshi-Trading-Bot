@@ -28,7 +28,7 @@ Low-liquidity leagues and off-market sports are permanently excluded from automa
 
 ## 2. Annual Calendar Priority Matrix
 
-The router inspects the current UTC month to determine active league priorities:
+The router inspects the current US Eastern Time (ET) date and month to determine active league priorities:
 
 | Month | Active Sports Phase | Priority 1 | Priority 2 | Priority 3 | Priority 4 | Behavior if Dormant |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -47,6 +47,22 @@ The router inspects the current UTC month to determine active league priorities:
 
 
 
+### Day-of-Week Football Scheduling Dynamics (Sep – Jan)
+
+During football season (September through January), both the NFL and College Football (NCAAF) are active. To maximize liquidity capture based on real-world scheduling, the router evaluates calendar priority using **US Eastern Time (`America/New_York`)**:
+
+- **Friday & Saturday (College Football Primetime)**:
+  - College Football is the dominant national event across Friday night games and the full Saturday slate.
+  - **NCAAF is elevated to Priority 1**, ahead of NFL, NBA, and MLB.
+  - *October Example*: `NCAAF` $\rightarrow$ `NFL` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+- **Sunday, Monday, Thursday (NFL Game Days)**:
+  - The NFL holds its primary slate on Sunday (early, afternoon, and Sunday Night Football), Monday Night Football, and Thursday Night Football.
+  - **NFL retains Priority 1**, ahead of NCAAF, NBA, and MLB.
+  - *October Example*: `NFL` $\rightarrow$ `NCAAF` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+- **Tuesday & Wednesday (Midweek Lulls)**:
+  - Standard seasonal priority applies; when no active NFL/NCAAF games are live, the waterfall seamlessly cascades to midweek NBA or MLB postseason games.
+
+
 ## 3. Routing & Selection Architecture
 
 ```mermaid
@@ -63,7 +79,7 @@ flowchart TD
 
     DetectLeague --> Matrix[/Lookup Priority Sequence/]
     ManualOverride --> Matrix
-    Router --> CheckDate[Check Current UTC Month]
+    Router --> CheckDate[Check Current Eastern Date & Month]
     CheckDate --> Matrix
 
     Matrix --> NextTier{Next Tier in<br>Waterfall?}
