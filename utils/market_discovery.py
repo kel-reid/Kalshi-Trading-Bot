@@ -37,6 +37,9 @@ from utils.market_api import (
     fetch_eligible_markets,
 )
 from utils.market_scoring import (
+    DEFAULT_MAX_PROBES_GAME_LINES,
+    DEFAULT_MAX_PROBES_PRIMARY_GAME,
+    DEFAULT_MAX_PROBES_PROPS,
     DEFAULT_MAX_PROBES_PER_SERIES,
     DEFAULT_MAX_TARGETED_SERIES_FALLBACKS,
     DEFAULT_MAX_TOTAL_PROBES,
@@ -66,7 +69,10 @@ __all__ = [
     "check_market_status",
     "check_market_status_async",
     "check_orderbook_has_quotes",
+    "DEFAULT_MAX_PROBES_GAME_LINES",
     "DEFAULT_MAX_PROBES_PER_SERIES",
+    "DEFAULT_MAX_PROBES_PRIMARY_GAME",
+    "DEFAULT_MAX_PROBES_PROPS",
     "DEFAULT_MAX_TARGETED_SERIES_FALLBACKS",
     "DEFAULT_MAX_TOTAL_PROBES",
     "discover_active_market",
@@ -283,7 +289,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_PRIMARY_GAME,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
@@ -311,7 +317,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_GAME_LINES,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
@@ -336,7 +342,7 @@ def discover_active_market(
                     selected = _select_best_market(
                         series_markets,
                         preflight_check=preflight_check,
-                        max_probes=DEFAULT_MAX_PROBES_PER_SERIES,
+                        max_probes=DEFAULT_MAX_PROBES_PROPS,
                         budget_tracker=budget_tracker,
                         min_mid_price=min_mid_price,
                         max_mid_price=max_mid_price,
