@@ -121,6 +121,12 @@ MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
 # Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
 POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0, allow_zero=True)
 
+# Fast Market / Price Velocity Circuit Breaker Safeguards
+# Automatically withdraw resting quotes when orderbook midpoint shifts faster than threshold over rolling window.
+PRICE_VELOCITY_THRESHOLD_CENTS = _get_float_env("PRICE_VELOCITY_THRESHOLD_CENTS", 6.0, allow_zero=True)
+PRICE_VELOCITY_WINDOW_SECONDS = _get_float_env("PRICE_VELOCITY_WINDOW_SECONDS", 20.0, allow_zero=True)
+PRICE_VELOCITY_QUIESCE_SECONDS = _get_float_env("PRICE_VELOCITY_QUIESCE_SECONDS", 30.0, allow_zero=True)
+
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
