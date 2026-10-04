@@ -11,6 +11,7 @@ import logging
 import time
 import math
 import os
+from collections import deque
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
@@ -42,6 +43,9 @@ from config import (
     MAX_SESSION_FEES_CENTS,
     MAX_SESSION_LOSS_CENTS,
     POST_FILL_PAUSE_SECONDS,
+    PRICE_VELOCITY_THRESHOLD_CENTS,
+    PRICE_VELOCITY_WINDOW_SECONDS,
+    PRICE_VELOCITY_QUIESCE_SECONDS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -79,6 +83,9 @@ class AvellanedaStoikovBot:
         max_session_fees_cents: Optional[int] = None,
         max_session_loss_cents: Optional[int] = None,
         post_fill_pause_seconds: Optional[float] = None,
+        price_velocity_threshold_cents: Optional[float] = None,
+        price_velocity_window_seconds: Optional[float] = None,
+        price_velocity_quiesce_seconds: Optional[float] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -97,6 +104,21 @@ class AvellanedaStoikovBot:
             max(0.0, float(post_fill_pause_seconds))
             if post_fill_pause_seconds is not None
             else POST_FILL_PAUSE_SECONDS
+        )
+        self.price_velocity_threshold_cents = (
+            max(0.0, float(price_velocity_threshold_cents))
+            if price_velocity_threshold_cents is not None
+            else PRICE_VELOCITY_THRESHOLD_CENTS
+        )
+        self.price_velocity_window_seconds = (
+            max(0.0, float(price_velocity_window_seconds))
+            if price_velocity_window_seconds is not None
+            else PRICE_VELOCITY_WINDOW_SECONDS
+        )
+        self.price_velocity_quiesce_seconds = (
+            max(0.0, float(price_velocity_quiesce_seconds))
+            if price_velocity_quiesce_seconds is not None
+            else PRICE_VELOCITY_QUIESCE_SECONDS
         )
 
 
@@ -154,6 +176,10 @@ class AvellanedaStoikovBot:
         # Periodic exchange resting order reconciliation
         self._last_reconciliation_time: float = time.time()
         self._reconciliation_interval: float = 60.0
+
+        # Fast Market / Price Velocity Circuit Breaker tracking
+        self._mid_price_history: deque = deque()
+        self._fast_market_until: float = 0.0
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
@@ -575,6 +601,46 @@ class AvellanedaStoikovBot:
                 self._market_inactive = True
                 self._last_inactive_retry = now
             return
+
+        # 2c. Fast Market / Price Velocity Circuit Breaker:
+        # Check active Fast Market quiesce period
+        if self._fast_market_until > now:
+            remaining = self._fast_market_until - now
+            logger.info(
+                f"[FAST MARKET ACTIVE] Volatility circuit breaker active for {self.ticker} "
+                f"({remaining:.1f}s remaining). Withdrawing quotes."
+            )
+            if self.current_bid_id or self.current_ask_id:
+                await self._cancel_all_quotes()
+            return
+
+        # Evaluate orderbook midpoint velocity over rolling window
+        if self.price_velocity_threshold_cents > 0 and self.price_velocity_window_seconds > 0:
+            cutoff = now - self.price_velocity_window_seconds
+            while self._mid_price_history and self._mid_price_history[0][0] < cutoff:
+                self._mid_price_history.popleft()
+
+            self._mid_price_history.append((now, mid_price))
+
+            if len(self._mid_price_history) >= 2:
+                prices = [p for _, p in self._mid_price_history]
+                delta_p = max(prices) - min(prices)
+                if delta_p >= self.price_velocity_threshold_cents:
+                    elapsed = now - self._mid_price_history[0][0]
+                    logger.warning(
+                        f"[FAST MARKET / VELOCITY BREACH] Market {self.ticker} mid price swung "
+                        f"{delta_p:.1f}c over {elapsed:.1f}s (threshold: {self.price_velocity_threshold_cents:.1f}c). "
+                        f"Entering Fast Market state; withdrawing quotes for {self.price_velocity_quiesce_seconds:.1f}s."
+                    )
+                    try:
+                        SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_velocity", ticker=self.ticker).inc()
+                    except Exception as e_metric:
+                        logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+                    self._fast_market_until = now + self.price_velocity_quiesce_seconds
+                    self._mid_price_history.clear()
+                    await self._cancel_all_quotes()
+                    return
 
         # Check post-fill adverse selection backoff pause
         if self.post_fill_pause_seconds > 0:
@@ -1168,6 +1234,8 @@ class AvellanedaStoikovBot:
         self._last_market_status_check = time.time()
         self._market_inactive = False
         self._last_pnl_snapshot = time.time()
+        self._mid_price_history.clear()
+        self._fast_market_until = 0.0
 
         # Start a new tracking session for the new market ticker
         self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
