@@ -58,7 +58,13 @@ class KillSwitch:
                     )
                     return None
                 data = resp.json()
-                page_orders = data.get("orders", [])
+                if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
+                    logger.error("Invalid resting-orders response: payload must be a dict containing an orders list.")
+                    return None
+                page_orders = data["orders"]
+                if not all(isinstance(order, dict) for order in page_orders):
+                    logger.error("Invalid resting-orders response: orders list must contain object elements.")
+                    return None
                 orders_list.extend(page_orders)
                 next_cursor = data.get("cursor")
                 if not next_cursor:
