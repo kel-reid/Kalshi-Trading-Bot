@@ -81,7 +81,7 @@ Sports contracts exhibit sudden probability jumps caused by live events (e.g., t
    - If price displacement exceeds threshold (`PRICE_VELOCITY_THRESHOLD_CENTS = 6.0¢`), trips the **Fast Market** circuit breaker.
 2. **Circuit Breaker Actions**:
    - **Immediate Quote Pull**: Cancels resting bids and asks on both sides to prevent adverse fills.
-   - **Quiesce Cooldown**: Enters a 30-second quoting pause (`PRICE_VELOCITY_QUIESCE_SECONDS = 30.0s`) before re-evaluating price stability.
+   - **Quiesce Cooldown**: Enters a fixed 30-second quoting pause (`PRICE_VELOCITY_QUIESCE_SECONDS = 30.0s`) before normal quote evaluation resumes.
    - **Extreme Price Collars**: Halts quoting when mid-price breaches `MIN_MID_PRICE = 10¢` or `MAX_MID_PRICE = 90¢` to eliminate binary boundary risk.
    - **Post-Fill Pause**: Pauses quoting for 3.0 seconds post-fill (`POST_FILL_PAUSE_SECONDS`) to let the orderbook stabilize.
    - **Session Stop-Loss**: Enforces session loss limits (300¢) and fee caps (250¢) with auto-liquidation and market rotation.
@@ -91,7 +91,7 @@ Sports contracts exhibit sudden probability jumps caused by live events (e.g., t
 
 ### Acceptance Criteria
 - [x] Rapid mid-price moves trigger immediate quote cancellations.
-- [x] Quoting automatically quiesces for 30s cooldown before safely resuming once orderbook stabilizes.
+- [x] Quoting automatically quiesces for a fixed 30s cooldown before normal quote evaluation resumes.
 - [x] Extreme price collars (10¢–90¢) prevent adverse inventory accumulation at binary boundaries.
 - [x] Post-fill execution pause allows liquidity recovery after partial or complete fills.
 - [x] Comprehensive unit tests assert circuit breaker activations, quiesce timers, and state resets on market rotation.

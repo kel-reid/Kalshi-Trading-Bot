@@ -129,5 +129,5 @@ A multi-layered defensive risk engine protects strategy capital:
 2.  **Extreme Price Collars:** Quoting is strictly clipped to safe binary interior bounds (`MIN_MID_PRICE = 10¢`, `MAX_MID_PRICE = 90¢`). When the midpoint enters extreme tails, quoting halts immediately to prevent toxic fills at the boundary.
 3.  **Post-Fill Adverse Selection Pause:** Following any fill execution, quoting pauses for `POST_FILL_PAUSE_SECONDS = 3.0s` to allow resting orderbook depth to rebuild before new quotes are published.
 4.  **Session Stop-Loss & Fee Churn Throttles:** Tracks cumulative session fees (`MAX_SESSION_FEES_CENTS = 250¢`) and cumulative net loss (`MAX_SESSION_LOSS_CENTS = 300¢`) per market. If either threshold is breached, the bot quiesces, liquidates open positions, and rotates away from the unprofitable market.
-5.  **Pre-Settlement Inventory Liquidation:** An expiration buffer (`EXPIRATION_BUFFER_MINUTES = 90`) ceases quoting and liquidates open positions in orderly, rate-limited slices prior to event settlement, guaranteeing flat exposure before market close.
+5.  **Pre-Settlement Inventory Liquidation:** An expiration buffer (`EXPIRATION_BUFFER_MINUTES = 90`) ceases quoting and liquidates open positions in orderly, rate-limited slices prior to event settlement, attempting to reach flat exposure before market close.
 
