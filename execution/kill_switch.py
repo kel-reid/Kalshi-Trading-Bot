@@ -46,10 +46,36 @@ class KillSwitch:
             return []
         return []
 
+    def _delete_order_sync(self, kalshi_order_id: str, client_order_id: Optional[str] = None):
+        """Helper to synchronously send DELETE request for an order."""
+        ref = client_order_id or kalshi_order_id
+        logger.warning(f"Canceling {ref} (Kalshi ID: {kalshi_order_id})...")
+        sign_path = f"/trade-api/v2/portfolio/events/orders/{kalshi_order_id}"
+        try:
+            headers = get_auth_headers(method="DELETE", sign_path=sign_path)
+            resp = requests.delete(
+                BASE_URL + sign_path, 
+                headers=headers, 
+                timeout=5, 
+                verify=certifi.where()
+            )
+            if resp.status_code in [200, 204]:
+                logger.info(f"Successfully killed {ref}")
+                if client_order_id:
+                    self.om.active_orders.pop(client_order_id, None)
+            elif resp.status_code == 404:
+                logger.info(f"Order {ref} ({kalshi_order_id}) already closed/filled on exchange.")
+                if client_order_id:
+                    self.om.active_orders.pop(client_order_id, None)
+            else:
+                logger.error(f"Failed to kill {ref}: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            import traceback
+            logger.error(f"Exception while killing {ref}: {e}\n{traceback.format_exc()}")
+
     def trigger_synchronous(self, ticker: Optional[str] = None):
         """Immediately cancel all known local and exchange resting orders synchronously."""
         logger.warning("Kill Switch Triggered (Sync). Canceling all resting orders...")
-        # Since this is synchronous and we are about to exit, we must block to send the alert
         from config import ALERT_WEBHOOK_URL
         if ALERT_WEBHOOK_URL:
             try:
@@ -64,6 +90,24 @@ class KillSwitch:
                 logger.error(f"Failed to send sync webhook alert: {e}")
 
         target_ticker = ticker or self.ticker
+        active_ids = list(self.om.active_orders.keys())
+        cancelled_kalshi_ids = set()
+        unverified_ids = []
+
+        # 1. Immediately cancel all known orders with verified exchange IDs
+        for client_order_id in active_ids:
+            order_info = self.om.active_orders.get(client_order_id) or {}
+            if target_ticker and order_info.get("ticker") and order_info.get("ticker") != target_ticker:
+                continue
+
+            kalshi_order_id = order_info.get("kalshi_order_id")
+            if kalshi_order_id:
+                self._delete_order_sync(kalshi_order_id, client_order_id)
+                cancelled_kalshi_ids.add(kalshi_order_id)
+            else:
+                unverified_ids.append(client_order_id)
+
+        # 2. Fetch exchange resting orders to reconcile unverified and discover untracked orders
         exchange_orders = self._fetch_resting_orders_sync(ticker=target_ticker)
         if exchange_orders is not None and target_ticker:
             exchange_orders = [o for o in exchange_orders if o.get("ticker") == target_ticker]
@@ -76,77 +120,39 @@ class KillSwitch:
                 if o.get("client_order_id") and o.get("order_id")
             }
 
-        orders_to_cancel = {}  # kalshi_order_id -> client_order_id
-        active_ids = list(self.om.active_orders.keys())
-
-        for client_order_id in active_ids:
+        # 3. Reconcile and cancel unverified orders
+        for client_order_id in unverified_ids:
             order_info = self.om.active_orders.get(client_order_id) or {}
-            if target_ticker and order_info.get("ticker") and order_info.get("ticker") != target_ticker:
-                continue
-
-            kalshi_order_id = order_info.get("kalshi_order_id")
-            if not kalshi_order_id:
-                if exchange_orders is not None:
-                    if client_order_id in client_to_exchange:
-                        kalshi_order_id = client_to_exchange[client_order_id]
-                        order_info["kalshi_order_id"] = kalshi_order_id
-                    else:
-                        # Exchange confirms this client order is NOT in resting orders
-                        logger.info(f"Order {client_order_id} verified not resting on exchange.")
-                        self.om.active_orders.pop(client_order_id, None)
-                        continue
+            if exchange_orders is not None:
+                if client_order_id in client_to_exchange:
+                    kalshi_order_id = client_to_exchange[client_order_id]
+                    order_info["kalshi_order_id"] = kalshi_order_id
+                    if kalshi_order_id not in cancelled_kalshi_ids:
+                        self._delete_order_sync(kalshi_order_id, client_order_id)
+                        cancelled_kalshi_ids.add(kalshi_order_id)
                 else:
-                    logger.error(
-                        f"Cannot safely cancel unverified order {client_order_id}: "
-                        "missing exchange order ID and resting order reconciliation failed."
-                    )
-                    continue
+                    logger.info(f"Order {client_order_id} verified not resting on exchange.")
+                    self.om.active_orders.pop(client_order_id, None)
+            else:
+                logger.error(
+                    f"Cannot safely cancel unverified order {client_order_id}: "
+                    "missing exchange order ID and resting order reconciliation failed."
+                )
 
-            if kalshi_order_id:
-                orders_to_cancel[kalshi_order_id] = client_order_id
-
-        # Union: Add untracked exchange resting orders
+        # 4. Cancel untracked exchange resting orders
         if exchange_orders is not None:
             for order in exchange_orders:
                 oid = order.get("order_id")
                 cid = order.get("client_order_id")
-                if oid and oid not in orders_to_cancel:
-                    orders_to_cancel[oid] = cid
+                if oid and oid not in cancelled_kalshi_ids:
+                    self._delete_order_sync(oid, cid)
+                    cancelled_kalshi_ids.add(oid)
 
-        if not orders_to_cancel:
+        if not cancelled_kalshi_ids:
             if exchange_orders is None and not active_ids:
                 logger.error("Failed to fetch exchange resting orders and no active local orders to kill.")
             else:
                 logger.info("No active local or exchange resting orders to kill.")
-            return
-
-        for kalshi_order_id, client_order_id in list(orders_to_cancel.items()):
-            ref = client_order_id or kalshi_order_id
-            logger.warning(f"Canceling {ref} (Kalshi ID: {kalshi_order_id})...")
-            # Fire an emergency blocking cancel to Kalshi using the raw request wrapper
-            sign_path = f"/trade-api/v2/portfolio/events/orders/{kalshi_order_id}"
-            try:
-                headers = get_auth_headers(method="DELETE", sign_path=sign_path)
-                resp = requests.delete(
-                    BASE_URL + sign_path, 
-                    headers=headers, 
-                    timeout=5, 
-                    verify=certifi.where()
-                )
-                if resp.status_code in [200, 204]:
-                    logger.info(f"Successfully killed {ref}")
-                    if client_order_id:
-                        self.om.active_orders.pop(client_order_id, None)
-                elif resp.status_code == 404:
-                    # Verified Kalshi ID returned 404: confirmed closed/filled on exchange
-                    logger.info(f"Order {ref} ({kalshi_order_id}) already closed/filled on exchange.")
-                    if client_order_id:
-                        self.om.active_orders.pop(client_order_id, None)
-                else:
-                    logger.error(f"Failed to kill {ref}: {resp.status_code} - {resp.text}")
-            except Exception as e:
-                import traceback
-                logger.error(f"Exception while killing {ref}: {e}\n{traceback.format_exc()}")
 
     async def trigger(self, ticker: Optional[str] = None):
         """Asynchronously triggers the kill switch using the core order manager."""
@@ -154,7 +160,32 @@ class KillSwitch:
         await send_alert("Kill Switch Triggered (Asynchronous). Withdrawing all quotes.")
         
         target_ticker = ticker or self.ticker
-        exchange_orders = await asyncio.to_thread(self._fetch_resting_orders_sync, ticker=target_ticker)
+        active_ids = list(self.om.active_orders.keys())
+        tasks = []
+        cids_being_cancelled = []
+        kalshi_ids_covered = set()
+        unverified_cids = []
+
+        # 1. Immediately dispatch cancellations for known verified orders without waiting for fetch
+        for cid in active_ids:
+            order_info = self.om.active_orders.get(cid) or {}
+            if target_ticker and order_info.get("ticker") and order_info.get("ticker") != target_ticker:
+                continue
+
+            kid = order_info.get("kalshi_order_id")
+            if kid:
+                kalshi_ids_covered.add(kid)
+                tasks.append(self.om.cancel_order(cid))
+                cids_being_cancelled.append(cid)
+            else:
+                unverified_cids.append(cid)
+
+        # 2. Concurrently fetch exchange resting orders in background thread
+        fetch_task = asyncio.create_task(
+            asyncio.to_thread(self._fetch_resting_orders_sync, ticker=target_ticker)
+        )
+
+        exchange_orders = await fetch_task
         if exchange_orders is not None and target_ticker:
             exchange_orders = [o for o in exchange_orders if o.get("ticker") == target_ticker]
 
@@ -166,39 +197,26 @@ class KillSwitch:
                 if o.get("client_order_id") and o.get("order_id")
             }
 
-        active_ids = list(self.om.active_orders.keys())
-        tasks = []
-        cids_being_cancelled = []
-        kalshi_ids_covered = set()
-
-        for cid in active_ids:
+        # 3. Reconcile unverified orders against fetched exchange orders
+        for cid in unverified_cids:
             order_info = self.om.active_orders.get(cid) or {}
-            if target_ticker and order_info.get("ticker") and order_info.get("ticker") != target_ticker:
-                continue
-
-            kid = order_info.get("kalshi_order_id")
-            if not kid:
-                if exchange_orders is not None:
-                    if cid in client_to_exchange:
-                        kid = client_to_exchange[cid]
-                        order_info["kalshi_order_id"] = kid
-                    else:
-                        logger.info(f"Order {cid} verified not resting on exchange.")
-                        self.om.active_orders.pop(cid, None)
-                        continue
+            if exchange_orders is not None:
+                if cid in client_to_exchange:
+                    kid = client_to_exchange[cid]
+                    order_info["kalshi_order_id"] = kid
+                    kalshi_ids_covered.add(kid)
+                    tasks.append(self.om.cancel_order(cid))
+                    cids_being_cancelled.append(cid)
                 else:
-                    logger.error(
-                        f"Cannot safely cancel unverified order {cid}: "
-                        "missing exchange order ID and resting order reconciliation failed."
-                    )
-                    continue
+                    logger.info(f"Order {cid} verified not resting on exchange.")
+                    self.om.active_orders.pop(cid, None)
+            else:
+                logger.error(
+                    f"Cannot safely cancel unverified order {cid}: "
+                    "missing exchange order ID and resting order reconciliation failed."
+                )
 
-            if kid:
-                kalshi_ids_covered.add(kid)
-            tasks.append(self.om.cancel_order(cid))
-            cids_being_cancelled.append(cid)
-
-        # Union: Add untracked exchange resting orders
+        # 4. Union: Add untracked exchange resting orders
         if exchange_orders is not None:
             for order in exchange_orders:
                 oid = order.get("order_id")

@@ -567,6 +567,7 @@ class OrderManager:
     def fetch_resting_orders_sync(self, ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """
         Fetch all resting orders across the portfolio (or for a specific ticker) synchronously with cursor pagination.
+        Applies per-page rate-limiting and 429 exponential backoff retries.
 
         Args:
             ticker: Optional market ticker to filter orders. If None, queries across portfolio.
@@ -574,13 +575,21 @@ class OrderManager:
         Returns:
             List of order dictionaries on success, or None on failure.
         """
+        import time
         sign_path = "/trade-api/v2/portfolio/orders"
         cursor: Optional[str] = None
         orders_list: List[Dict[str, Any]] = []
         seen_cursors = set()
+        max_retries = 3
+        base_delay = 1.0
 
         try:
             while True:
+                # Reserve a rate-limit token for every paginated request
+                if hasattr(self, "rate_limiter") and self.rate_limiter:
+                    if hasattr(self.rate_limiter, "acquire_sync"):
+                        self.rate_limiter.acquire_sync()
+
                 headers = get_auth_headers(method="GET", sign_path=sign_path)
                 params: Dict[str, Any] = {"status": "resting", "limit": 100}
                 if ticker:
@@ -588,19 +597,41 @@ class OrderManager:
                 if cursor:
                     params["cursor"] = cursor
 
-                with measure_latency("GET", sign_path):
-                    resp = requests.get(
-                        BASE_URL + sign_path,
-                        headers=headers,
-                        params=params,
-                        timeout=10,
-                        verify=certifi.where(),
-                    )
-                if resp.status_code != 200:
-                    logger.error(
-                        f"Failed to fetch resting orders: {resp.status_code} - {resp.text}"
-                    )
+                page_success = False
+                for attempt in range(max_retries + 1):
+                    with measure_latency("GET", sign_path):
+                        resp = requests.get(
+                            BASE_URL + sign_path,
+                            headers=headers,
+                            params=params,
+                            timeout=10,
+                            verify=certifi.where(),
+                        )
+                    if resp.status_code == 200:
+                        page_success = True
+                        break
+                    elif resp.status_code == 429:
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(
+                                f"Rate limited (429) fetching resting orders. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})"
+                            )
+                            time.sleep(delay)
+                            continue
+                        else:
+                            logger.error(
+                                f"Failed to fetch resting orders after {max_retries} retries due to 429 rate limit."
+                            )
+                            return None
+                    else:
+                        logger.error(
+                            f"Failed to fetch resting orders: {resp.status_code} - {resp.text}"
+                        )
+                        return None
+
+                if not page_success:
                     return None
+
                 data = resp.json()
                 if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
                     logger.error("Invalid resting-orders response: payload must be a dict containing an orders list.")
@@ -637,7 +668,6 @@ class OrderManager:
         Returns the count of orphaned orders cancelled on success, or None on failure.
         """
         try:
-            await self.rate_limiter.acquire()
             orders_list = await asyncio.to_thread(self.fetch_resting_orders_sync, ticker=ticker)
             if orders_list is None:
                 return None
@@ -693,7 +723,6 @@ class OrderManager:
         logger.info("Starting state recovery and reconciliation...")
         
         try:
-            await self.rate_limiter.acquire()
             orders_list = await asyncio.to_thread(self.fetch_resting_orders_sync)
             
             if orders_list is not None:
