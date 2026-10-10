@@ -206,6 +206,57 @@ def test_kill_switch_fetch_resting_orders_sync_subsequent_page_failure_returns_n
         assert mock_get.call_count == 2
 
 
+def test_kill_switch_fetch_resting_orders_sync_stagnant_cursor_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+
+    resp_page1 = MagicMock(status_code=200)
+    resp_page1.json.return_value = {
+        "orders": [{"order_id": "k1", "client_order_id": "c1"}],
+        "cursor": "token_stagnant"
+    }
+    resp_page2 = MagicMock(status_code=200)
+    resp_page2.json.return_value = {
+        "orders": [{"order_id": "k2", "client_order_id": "c2"}],
+        "cursor": "token_stagnant"  # identical to requested cursor
+    }
+
+    with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+
+        assert result is None
+        assert mock_get.call_count == 2
+
+
+def test_kill_switch_fetch_resting_orders_sync_cyclic_cursor_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+
+    resp_page1 = MagicMock(status_code=200)
+    resp_page1.json.return_value = {
+        "orders": [{"order_id": "k1", "client_order_id": "c1"}],
+        "cursor": "cursor_a"
+    }
+    resp_page2 = MagicMock(status_code=200)
+    resp_page2.json.return_value = {
+        "orders": [{"order_id": "k2", "client_order_id": "c2"}],
+        "cursor": "cursor_b"
+    }
+    resp_page3 = MagicMock(status_code=200)
+    resp_page3.json.return_value = {
+        "orders": [{"order_id": "k3", "client_order_id": "c3"}],
+        "cursor": "cursor_a"  # cycle back to cursor_a
+    }
+
+    with patch("requests.get", side_effect=[resp_page1, resp_page2, resp_page3]) as mock_get, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+
+        assert result is None
+        assert mock_get.call_count == 3
+
+
 def test_kill_switch_fetch_resting_orders_sync_error():
     mock_om = MagicMock()
     killer = KillSwitch(mock_om)

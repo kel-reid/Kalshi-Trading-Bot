@@ -2,6 +2,7 @@
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 
 > **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
 

@@ -38,6 +38,7 @@ class KillSwitch:
         sign_path = "/trade-api/v2/portfolio/orders"
         cursor = None
         orders_list = []
+        seen_cursors = set()
         try:
             while True:
                 headers = get_auth_headers(method="GET", sign_path=sign_path)
@@ -59,9 +60,15 @@ class KillSwitch:
                 data = resp.json()
                 page_orders = data.get("orders", [])
                 orders_list.extend(page_orders)
-                cursor = data.get("cursor")
-                if not cursor:
+                next_cursor = data.get("cursor")
+                if not next_cursor:
                     break
+                if next_cursor == cursor or next_cursor in seen_cursors:
+                    logger.error("Resting order pagination cursor did not advance; aborting reconciliation.")
+                    return None
+                if cursor:
+                    seen_cursors.add(cursor)
+                cursor = next_cursor
             return orders_list
         except Exception as e:
             logger.error(f"Exception fetching resting orders for sync reconciliation: {e}")
