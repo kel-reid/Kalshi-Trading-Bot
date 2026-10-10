@@ -1,4 +1,4 @@
-# Kalshi Algorithmic Market Maker
+# Kalshi Market Maker
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
