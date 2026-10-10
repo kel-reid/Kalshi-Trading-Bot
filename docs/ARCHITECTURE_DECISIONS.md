@@ -14,7 +14,7 @@ The bot implements a simplified **Avellaneda-Stoikov (A-S) Pricing Model**.
     $$R = \text{MidPrice} - (q \times \gamma)$$
 *   **Spread Offsets:** Quotes are placed symmetrically around the reservation price:
     $$\text{Bid} = R - \frac{\text{Spread}}{2}, \quad \text{Ask} = R + \frac{\text{Spread}}{2}$$
-*   **Active Inventory Hedging:** An active inventory threshold is dynamically enforced ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled, or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ under fixed contract sizing). When exceeded, the bot halts posting new quotes in the direction of the exposure and aggressively crosses the spread on the opposite side to exit the position.
+*   **Active Inventory Hedging:** An active inventory threshold is dynamically enforced ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled, or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ under fixed contract sizing). When net inventory reaches or exceeds this threshold, the bot halts posting new quotes in the direction of the exposure and aggressively crosses the spread on the opposite side to exit the position.
 
 
 ## Infrastructure: Single Host (DigitalOcean Droplet + Docker Compose)
@@ -109,7 +109,7 @@ Production telemetry revealed that market discovery previously targeted distant 
 
 ### Solution
 The market discovery engine implements a complete seasonal routing and liquidity overhaul:
-1.  **`SportsSeasonRouter`:** Defines an annual calendar priority matrix (Jan–Dec) that cascades through active in-season suites (Game Lines and Player Props) across College Football (NCAAF), NFL, NBA, and MLB, while permanently excluding low-liquidity leagues.
+1.  **`SportsSeasonRouter`:** Defines an annual calendar priority matrix (Jan–Dec) that cascades through active in-season suites across NFL, NBA, and MLB (Game Lines and Player Props) and College Football (NCAAF Game Lines only), while permanently excluding low-liquidity leagues.
 2.  **Expiration Horizon Multipliers:** Applies weighted expiration factors ($\le 7$ days: $3.0\times$ vs. $> 365$ days: $0.05\times$) to ensure upcoming weekly game lines outscore distant multi-year props.
 3.  **Pre-Flight Live Orderbook Checks:** Queries `/trade-api/v2/markets/{ticker}/orderbook` on top candidates, immediately verifying resting two-sided quotes before committing to a contract.
 4.  **Kalshi v2 Schema Compatibility:** Ingests and maintains all dollar-string and float payloads across snapshots and deltas using full floating-point precision, preserving sub-cent price levels (e.g. 32.1¢ and 32.4¢), valid settlement prices up to 100.0¢ ($1.00), and fractional contract quantities (e.g. 0.50) without truncation or level collisions.
