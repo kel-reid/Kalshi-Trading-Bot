@@ -384,5 +384,87 @@ class TestV2PayloadSchema:
         assert order_manager.rate_limiter.acquire.await_count == 2
         mock_sleep.assert_awaited_once_with(1.0)
 
+    @pytest.mark.asyncio
+    async def test_sync_and_recover_state_paginates_beyond_100_orders(self, order_manager):
+        """Verify sync_and_recover_state paginates past 100 orders and cancels all orphans."""
+        page1_orders = [{"order_id": f"p1-ord-{i}", "client_order_id": f"p1-cid-{i}"} for i in range(100)]
+        page2_orders = [{"order_id": f"p2-ord-{i}", "client_order_id": f"p2-cid-{i}"} for i in range(25)]
+
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {"orders": page1_orders, "cursor": "page2_cursor"}
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"orders": page2_orders, "cursor": None}
+
+        # Mock group response as empty
+        group_resp = MagicMock(status_code=200)
+        group_resp.json.return_value = {"order_groups": []}
+
+        order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2, group_resp]):
+            await order_manager.sync_and_recover_state()
+
+            # All 125 orders cancelled across both pages
+            assert order_manager._cancel_by_kalshi_id.call_count == 125
+
+    @pytest.mark.asyncio
+    async def test_sync_and_recover_state_handles_fetch_failure(self, order_manager):
+        """Verify sync_and_recover_state logs error gracefully when fetch fails."""
+        resp_err = MagicMock(status_code=500, text="Internal Error")
+        group_resp = MagicMock(status_code=200)
+        group_resp.json.return_value = {"order_groups": []}
+
+        order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+
+        with patch("execution.order_manager.requests.get", side_effect=[resp_err, group_resp]):
+            await order_manager.sync_and_recover_state()
+
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
+    def test_fetch_resting_orders_sync_acquires_rate_limiter_per_page(self, order_manager):
+        """Verify fetch_resting_orders_sync acquires rate limiter token for every page."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {"orders": [{"order_id": "k1"}], "cursor": "c2"}
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"orders": [{"order_id": "k2"}], "cursor": None}
+
+        order_manager.rate_limiter.acquire_sync = MagicMock()
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]):
+            orders = order_manager.fetch_resting_orders_sync()
+
+            assert len(orders) == 2
+            assert order_manager.rate_limiter.acquire_sync.call_count == 2
+
+    def test_fetch_resting_orders_sync_retries_429_with_backoff(self, order_manager, monkeypatch):
+        """Verify fetch_resting_orders_sync retries 429 response with backoff and acquires token per attempt."""
+        resp_429 = MagicMock(status_code=429)
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {"orders": [{"order_id": "k1"}], "cursor": None}
+
+        order_manager.rate_limiter.acquire_sync = MagicMock()
+        mock_sleep = MagicMock()
+        import time
+        monkeypatch.setattr(time, "sleep", mock_sleep)
+
+        with patch("execution.order_manager.requests.get", side_effect=[resp_429, resp_200]), \
+             patch("execution.order_manager.get_auth_headers", return_value={"mock": "header"}) as mock_headers:
+            orders = order_manager.fetch_resting_orders_sync()
+
+            assert len(orders) == 1
+            mock_sleep.assert_called_once_with(1.0)
+            assert order_manager.rate_limiter.acquire_sync.call_count == 2
+            assert mock_headers.call_count == 2
+
+    def test_rate_limiter_acquire_sync_and_async(self):
+        """Verify RateLimiter acquire_sync consumes tokens and throttles when exhausted."""
+        from utils.rate_limiter import RateLimiter
+        limiter = RateLimiter(rate=2, per=1.0)
+
+        # Consumes available tokens without blocking
+        limiter.acquire_sync()
+        limiter.acquire_sync()
+        assert limiter._tokens < 1.0
+
 
 

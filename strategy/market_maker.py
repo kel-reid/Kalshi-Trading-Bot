@@ -1100,7 +1100,7 @@ class AvellanedaStoikovBot:
         logger.error(f"Active orders remain or quote cancellation failed during {context}. Escalating to emergency kill switch...")
         try:
             from execution.kill_switch import KillSwitch
-            killer = KillSwitch(self.om)
+            killer = KillSwitch(self.om, ticker=self.ticker)
             initial_active = set(self.om.active_orders.keys())
             await killer.trigger()
 

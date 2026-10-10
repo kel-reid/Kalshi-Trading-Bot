@@ -564,6 +564,97 @@ class OrderManager:
                 order_copy["client_order_id"] = cid
                 orders.append(order_copy)
         return orders
+    def fetch_resting_orders_sync(self, ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch all resting orders across the portfolio (or for a specific ticker) synchronously with cursor pagination.
+        Applies per-page rate-limiting and 429 exponential backoff retries.
+
+        Args:
+            ticker: Optional market ticker to filter orders. If None, queries across portfolio.
+
+        Returns:
+            List of order dictionaries on success, or None on failure.
+        """
+        import time
+        sign_path = "/trade-api/v2/portfolio/orders"
+        cursor: Optional[str] = None
+        orders_list: List[Dict[str, Any]] = []
+        seen_cursors = set()
+        max_retries = 3
+        base_delay = 1.0
+
+        try:
+            while True:
+                params: Dict[str, Any] = {"status": "resting", "limit": 100}
+                if ticker:
+                    params["ticker"] = ticker
+                if cursor:
+                    params["cursor"] = cursor
+
+                page_success = False
+                for attempt in range(max_retries + 1):
+                    # Reserve a rate-limit token and generate fresh signed headers for each attempt
+                    if hasattr(self, "rate_limiter") and self.rate_limiter:
+                        if hasattr(self.rate_limiter, "acquire_sync"):
+                            self.rate_limiter.acquire_sync()
+
+                    headers = get_auth_headers(method="GET", sign_path=sign_path)
+                    with measure_latency("GET", sign_path):
+                        resp = requests.get(
+                            BASE_URL + sign_path,
+                            headers=headers,
+                            params=params,
+                            timeout=10,
+                            verify=certifi.where(),
+                        )
+                    if resp.status_code == 200:
+                        page_success = True
+                        break
+                    elif resp.status_code == 429:
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(
+                                f"Rate limited (429) fetching resting orders. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})"
+                            )
+                            time.sleep(delay)
+                            continue
+                        else:
+                            logger.error(
+                                f"Failed to fetch resting orders after {max_retries} retries due to 429 rate limit."
+                            )
+                            return None
+                    else:
+                        logger.error(
+                            f"Failed to fetch resting orders: {resp.status_code} - {resp.text}"
+                        )
+                        return None
+
+                if not page_success:
+                    return None
+
+                data = resp.json()
+                if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
+                    logger.error("Invalid resting-orders response: payload must be a dict containing an orders list.")
+                    return None
+                page_orders = data["orders"]
+                if not all(isinstance(order, dict) for order in page_orders):
+                    logger.error("Invalid resting-orders response: orders list must contain object elements.")
+                    return None
+                orders_list.extend(page_orders)
+                next_cursor = data.get("cursor")
+                if not next_cursor:
+                    break
+                if next_cursor == cursor or next_cursor in seen_cursors:
+                    logger.error("Resting order pagination cursor did not advance; aborting pagination.")
+                    return None
+                if cursor:
+                    seen_cursors.add(cursor)
+                cursor = next_cursor
+            return orders_list
+        except Exception as e:
+            logger.error(f"Exception fetching resting orders: {e}")
+            return None
+
     async def reconcile_resting_orders(
         self,
         ticker: Optional[str] = None,
@@ -576,40 +667,10 @@ class OrderManager:
         or that matches target_client_order_id.
         Returns the count of orphaned orders cancelled on success, or None on failure.
         """
-        sign_path = "/trade-api/v2/portfolio/orders"
-        cursor: Optional[str] = None
-        orders_list: List[Dict[str, Any]] = []
-
         try:
-            while True:
-                await self.rate_limiter.acquire()
-                headers = get_auth_headers(method="GET", sign_path=sign_path)
-                query_params = {"status": "resting", "limit": 100}
-                if ticker:
-                    query_params["ticker"] = ticker
-                if cursor:
-                    query_params["cursor"] = cursor
-
-                with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
-                    response = await asyncio.to_thread(
-                        requests.get,
-                        BASE_URL + sign_path,
-                        headers=headers,
-                        params=query_params,
-                        timeout=10,
-                        verify=certifi.where()
-                    )
-                if response.status_code != 200:
-                    logger.error(f"Failed to fetch resting orders for reconciliation: {response.status_code} - {response.text}")
-                    return None
-
-                data = response.json()
-                page_orders = data.get("orders", [])
-                orders_list.extend(page_orders)
-
-                cursor = data.get("cursor")
-                if not cursor:
-                    break
+            orders_list = await asyncio.to_thread(self.fetch_resting_orders_sync, ticker=ticker)
+            if orders_list is None:
+                return None
 
             tracked_kalshi_ids = {
                 v.get("kalshi_order_id") for v in self.active_orders.values() if v.get("kalshi_order_id")
@@ -661,28 +722,10 @@ class OrderManager:
         """
         logger.info("Starting state recovery and reconciliation...")
         
-        sign_path = "/trade-api/v2/portfolio/orders"
-        query_params = {"status": "resting", "limit": 100}
-        
         try:
-            # Need to build query string for signature if it contains params, but for Kalshi V2,
-            # the signature is usually just on the path. We will use the requests library to handle params.
-            # But get_auth_headers needs the path without params for the signature, let's keep it simple.
-            headers = get_auth_headers(method="GET", sign_path=sign_path)
+            orders_list = await asyncio.to_thread(self.fetch_resting_orders_sync)
             
-            # Wrap the cross-thread call to still capture overall latency
-            with measure_latency("GET", "/trade-api/v2/portfolio/orders"):
-                response = await asyncio.to_thread(
-                    requests.get,
-                    BASE_URL + sign_path,
-                    headers=headers,
-                    params=query_params,
-                    timeout=10,
-                    verify=certifi.where()
-                )
-                
-            if response.status_code == 200:
-                orders_list = response.json().get("orders", [])
+            if orders_list is not None:
                 logger.info(f"Found {len(orders_list)} resting orders on Kalshi.")
                 
                 cancel_tasks = []
@@ -700,7 +743,7 @@ class OrderManager:
                 else:
                     logger.info("No orphaned resting orders found. State is clean.")
             else:
-                logger.error(f"Failed to fetch resting orders during recovery. Status: {response.status_code}, Response: {response.text}")
+                logger.error("Failed to fetch resting orders during recovery.")
                 
             # Now hunt for combo orders (order_groups)
             group_path = "/trade-api/v2/portfolio/order_groups"
