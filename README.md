@@ -13,7 +13,7 @@ This project is an asynchronous algorithmic market-making trading bot built for 
 
 ### Key Capabilities
 * **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory (`q`) and the risk aversion parameter (`gamma`).
-* **Active Inventory Hedging:** Dynamically halts adverse quoting and crosses the spread when net inventory breaches the hedge threshold ($5 \times \text{quote size}$, bounded by `MAX_HEDGE_INVENTORY`).
+* **Active Inventory Hedging:** Dynamically halts adverse quoting and crosses the spread at $\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled; otherwise, the threshold is $\min(5, \text{MAX\_HEDGE\_INVENTORY})$.
 * **Execution Safeguards & Circuit Breakers:**
   * **Price Velocity Circuit Breaker (Fast Market):** Automatically detects toxic price momentum (mid-price shift $\ge 6¢$ over a 20-second rolling window) and quiesces quoting for 30 seconds.
   * **Extreme Price Collars:** Halts quoting if midpoint breaches 10¢ or 90¢ to eliminate asymmetric adverse selection near binary contract settlement bounds.
@@ -76,7 +76,7 @@ The bot loads configuration parameters dynamically from environment variables or
 | `ORDER_SIZE` | `integer` | `1` | Fallback number of contracts to quote per side. |
 | `ORDER_DOLLARS` | `float` | `1.0` | Minimum notional dollar allocation per quote for dynamic order sizing. |
 | `MAX_ORDER_CONTRACTS` | `integer` | `100` | Maximum contract ceiling allowed per individual order slice. |
-| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Hard upper ceiling applied to the dynamic inventory hedge threshold ($5 \times \text{quote size}$). |
+| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Hard upper ceiling applied to the inventory hedge threshold ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ in dollar mode or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ in fixed mode). |
 | `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
 | `RISK_GAMMA` | `float` | `0.7` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
 | `MIN_MID_PRICE` | `integer` | `10` | Lower price collar bound (cents); halts quoting when mid-price drops below this level. |

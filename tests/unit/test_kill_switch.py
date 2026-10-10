@@ -156,6 +156,56 @@ def test_kill_switch_fetch_resting_orders_sync_success():
         assert result == [{"order_id": "k1", "client_order_id": "c1"}]
 
 
+def test_kill_switch_fetch_resting_orders_sync_paginates():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+
+    resp_page1 = MagicMock(status_code=200)
+    resp_page1.json.return_value = {
+        "orders": [{"order_id": "k1", "client_order_id": "c1"}],
+        "cursor": "cursor_token_page2"
+    }
+    resp_page2 = MagicMock(status_code=200)
+    resp_page2.json.return_value = {
+        "orders": [{"order_id": "k2", "client_order_id": "c2"}],
+        "cursor": None
+    }
+
+    with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+
+        assert len(result) == 2
+        assert result == [
+            {"order_id": "k1", "client_order_id": "c1"},
+            {"order_id": "k2", "client_order_id": "c2"},
+        ]
+        assert mock_get.call_count == 2
+        first_call_params = mock_get.call_args_list[0][1]["params"]
+        second_call_params = mock_get.call_args_list[1][1]["params"]
+        assert "cursor" not in first_call_params
+        assert second_call_params["cursor"] == "cursor_token_page2"
+
+
+def test_kill_switch_fetch_resting_orders_sync_subsequent_page_failure_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+
+    resp_page1 = MagicMock(status_code=200)
+    resp_page1.json.return_value = {
+        "orders": [{"order_id": "k1", "client_order_id": "c1"}],
+        "cursor": "cursor_token_page2"
+    }
+    resp_page2 = MagicMock(status_code=500, text="Internal Server Error")
+
+    with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+
+        assert result is None
+        assert mock_get.call_count == 2
+
+
 def test_kill_switch_fetch_resting_orders_sync_error():
     mock_om = MagicMock()
     killer = KillSwitch(mock_om)
