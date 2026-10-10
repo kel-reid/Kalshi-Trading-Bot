@@ -87,3 +87,10 @@ graph TD
    - Hardened DigitalOcean Droplet managed via Terraform and Docker Compose.
    - Secrets managed via Doppler in memory without storing plaintext `.env` or `.pem` keys on disk.
    - Telemetry collected via local Grafana Alloy daemon and streamed to hosted Grafana Cloud.
+
+4. **Execution Safeguards & Risk Controls**:
+   - **Price Velocity Circuit Breaker (Fast Market)**: Automatically pulls quotes and enters a 30-second quiesce cooldown when midpoint displacement exceeds 6¢ over a rolling 20-second window.
+   - **Extreme Price Collars**: Halts quoting when mid-price breaches 10¢ or 90¢ to prevent asymmetric binary boundary losses.
+   - **Post-Fill Pause**: Pauses quoting for 3.0 seconds following execution fills to allow resting orderbook depth to recover.
+   - **Pre-Settlement Liquidation**: Ceases quoting and liquidates open inventory in rate-limited slices 90 minutes before contract expiration.
+   - **Session Stop-Loss & Fee Churn**: Enforces strict loss limits ($3.00) and fee caps ($2.50) before triggering auto-liquidation and market rotation.
