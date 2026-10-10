@@ -14,7 +14,7 @@ The bot implements a simplified **Avellaneda-Stoikov (A-S) Pricing Model**.
     $$R = \text{MidPrice} - (q \times \gamma)$$
 *   **Spread Offsets:** Quotes are placed symmetrically around the reservation price:
     $$\text{Bid} = R - \frac{\text{Spread}}{2}, \quad \text{Ask} = R + \frac{\text{Spread}}{2}$$
-*   **Active Inventory Hedging:** An active inventory threshold is dynamically enforced ($5 \times \text{quote size}$, bounded by `MAX_HEDGE_INVENTORY`). When exceeded, the bot halts posting new quotes in the direction of the exposure and aggressively crosses the spread on the opposite side to exit the position.
+*   **Active Inventory Hedging:** An active inventory threshold is dynamically enforced ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled, or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ under fixed contract sizing). When exceeded, the bot halts posting new quotes in the direction of the exposure and aggressively crosses the spread on the opposite side to exit the position.
 
 
 ## Infrastructure: Single Host (DigitalOcean Droplet + Docker Compose)

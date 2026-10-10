@@ -36,19 +36,33 @@ class KillSwitch:
     def _fetch_resting_orders_sync(self):
         """Fetch all resting orders across the portfolio synchronously for emergency reconciliation."""
         sign_path = "/trade-api/v2/portfolio/orders"
+        cursor = None
+        orders_list = []
         try:
-            headers = get_auth_headers(method="GET", sign_path=sign_path)
-            resp = requests.get(
-                BASE_URL + sign_path,
-                headers=headers,
-                params={"status": "resting", "limit": 100},
-                timeout=5,
-                verify=certifi.where()
-            )
-            if resp.status_code == 200:
-                return resp.json().get("orders", [])
-            logger.error(f"Failed to fetch resting orders for sync reconciliation: {resp.status_code} - {resp.text}")
-            return None
+            while True:
+                headers = get_auth_headers(method="GET", sign_path=sign_path)
+                params = {"status": "resting", "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = requests.get(
+                    BASE_URL + sign_path,
+                    headers=headers,
+                    params=params,
+                    timeout=5,
+                    verify=certifi.where()
+                )
+                if resp.status_code != 200:
+                    logger.error(
+                        f"Failed to fetch resting orders for sync reconciliation: {resp.status_code} - {resp.text}"
+                    )
+                    return None
+                data = resp.json()
+                page_orders = data.get("orders", [])
+                orders_list.extend(page_orders)
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+            return orders_list
         except Exception as e:
             logger.error(f"Exception fetching resting orders for sync reconciliation: {e}")
             return None
