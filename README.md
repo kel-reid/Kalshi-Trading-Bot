@@ -14,6 +14,12 @@ This project is a production-grade algorithmic market-making trading bot built f
 ### Key Capabilities
 * **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory (`q`) and the risk aversion parameter (`gamma`).
 * **Active Inventory Hedging:** Halts adverse quoting and aggressively crosses the spread when inventory reaches +/- 5 contracts.
+* **Execution Safeguards & Circuit Breakers:**
+  * **Price Velocity Circuit Breaker (Fast Market):** Automatically detects toxic price momentum (mid-price shift $\ge 6¢$ over a 20-second rolling window) and quiesces quoting for 30 seconds.
+  * **Extreme Price Collars:** Halts quoting if midpoint breaches 10¢ or 90¢ to eliminate asymmetric adverse selection near binary contract settlement bounds.
+  * **Session Stop-Loss & Fee Churn:** Enforces session loss limits ($3.00) and fee caps ($2.50) before orderly liquidation and rotation.
+  * **Post-Fill Adverse Selection Protection:** Pauses quoting for 3 seconds post-fill to let the orderbook stabilize.
+  * **Pre-Settlement Liquidation:** Halts quoting and liquidates open inventory in slices 90 minutes prior to contract expiration.
 * **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
 * **Zero-Downtime Telemetry:** Emits real-time Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
 
@@ -66,10 +72,21 @@ The bot loads configuration parameters dynamically from environment variables or
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `KALSHI_ENV` | `string` | `prod` | Exchange environment (`demo` or `prod`). |
-| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26SEP21NYGLAR-NYG`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
-| `ORDER_SIZE` | `integer` | `1` | Number of contracts to quote per side. |
+| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26OCT04DALHOU-DAL`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
+| `ORDER_SIZE` | `integer` | `1` | Fallback number of contracts to quote per side. |
+| `ORDER_DOLLARS` | `float` | `1.0` | Minimum notional dollar allocation per quote for dynamic order sizing. |
+| `MAX_ORDER_CONTRACTS` | `integer` | `100` | Maximum contract ceiling allowed per individual order slice. |
+| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Maximum portfolio contract inventory ceiling before emergency liquidation. |
 | `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
 | `RISK_GAMMA` | `float` | `0.7` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
+| `MIN_MID_PRICE` | `integer` | `10` | Lower price collar bound (cents); halts quoting when mid-price drops below this level. |
+| `MAX_MID_PRICE` | `integer` | `90` | Upper price collar bound (cents); halts quoting when mid-price exceeds this level. |
+| `MAX_SESSION_FEES_CENTS` | `integer` | `250` | Maximum cumulative session exchange fees (in cents) before quiesce and rotation. |
+| `MAX_SESSION_LOSS_CENTS` | `integer` | `300` | Maximum cumulative session net loss (in cents) before quiesce and rotation. |
+| `POST_FILL_PAUSE_SECONDS` | `float` | `3.0` | Quoting pause duration (seconds) following an execution fill for orderbook stabilization. |
+| `PRICE_VELOCITY_THRESHOLD_CENTS` | `float` | `6.0` | Midpoint price shift threshold (cents) triggering the Fast Market circuit breaker. |
+| `PRICE_VELOCITY_WINDOW_SECONDS` | `float` | `20.0` | Rolling observation window (seconds) evaluated for rapid price velocity shifts. |
+| `PRICE_VELOCITY_QUIESCE_SECONDS` | `float` | `30.0` | Cooldown duration (seconds) to pull resting quotes and pause during fast market conditions. |
 | `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Maximum contract expiration window (days) to enforce weekly liquidity and prevent capital lockup. |
 | `EXPIRATION_BUFFER_MINUTES` | `integer` | `90` | Expiration cutoff buffer (minutes) to cease quoting, liquidate, and rotate out before settlement. |
 | `DB_HOST` | `string` | `localhost` | PostgreSQL host address (`db` inside Docker Compose). |
