@@ -384,5 +384,42 @@ class TestV2PayloadSchema:
         assert order_manager.rate_limiter.acquire.await_count == 2
         mock_sleep.assert_awaited_once_with(1.0)
 
+    @pytest.mark.asyncio
+    async def test_sync_and_recover_state_paginates_beyond_100_orders(self, order_manager):
+        """Verify sync_and_recover_state paginates past 100 orders and cancels all orphans."""
+        page1_orders = [{"order_id": f"p1-ord-{i}", "client_order_id": f"p1-cid-{i}"} for i in range(100)]
+        page2_orders = [{"order_id": f"p2-ord-{i}", "client_order_id": f"p2-cid-{i}"} for i in range(25)]
+
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {"orders": page1_orders, "cursor": "page2_cursor"}
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"orders": page2_orders, "cursor": None}
+
+        # Mock group response as empty
+        group_resp = MagicMock(status_code=200)
+        group_resp.json.return_value = {"order_groups": []}
+
+        order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2, group_resp]):
+            await order_manager.sync_and_recover_state()
+
+            # All 125 orders cancelled across both pages
+            assert order_manager._cancel_by_kalshi_id.call_count == 125
+
+    @pytest.mark.asyncio
+    async def test_sync_and_recover_state_handles_fetch_failure(self, order_manager):
+        """Verify sync_and_recover_state logs error gracefully when fetch fails."""
+        resp_err = MagicMock(status_code=500, text="Internal Error")
+        group_resp = MagicMock(status_code=200)
+        group_resp.json.return_value = {"order_groups": []}
+
+        order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+
+        with patch("execution.order_manager.requests.get", side_effect=[resp_err, group_resp]):
+            await order_manager.sync_and_recover_state()
+
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
 
 

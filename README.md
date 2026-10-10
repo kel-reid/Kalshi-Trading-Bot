@@ -2,123 +2,123 @@
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-> **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
+An asynchronous market maker for [Kalshi](https://kalshi.com) prediction markets. It quotes both sides of in-season sports contracts with Avellaneda-Stoikov pricing, skews its quotes against the inventory it holds, and trades real capital. Because of that, every design choice starts with one question: what happens to open orders and positions when something goes wrong?
 
+## Key Capabilities
 
-## Overview
+- **Avellaneda-Stoikov pricing:** shifts the quote midpoint against current inventory (`r = mid − q·γ`) and places bid and ask `MIN_SPREAD / 2` either side.
+- **Inventory hedging:** when the position reaches the hedge threshold (`min(5 × quote size, MAX_HEDGE_INVENTORY)` with dollar sizing), the bot stops adding to it and crosses the spread to reduce it.
+- **Safeguards:**
+  - **Fast market:** a mid-price move of 6¢ or more within 20 seconds pulls all quotes for 30 seconds.
+  - **Price collar:** no quoting when the mid price is below 10¢ or above 90¢.
+  - **Session limits:** a $3.00 net loss or $2.50 in fees triggers liquidation and a move to another market.
+  - **Post-fill pause:** 3 seconds without quoting after a fill, so the order book can settle.
+  - **Pre-settlement exit:** quoting stops and inventory is sold down in slices 90 minutes before expiry.
+- **Market discovery:** picks liquid in-season contracts (college football, NFL, NBA, MLB) that expire within 8 days, after checking the live order book.
+- **Telemetry:** Prometheus metrics (API latency, inventory, P&L) scraped by Grafana Alloy into Grafana Cloud, with webhook alerts.
 
-This project is an asynchronous algorithmic market-making trading bot built for the **Kalshi** prediction market exchange. It continuously provides dual-sided liquidity (bids and asks) using an asynchronous **Avellaneda-Stoikov** pricing model to capture the bid-ask spread while actively hedging inventory exposure.
+For the order these checks run in each second, see **[How It Works](docs/HOW_IT_WORKS.md)**.
 
-### Key Capabilities
-* **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory (`q`) and the risk aversion parameter (`gamma`).
-* **Active Inventory Hedging:** Dynamically halts adverse quoting and crosses the spread at $\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled; otherwise, the threshold is $\min(5, \text{MAX\_HEDGE\_INVENTORY})$.
-* **Execution Safeguards & Circuit Breakers:**
-  * **Price Velocity Circuit Breaker (Fast Market):** Automatically detects toxic price momentum (mid-price shift $\ge 6¢$ over a 20-second rolling window) and quiesces quoting for 30 seconds.
-  * **Extreme Price Collars:** Halts quoting if midpoint breaches 10¢ or 90¢ to eliminate asymmetric adverse selection near binary contract settlement bounds.
-  * **Session Stop-Loss & Fee Churn:** Enforces session loss limits ($3.00) and fee caps ($2.50) before orderly liquidation and rotation.
-  * **Post-Fill Adverse Selection Protection:** Pauses quoting for 3 seconds post-fill to let the orderbook stabilize.
-  * **Pre-Settlement Liquidation:** Halts quoting and liquidates open inventory in slices 90 minutes prior to contract expiration.
-* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (College Football / NCAAF, NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
-* **Real-Time Telemetry:** Emits live Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
+## Architecture
 
+- **Runtime:** one asyncio Python service in Docker that handles the WebSocket order-book feed and REST order execution concurrently.
+- **State:** PostgreSQL for order history and P&L snapshots; inventory is reconciled against the exchange every 5 minutes.
+- **Infrastructure:** a DigitalOcean Droplet provisioned with Terraform, in an isolated VPC with outbound traffic limited to DNS, HTTP/S and NTP.
+- **Secrets:** Doppler injects API keys and the RSA signing key at runtime; nothing sensitive is written to disk.
+- **Delivery:** GitHub Actions runs tests with coverage, Terraform checks and security scans, then publishes to GHCR and deploys.
 
-## System Architecture
+The full component diagram is in the **[wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture)**.
 
-The trading bot executes as an asynchronous event-driven system on a hardened DigitalOcean Droplet:
-* **Compute:** Containerized Python service with asyncio concurrency for simultaneous WebSocket orderbook feeds and REST execution.
-* **Database:** Isolated PostgreSQL container recording persistent order history and execution state.
-* **Observability:** Telemetry scraped on loopback port `8000` via Grafana Alloy daemon and streamed to Grafana Cloud.
-* **Security:** Cryptographic RSA request signing and in-memory secret injection via Doppler.
+## Quick Start
 
-**For the complete interactive system architecture diagram and component workflows, see the [Wiki: System Architecture](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture).**
-
-
-## Quick Start (Local Development)
-
-### Prerequisites
-* Python 3.12+ (tested on Python 3.12 & 3.14)
-* Git
-
-### Setup & Testing
+Requires Python 3.12+ (tested on 3.12 and 3.14).
 
 ```bash
-# 1. Clone the repository
 git clone git@github.com:kel-reid/Kalshi-Trading-Bot.git
 cd Kalshi-Trading-Bot
-
-# 2. Initialize virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 3. Install dependencies
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Run full test suite
-pytest -v
+pytest -v                       # run the test suite
+KALSHI_ENV=demo python main.py  # run against Kalshi's demo exchange
 ```
 
-For server provisioning, Docker deployment, and Doppler secret configuration, follow the **[Setup & Operations Guide](docs/SETUP_GUIDE.md)**.
+Set your API credentials first, using `.env.example` as a template. For Docker, Doppler and server setup, see the **[Setup & Operations Guide](docs/SETUP_GUIDE.md)**.
 
+## Key Configuration
 
-## Configuration Parameters
+| Parameter | Default | What it controls |
+| :--- | :--- | :--- |
+| `KALSHI_ENV` | `prod` | `demo` or `prod` exchange. Start with `demo`. |
+| `TARGET_TICKER` | `""` | A ticker, league (`NFL`) or category. Empty means automatic in-season discovery. |
+| `ORDER_DOLLARS` | `1.0` | Dollars allocated per quote; sets the contract size. |
+| `MIN_SPREAD` | `4` | Minimum gap between bid and ask, in cents. |
+| `RISK_GAMMA` | `0.7` | How strongly quotes skew against inventory. |
+| `MAX_SESSION_LOSS_CENTS` | `300` | Session loss that triggers liquidation and rotation. |
 
-The bot loads configuration parameters dynamically from environment variables or Doppler:
+Every parameter, including credentials, safeguard thresholds and database settings, is listed in **[Configuration](docs/CONFIGURATION.md)**.
 
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `KALSHI_ENV` | `string` | `prod` | Exchange environment (`demo` or `prod`). |
-| `TARGET_TICKER` | `string` | `""` | Target market ticker (e.g. `KXNFLGAME-26OCT04DALHOU-DAL`), league (`NFL`), or category. Empty string triggers automated in-season discovery. |
-| `ORDER_SIZE` | `integer` | `1` | Fallback number of contracts to quote per side. |
-| `ORDER_DOLLARS` | `float` | `1.0` | Minimum notional dollar allocation per quote for dynamic order sizing. |
-| `MAX_ORDER_CONTRACTS` | `integer` | `100` | Maximum contract ceiling allowed per individual order slice. |
-| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Hard upper ceiling applied to the inventory hedge threshold ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ in dollar mode or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ in fixed mode). |
-| `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
-| `RISK_GAMMA` | `float` | `0.7` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
-| `MIN_MID_PRICE` | `integer` | `10` | Lower price collar bound (cents); halts quoting when mid-price drops below this level. |
-| `MAX_MID_PRICE` | `integer` | `90` | Upper price collar bound (cents); halts quoting when mid-price exceeds this level. |
-| `MAX_SESSION_FEES_CENTS` | `integer` | `250` | Maximum cumulative session exchange fees (in cents) before quiesce and rotation. |
-| `MAX_SESSION_LOSS_CENTS` | `integer` | `300` | Maximum cumulative session net loss (in cents) before quiesce and rotation. |
-| `POST_FILL_PAUSE_SECONDS` | `float` | `3.0` | Quoting pause duration (seconds) following an execution fill for orderbook stabilization. |
-| `PRICE_VELOCITY_THRESHOLD_CENTS` | `float` | `6.0` | Midpoint price shift threshold (cents) triggering the Fast Market circuit breaker. |
-| `PRICE_VELOCITY_WINDOW_SECONDS` | `float` | `20.0` | Rolling observation window (seconds) evaluated for rapid price velocity shifts. |
-| `PRICE_VELOCITY_QUIESCE_SECONDS` | `float` | `30.0` | Cooldown duration (seconds) to pull resting quotes and pause during fast market conditions. |
-| `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Maximum contract expiration window (days) to enforce weekly liquidity and prevent capital lockup. |
-| `EXPIRATION_BUFFER_MINUTES` | `integer` | `90` | Expiration cutoff buffer (minutes) to cease quoting, liquidate, and rotate out before settlement. |
-| `DB_HOST` | `string` | `localhost` | PostgreSQL host address (`db` inside Docker Compose). |
-| `DB_PORT` | `integer` | `5432` | PostgreSQL port. |
-| `DB_NAME` | `string` | `kalshi_bot` | PostgreSQL database name. |
-| `DB_USER` | `string` | `postgres` | PostgreSQL username. |
-| `DB_PASSWORD` | `string` | `postgres` | PostgreSQL password. |
+## Shutdown & Risk
 
-For the seasonal matrix and series precedence rules, see the **[SportsSeasonRouter Specification](docs/SPORTS_SEASON_ROUTER.md)**.
+On `SIGTERM` or Ctrl+C, the bot won't exit cleanly until the exchange confirms every order is cancelled:
 
+```mermaid
+sequenceDiagram
+  participant OS as SIGTERM / Ctrl+C
+  participant Main as main.py
+  participant KS as Kill switch
+  participant Bot as Market maker
+  participant K as Kalshi API
 
-## Live Output Preview
+  OS->>Main: signal
+  Main->>KS: trigger_synchronous()
+  KS->>K: look up any missing order IDs
+  KS->>K: cancel tracked orders
+  Main->>Bot: stop()
+  Bot->>K: cancel all quotes
+  alt cancellation not confirmed
+    Bot->>KS: escalate
+    KS->>K: cancel remaining orders
+  end
+  opt position still open
+    Bot->>K: liquidate inventory
+  end
+  Bot->>Bot: save final P&L snapshot<br/>stop background tasks
+  Bot-->>Main: all orders confirmed cancelled?
+  alt no
+    Main->>KS: trigger_synchronous() again
+    Main-->>OS: exit with error
+  else yes
+    Main-->>OS: exit cleanly
+  end
+```
 
-When running, the bot feeds structured telemetry and execution updates via its primary logging loop:
+> **Risk notice:** This bot trades real money. Test against the demo exchange (`KALSHI_ENV=demo`) first, and set `ORDER_DOLLARS`, `MAX_SESSION_LOSS_CENTS` and `MAX_HEDGE_INVENTORY` to what you can afford to lose. No warranty is provided; see the [MIT license](LICENSE).
+
+## Sample Output
+
+One quote, fill and requote cycle:
 
 ```text
-Selected Market: KXNCAAFGAME-26OCT10INDNEB-NEB
-2026-10-10 16:03:12,240 - MarketMaker - INFO - Starting Market Maker for KXNCAAFGAME-26OCT10INDNEB-NEB
-2026-10-10 16:03:12,569 - KalshiWS - INFO - Connected successfully.
-2026-10-10 16:03:12,643 - MarketMaker - INFO - WebSocket Connected. Hydrating state...
-2026-10-10 16:03:12,773 - MarketMaker - INFO - State hydrated. Beginning quoting loop.
-2026-10-10 16:03:12,841 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=0 | Gamma=0.7 | ReservationPrice=25.50c | Spread=4c → Bid=23c  Ask=28c | Realized=+0.0c | Unrealized=+0.0c
-2026-10-10 16:03:12,842 - MarketMaker - INFO - >> Placing new BID: 4 YES @ 23c
-2026-10-10 16:03:12,916 - MarketMaker - INFO - >> Placing new ASK: 4 YES @ 28c
-2026-10-10 16:03:18,120 - InventoryManager - INFO - Fill processed for KXNCAAFGAME-26OCT10INDNEB-NEB: buy 4 yes @ 23c. New Net Pos: 4.
-2026-10-10 16:03:18,589 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=4 | Gamma=0.7 | ReservationPrice=22.70c | Spread=4c → Bid=20c  Ask=25c | Realized=+0.0c | Unrealized=-10.8c
-2026-10-10 16:03:18,590 - MarketMaker - INFO - >> Replacing ASK: 4 YES @ 25c
+MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=0 | Gamma=0.7 | ReservationPrice=25.50c | Spread=4c → Bid=23c  Ask=28c | Realized=+0.0c | Unrealized=+0.0c
+MarketMaker - INFO - >> Placing new BID: 4 YES @ 23c
+MarketMaker - INFO - >> Placing new ASK: 4 YES @ 28c
+InventoryManager - INFO - Fill processed for KXNCAAFGAME-26OCT10INDNEB-NEB: buy 4 yes @ 23c. New Net Pos: 4.
+MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=4 | Gamma=0.7 | ReservationPrice=24.80c | Spread=4c → Bid=22c  Ask=27c | Realized=+0.0c | Unrealized=-10.8c
+MarketMaker - INFO - >> Placing new BID: 4 YES @ 22c
+MarketMaker - INFO - >> Placing new ASK: 4 YES @ 27c
 ```
 
+## Documentation
 
-## Production Operations & Risk Notice
+| Document | What's in it |
+| :--- | :--- |
+| [How It Works](docs/HOW_IT_WORKS.md) | Startup, the per-second quoting loop and each safeguard |
+| [Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md) | Why each design choice was made |
+| [Configuration](docs/CONFIGURATION.md) | Every parameter and its default |
+| [Setup & Operations Guide](docs/SETUP_GUIDE.md) | Provisioning, deploying and operating the bot |
+| [Sports Season Router](docs/SPORTS_SEASON_ROUTER.md) | How markets are discovered and ranked |
+| [Feature Roadmap](docs/FEATURE_ROADMAP.md) | Planned work with acceptance criteria |
 
-This software is an algorithmic trading system engineered for automated market making and live capital deployment on the Kalshi prediction exchange.
-
-Algorithmic market making involves real financial exposure, execution latency sensitivities, and exchange counterparty dynamics. Operators deploying live capital should ensure:
-* **Risk Calibration:** Operational risk parameters (`RISK_GAMMA`, `MIN_SPREAD`, `ORDER_SIZE`, and `MAX_EXPIRATION_DAYS`) are strictly scaled to account equity and risk limits.
-* **Continuous Observability:** Production deployments maintain real-time telemetry via Grafana Cloud, Prometheus metrics, and automated Slack/Discord alerting.
-* **Safety Controls:** Emergency shutdown protocols, state reconciliation routines, and synchronous kill-switch mechanisms are actively enforced to protect deployed funds.
