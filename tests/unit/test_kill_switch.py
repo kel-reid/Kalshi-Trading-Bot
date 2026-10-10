@@ -268,6 +268,54 @@ def test_kill_switch_fetch_resting_orders_sync_error():
         assert result is None
 
 
+def test_kill_switch_fetch_resting_orders_sync_invalid_payload_not_dict_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = ["not", "a", "dict"]
+
+    with patch("requests.get", return_value=mock_resp), \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+        assert result is None
+
+
+def test_kill_switch_fetch_resting_orders_sync_missing_orders_field_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = {"cursor": "token_abc"}
+
+    with patch("requests.get", return_value=mock_resp), \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+        assert result is None
+
+
+def test_kill_switch_fetch_resting_orders_sync_orders_not_list_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = {"orders": None}
+
+    with patch("requests.get", return_value=mock_resp), \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+        assert result is None
+
+
+def test_kill_switch_fetch_resting_orders_sync_orders_elements_not_dict_returns_none():
+    mock_om = MagicMock()
+    killer = KillSwitch(mock_om)
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = {"orders": ["string_order", 123]}
+
+    with patch("requests.get", return_value=mock_resp), \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        result = killer._fetch_resting_orders_sync()
+        assert result is None
+
+
 @pytest.mark.asyncio
 async def test_kill_switch_async_delegates_to_order_manager(mock_order_manager):
     mock_order_manager.active_orders = {"cid-1": {}, "cid-2": {}}
