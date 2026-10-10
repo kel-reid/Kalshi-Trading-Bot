@@ -116,3 +116,18 @@ The market discovery engine implements a complete seasonal routing and liquidity
 5.  **Sub-Cent Dollar Order Precision:** `OrderManager.place_order` formats dollar prices with dynamic precision up to 4 decimals (e.g. `32.4¢` -> `"0.324"` and `32.12¢` -> `"0.3212"`), ensuring short-inventory crossing bids and long-inventory crossing asks execute at exact intended levels without truncation or round-off failure.
 6.  **Auto-Rotation for Configured Exact Tickers:** When an exact ticker is targeted and subsequently excluded upon settlement, expiration, or orderbook starvation, discovery routes the excluded target to its detected league suite (`KXNFL` -> NFL, `KXNBA` -> NBA, `KXMLB` -> MLB) or seasonal sports fallback, ensuring rotation reliably secures an active replacement market.
 7.  **Weekly Contract Horizon Constraint:** Enforces `MAX_EXPIRATION_DAYS = 8` across automated discovery tiers to restrict trading exclusively to near-term weekly game lines and props (Thursday through Monday Night Football). Season-long or multi-year futures (such as `KXNFLENDSTREAK`) are strictly disqualified from automated candidate pools, guaranteeing high capital velocity and eliminating months-long capital lockup.
+
+
+## Capital Defense & Safeguards: Price Velocity, Collars, and Pre-Settlement Liquidation
+
+### Problem
+In live binary prediction markets for sports events (e.g., college football, NFL games), in-game events (turnovers, touchdowns, scoring drives) cause sudden step-function changes in win probability. When the orderbook rapidly re-prices, market makers with resting quotes suffer severe adverse selection—getting picked off on the wrong side before standard 1-second quoting loops can react. Furthermore, quoting near binary boundaries (< 10¢ or > 90¢) carries severe asymmetric payoff risk and settlement-at-zero holding loss, while holding open inventory into market expiration exposes capital to exchange settlement haircuts or illiquid lockups.
+
+### Solution
+A multi-layered defensive risk engine protects strategy capital:
+1.  **Fast Market / Price Velocity Circuit Breaker:** The market maker records orderbook midpoint prices within a rolling time window (`PRICE_VELOCITY_WINDOW_SECONDS = 20.0s`). If midpoint displacement exceeds `PRICE_VELOCITY_THRESHOLD_CENTS = 6.0¢`, the bot flags a **Fast Market**, immediately cancels resting bids and asks, and enforces a cooldown quiesce (`PRICE_VELOCITY_QUIESCE_SECONDS = 30.0s`). This prevents the bot from providing stale liquidity during rapid in-game momentum runs.
+2.  **Extreme Price Collars:** Quoting is strictly clipped to safe binary interior bounds (`MIN_MID_PRICE = 10¢`, `MAX_MID_PRICE = 90¢`). When the midpoint enters extreme tails, quoting halts immediately to prevent toxic fills at the boundary.
+3.  **Post-Fill Adverse Selection Pause:** Following any fill execution, quoting pauses for `POST_FILL_PAUSE_SECONDS = 3.0s` to allow resting orderbook depth to rebuild before new quotes are published.
+4.  **Session Stop-Loss & Fee Churn Throttles:** Tracks cumulative session fees (`MAX_SESSION_FEES_CENTS = 250¢`) and cumulative net loss (`MAX_SESSION_LOSS_CENTS = 300¢`) per market. If either threshold is breached, the bot quiesces, liquidates open positions, and rotates away from the unprofitable market.
+5.  **Pre-Settlement Inventory Liquidation:** An expiration buffer (`EXPIRATION_BUFFER_MINUTES = 90`) ceases quoting and liquidates open positions in orderly, rate-limited slices prior to event settlement, guaranteeing flat exposure before market close.
+
