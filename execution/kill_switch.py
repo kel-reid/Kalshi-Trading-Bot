@@ -8,6 +8,7 @@ of software crashes and synchronous cancellation for manual developer triggers (
 
 import logging
 import asyncio
+from typing import Optional, List, Dict, Any
 import requests
 import certifi
 
