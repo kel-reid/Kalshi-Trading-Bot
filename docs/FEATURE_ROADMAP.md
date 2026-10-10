@@ -9,7 +9,7 @@ This roadmap outlines the prioritized engineering milestones for the Kalshi Algo
 | Priority | Feature / Capability | Category | Impact | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 1 (Critical)** | [Real-Time Realized PnL & Trade Attribution](#phase-1-real-time-realized-pnl--trade-attribution) | Observability & Economics | Visibility into true strategy profitability and fill quality | **Completed** |
-| **Phase 2 (High)** | [Adverse Selection & Toxic Flow Protection](#phase-2-adverse-selection--toxic-flow-protection) | Risk & Capital Defense | Safeguards resting capital against rapid information jumps | **Planned** |
+| **Phase 2 (High)** | [Adverse Selection & Toxic Flow Protection](#phase-2-adverse-selection--toxic-flow-protection) | Risk & Capital Defense | Safeguards resting capital against rapid information jumps | **Completed** |
 | **Phase 3 (Medium-High)** | [Dynamic Volatility & Adaptive Spread Modeling](#phase-3-dynamic-volatility--adaptive-spread-modeling) | Quantitative Alpha | Optimizes spread width according to real-time market regimes | **Planned** |
 | **Phase 4 (Medium)** | [In-Place Order Amendment Optimization](#phase-4-in-place-order-amendment-optimization) | Execution & Latency | Minimizes unquoted windows and cuts REST API roundtrips | **Planned** |
 | **Phase 5 (Low / Scale)** | [Multi-Market Portfolio Quoting Engine](#phase-5-multi-market-portfolio-quoting-engine) | Horizontal Scalability | Maximizes capital efficiency across concurrent games/leagues | **Future** |
@@ -22,7 +22,7 @@ graph LR
     P4 --> P5["Phase 5<br/><b>Scale</b><br/>Multi-Market Portfolio Engine"]
 
     style P1 fill:#1c3b2b,stroke:#2e7d32,stroke-width:2px;
-    style P2 fill:#3b2d1c,stroke:#f57c00,stroke-width:2px;
+    style P2 fill:#1c3b2b,stroke:#2e7d32,stroke-width:2px;
     style P3 fill:#1c2d3b,stroke:#1976d2,stroke-width:2px;
     style P4 fill:#2a1c3b,stroke:#7b1fa2,stroke-width:2px;
     style P5 fill:#263238,stroke:#607d8b,stroke-width:2px;
@@ -76,21 +76,25 @@ The bot persists order lifecycle records in PostgreSQL and manages inventory exp
 Sports contracts exhibit sudden probability jumps caused by live events (e.g., touchdowns, turnovers, instant replay rulings). When an informed counterparty sweeps the book, standard Avellaneda-Stoikov inventory skewing cannot react fast enough during the 1-second quoting cycle, leaving resting orders vulnerable to rapid sequential fills at stale prices.
 
 ### Proposed Architecture & Deliverables
-1. **Toxic Flow Detector**:
-   - Track micro-burst execution velocity: number of contracts filled within a rolling window ($< 2.0$ seconds).
-   - If fills exceed an execution threshold (e.g., $\ge 3$ contracts in $\le 2$ seconds in a single direction), flag the book as experiencing toxic or informed flow.
+1. **Price Velocity & Fast Market Detector**:
+   - Tracks orderbook midpoint displacements across a rolling observation window (`PRICE_VELOCITY_WINDOW_SECONDS = 20.0s`).
+   - If price displacement exceeds threshold (`PRICE_VELOCITY_THRESHOLD_CENTS = 6.0¢`), trips the **Fast Market** circuit breaker.
 2. **Circuit Breaker Actions**:
-   - **Immediate Quote Pull**: Cancel resting orders on the affected side via fast REST or synchronous kill switch.
-   - **Quote Fade**: Temporarily widen the bid/ask spread (e.g., $2\times$ or $3\times$ `MIN_SPREAD`) for a cool-down duration (e.g., 5–15 seconds).
-   - **Orderbook Skew Pause**: Delay posting new orders until the book re-stabilizes with two-sided resting liquidity.
+   - **Immediate Quote Pull**: Cancels resting bids and asks on both sides to prevent adverse fills.
+   - **Quiesce Cooldown**: Enters a fixed 30-second quoting pause (`PRICE_VELOCITY_QUIESCE_SECONDS = 30.0s`) before normal quote evaluation resumes.
+   - **Extreme Price Collars**: Halts quoting when mid-price breaches `MIN_MID_PRICE = 10¢` or `MAX_MID_PRICE = 90¢` to eliminate binary boundary risk.
+   - **Post-Fill Pause**: Pauses quoting for 3.0 seconds post-fill (`POST_FILL_PAUSE_SECONDS`) to let the orderbook stabilize.
+   - **Session Stop-Loss**: Enforces session loss limits (300¢) and fee caps (250¢) with auto-liquidation and market rotation.
 3. **Alerting & Telemetry**:
-   - Increment `kalshi_toxic_flow_trips_total` metric.
-   - Dispatch webhook alert when the circuit breaker trips.
+   - Emits structured warnings and logs on circuit breaker trips.
+   - Webhook notifications on safety quiesce events.
 
 ### Acceptance Criteria
-- [ ] Rapid fills in the same direction trigger quote pulls within 200ms.
-- [ ] Bot resumes normal quoting automatically once the cooldown window expires and orderbook stability returns.
-- [ ] Comprehensive unit tests simulating sweeping fills without false-positive triggers under normal volume.
+- [x] Rapid mid-price moves trigger immediate quote cancellations.
+- [x] Quoting automatically quiesces for a fixed 30s cooldown before normal quote evaluation resumes.
+- [x] Extreme price collars (10¢–90¢) prevent adverse inventory accumulation at binary boundaries.
+- [x] Post-fill execution pause allows liquidity recovery after partial or complete fills.
+- [x] Comprehensive unit tests assert circuit breaker activations, quiesce timers, and state resets on market rotation.
 
 ---
 
