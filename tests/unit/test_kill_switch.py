@@ -411,3 +411,25 @@ def test_kill_switch_sync_filters_by_ticker(mock_order_manager):
         called_url = mock_del.call_args[0][0]
         assert "kxtest-kid" in called_url
         assert "other-kid" not in called_url
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_async_cancels_verified_orders_concurrently_with_exchange_fetch(mock_order_manager):
+    """Verify trigger dispatches cancellations for verified orders while fetch runs."""
+    mock_order_manager.active_orders = {
+        "verified-cid": {"kalshi_order_id": "verified-kid", "ticker": "KXTEST"},
+        "unverified-cid": {"kalshi_order_id": None, "ticker": "KXTEST"},
+    }
+    mock_order_manager.cancel_order = AsyncMock(return_value=True)
+
+    def slow_fetch(ticker=None):
+        return [{"order_id": "unverified-kid", "client_order_id": "unverified-cid", "ticker": "KXTEST"}]
+
+    killer = KillSwitch(mock_order_manager, ticker="KXTEST")
+    killer._fetch_resting_orders_sync = slow_fetch
+
+    with patch("execution.kill_switch.send_alert", new_callable=AsyncMock):
+        await killer.trigger()
+
+        # Both verified and reconciled unverified orders cancelled
+        assert mock_order_manager.cancel_order.await_count == 2

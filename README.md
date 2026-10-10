@@ -62,7 +62,7 @@ Every parameter, including credentials, safeguard thresholds and database settin
 
 ## Shutdown & Risk
 
-On `SIGTERM` or Ctrl+C, the bot won't exit cleanly until the exchange confirms every order is cancelled:
+On `SIGTERM` or Ctrl+C, the bot won't exit cleanly until the exchange confirms every order is cancelled. For a running bot, the shutdown sequence starts with `trigger_synchronous()`. If a signal arrives during startup, cleanup begins after `KillSwitch` initialization:
 
 ```mermaid
 sequenceDiagram
@@ -106,7 +106,7 @@ MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=0 | Gamma=0.7 | R
 MarketMaker - INFO - >> Placing new BID: 4 YES @ 23c
 MarketMaker - INFO - >> Placing new ASK: 4 YES @ 28c
 InventoryManager - INFO - Fill processed for KXNCAAFGAME-26OCT10INDNEB-NEB: buy 4 yes @ 23c. New Net Pos: 4.
-MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=4 | Gamma=0.7 | ReservationPrice=24.80c | Spread=4c → Bid=22c  Ask=27c | Realized=+0.0c | Unrealized=-10.8c
+MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=4 | Gamma=0.7 | ReservationPrice=24.80c | Spread=4c → Bid=22c  Ask=27c | Realized=+0.0c | Unrealized=+10.0c
 MarketMaker - INFO - >> Placing new BID: 4 YES @ 22c
 MarketMaker - INFO - >> Placing new ASK: 4 YES @ 27c
 ```

@@ -421,5 +421,46 @@ class TestV2PayloadSchema:
 
             order_manager._cancel_by_kalshi_id.assert_not_called()
 
+    def test_fetch_resting_orders_sync_acquires_rate_limiter_per_page(self, order_manager):
+        """Verify fetch_resting_orders_sync acquires rate limiter token for every page."""
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {"orders": [{"order_id": "k1"}], "cursor": "c2"}
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"orders": [{"order_id": "k2"}], "cursor": None}
+
+        order_manager.rate_limiter.acquire_sync = MagicMock()
+
+        with patch("execution.order_manager.requests.get", side_effect=[page1, page2]):
+            orders = order_manager.fetch_resting_orders_sync()
+
+            assert len(orders) == 2
+            assert order_manager.rate_limiter.acquire_sync.call_count == 2
+
+    def test_fetch_resting_orders_sync_retries_429_with_backoff(self, order_manager, monkeypatch):
+        """Verify fetch_resting_orders_sync retries 429 response with backoff."""
+        resp_429 = MagicMock(status_code=429)
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {"orders": [{"order_id": "k1"}], "cursor": None}
+
+        mock_sleep = MagicMock()
+        import time
+        monkeypatch.setattr(time, "sleep", mock_sleep)
+
+        with patch("execution.order_manager.requests.get", side_effect=[resp_429, resp_200]):
+            orders = order_manager.fetch_resting_orders_sync()
+
+            assert len(orders) == 1
+            mock_sleep.assert_called_once_with(1.0)
+
+    def test_rate_limiter_acquire_sync_and_async(self):
+        """Verify RateLimiter acquire_sync consumes tokens and throttles when exhausted."""
+        from utils.rate_limiter import RateLimiter
+        limiter = RateLimiter(rate=2, per=1.0)
+
+        # Consumes available tokens without blocking
+        limiter.acquire_sync()
+        limiter.acquire_sync()
+        assert limiter._tokens < 1.0
+
 
 

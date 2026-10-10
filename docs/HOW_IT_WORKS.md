@@ -45,7 +45,7 @@ flowchart TB
 
 On `SIGTERM` or Ctrl+C, the bot won't exit cleanly until the exchange confirms every order is cancelled. The sequence is shown in the [README](../README.md#shutdown--risk).
 
-1. The signal handler fires the kill switch immediately. For any order without an exchange ID, the kill switch looks it up among the exchange's resting orders. If that lookup fails, it keeps the order on record rather than guessing.
+1. After `KillSwitch` initialization, the signal handler fires the kill switch immediately. If a signal arrives during startup, cleanup begins after initialization through `await killer.trigger()`. For any order without an exchange ID, the kill switch looks it up among the exchange's resting orders. If that lookup fails, it keeps the order on record rather than guessing.
 2. `stop()` cancels all quotes. If any cancellation isn't confirmed, it escalates to the kill switch again.
 3. Any open position is liquidated.
 4. A final P&L snapshot is saved and background tasks are stopped.
