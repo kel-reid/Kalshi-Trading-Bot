@@ -75,7 +75,7 @@ async def test_main_signal_shutdown():
         
         await main()
 
-    mock_killer.trigger_synchronous.assert_called_once()
+    mock_killer.trigger_synchronous.assert_called_once_with(ticker="KXNFLGAME-TEST")
     mock_bot.stop.assert_awaited_once()
 
 
@@ -114,7 +114,7 @@ async def test_main_sigterm_shutdown():
         
         await main()
 
-    mock_killer.trigger_synchronous.assert_called_once()
+    mock_killer.trigger_synchronous.assert_called_once_with(ticker="KXNFLGAME-TEST")
     mock_bot.stop.assert_awaited_once()
 
 
@@ -122,6 +122,7 @@ async def test_main_sigterm_shutdown():
 async def test_main_bot_crash_triggers_safety_and_stop():
     """Verify bot crash triggers killer.trigger() and bot.stop()."""
     mock_bot = MagicMock()
+    mock_bot.ticker = "KXNFLGAME-TEST"
     mock_bot.start = AsyncMock(side_effect=RuntimeError("Unexpected MM loop crash"))
     mock_bot.stop = AsyncMock()
     mock_killer = MagicMock()
@@ -134,7 +135,7 @@ async def test_main_bot_crash_triggers_safety_and_stop():
         with pytest.raises(RuntimeError, match="Unexpected MM loop crash"):
             await main()
 
-    mock_killer.trigger.assert_awaited_once()
+    mock_killer.trigger.assert_awaited_once_with(ticker="KXNFLGAME-TEST")
     mock_bot.stop.assert_awaited_once()
 
 
