@@ -33,6 +33,26 @@ class KillSwitch:
     def __init__(self, order_manager: OrderManager):
         self.om = order_manager
 
+    def _fetch_resting_orders_sync(self):
+        """Fetch all resting orders across the portfolio synchronously for emergency reconciliation."""
+        sign_path = "/trade-api/v2/portfolio/orders"
+        try:
+            headers = get_auth_headers(method="GET", sign_path=sign_path)
+            resp = requests.get(
+                BASE_URL + sign_path,
+                headers=headers,
+                params={"status": "resting", "limit": 100},
+                timeout=5,
+                verify=certifi.where()
+            )
+            if resp.status_code == 200:
+                return resp.json().get("orders", [])
+            logger.error(f"Failed to fetch resting orders for sync reconciliation: {resp.status_code} - {resp.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Exception fetching resting orders for sync reconciliation: {e}")
+            return None
+
     def trigger_synchronous(self):
         """Immediately cancel all known local orders synchronously."""
         logger.warning("Kill Switch Triggered (Sync). Canceling all local orders...")
@@ -55,14 +75,47 @@ class KillSwitch:
         if not active_ids:
             logger.info("No active local orders to kill.")
             return
+
+        # Check if any active orders are missing the exchange-assigned kalshi_order_id
+        unverified_ids = [
+            cid for cid in active_ids 
+            if not (self.om.active_orders.get(cid) or {}).get("kalshi_order_id")
+        ]
+
+        # If any order is unverified, reconcile against exchange resting orders first
+        client_to_exchange = {}
+        recon_succeeded = False
+        if unverified_ids:
+            resting_orders = self._fetch_resting_orders_sync()
+            if resting_orders is not None:
+                recon_succeeded = True
+                client_to_exchange = {
+                    o.get("client_order_id"): o.get("order_id")
+                    for o in resting_orders
+                    if o.get("client_order_id") and o.get("order_id")
+                }
             
         for client_order_id in active_ids:
             order_info = self.om.active_orders.get(client_order_id)
             kalshi_order_id = order_info.get("kalshi_order_id") if order_info else None
             
             if not kalshi_order_id:
-                # Fallback just in case Kalshi order ID wasn't populated yet
-                kalshi_order_id = client_order_id
+                if recon_succeeded:
+                    if client_order_id in client_to_exchange:
+                        kalshi_order_id = client_to_exchange[client_order_id]
+                        if order_info:
+                            order_info["kalshi_order_id"] = kalshi_order_id
+                    else:
+                        # Exchange confirms this client order is NOT in resting orders
+                        logger.info(f"Order {client_order_id} verified not resting on exchange.")
+                        self.om.active_orders.pop(client_order_id, None)
+                        continue
+                else:
+                    logger.error(
+                        f"Cannot safely cancel unverified order {client_order_id}: "
+                        "missing exchange order ID and resting order reconciliation failed."
+                    )
+                    continue
 
             logger.warning(f"Canceling {client_order_id} (Kalshi ID: {kalshi_order_id})...")
             # Fire an emergency blocking cancel to Kalshi using the raw request wrapper
@@ -79,7 +132,8 @@ class KillSwitch:
                     logger.info(f"Successfully killed {client_order_id}")
                     self.om.active_orders.pop(client_order_id, None)
                 elif resp.status_code == 404:
-                    logger.info(f"Order {client_order_id} already closed/filled.")
+                    # Verified Kalshi ID returned 404: confirmed closed/filled on exchange
+                    logger.info(f"Order {client_order_id} ({kalshi_order_id}) already closed/filled on exchange.")
                     self.om.active_orders.pop(client_order_id, None)
                 else:
                     logger.error(f"Failed to kill {client_order_id}: {resp.status_code} - {resp.text}")

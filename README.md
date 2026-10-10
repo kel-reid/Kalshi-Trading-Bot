@@ -9,19 +9,19 @@
 
 ## Overview
 
-This project is a production-grade algorithmic market-making trading bot built for the **Kalshi** prediction market exchange. It continuously provides dual-sided liquidity (bids and asks) using an asynchronous **Avellaneda-Stoikov** pricing model to capture the bid-ask spread while actively hedging inventory exposure.
+This project is an asynchronous algorithmic market-making trading bot built for the **Kalshi** prediction market exchange. It continuously provides dual-sided liquidity (bids and asks) using an asynchronous **Avellaneda-Stoikov** pricing model to capture the bid-ask spread while actively hedging inventory exposure.
 
 ### Key Capabilities
 * **Avellaneda-Stoikov Pricing:** Dynamically skews reservation price based on net contract inventory (`q`) and the risk aversion parameter (`gamma`).
-* **Active Inventory Hedging:** Halts adverse quoting and aggressively crosses the spread when inventory reaches +/- 5 contracts.
+* **Active Inventory Hedging:** Dynamically halts adverse quoting and crosses the spread when net inventory breaches the hedge threshold ($5 \times \text{quote size}$, bounded by `MAX_HEDGE_INVENTORY`).
 * **Execution Safeguards & Circuit Breakers:**
   * **Price Velocity Circuit Breaker (Fast Market):** Automatically detects toxic price momentum (mid-price shift $\ge 6¢$ over a 20-second rolling window) and quiesces quoting for 30 seconds.
   * **Extreme Price Collars:** Halts quoting if midpoint breaches 10¢ or 90¢ to eliminate asymmetric adverse selection near binary contract settlement bounds.
   * **Session Stop-Loss & Fee Churn:** Enforces session loss limits ($3.00) and fee caps ($2.50) before orderly liquidation and rotation.
   * **Post-Fill Adverse Selection Protection:** Pauses quoting for 3 seconds post-fill to let the orderbook stabilize.
   * **Pre-Settlement Liquidation:** Halts quoting and liquidates open inventory in slices 90 minutes prior to contract expiration.
-* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
-* **Zero-Downtime Telemetry:** Emits real-time Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
+* **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (College Football / NCAAF, NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
+* **Real-Time Telemetry:** Emits live Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
 
 ---
 
@@ -76,7 +76,7 @@ The bot loads configuration parameters dynamically from environment variables or
 | `ORDER_SIZE` | `integer` | `1` | Fallback number of contracts to quote per side. |
 | `ORDER_DOLLARS` | `float` | `1.0` | Minimum notional dollar allocation per quote for dynamic order sizing. |
 | `MAX_ORDER_CONTRACTS` | `integer` | `100` | Maximum contract ceiling allowed per individual order slice. |
-| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Maximum portfolio contract inventory ceiling before emergency liquidation. |
+| `MAX_HEDGE_INVENTORY` | `integer` | `250` | Hard upper ceiling applied to the dynamic inventory hedge threshold ($5 \times \text{quote size}$). |
 | `MIN_SPREAD` | `integer` | `4` | Minimum profit spread required between bid and ask (in cents). |
 | `RISK_GAMMA` | `float` | `0.7` | Risk-aversion parameter (`gamma`) controlling the rate of inventory skewing. |
 | `MIN_MID_PRICE` | `integer` | `10` | Lower price collar bound (cents); halts quoting when mid-price drops below this level. |
@@ -104,17 +104,17 @@ For the seasonal matrix and series precedence rules, see the **[SportsSeasonRout
 When running, the bot feeds structured telemetry and execution updates via its primary logging loop:
 
 ```text
-Selected Market: KXNFLGAME-26SEP21NYGLAR-NYG
-2026-09-19 16:21:12,851 - MarketMaker - INFO - Starting Market Maker for KXNFLGAME-26SEP21NYGLAR-NYG
-2026-09-19 16:21:13,234 - KalshiWS - INFO - Connected successfully.
-2026-09-19 16:21:13,334 - MarketMaker - INFO - WebSocket Connected. Hydrating state...
-2026-09-19 16:21:13,452 - MarketMaker - INFO - State hydrated. Beginning quoting loop.
-2026-09-19 16:21:14,455 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Inventory=0 | Gamma=0.5 | ReservationPrice=25.50c | Spread=4c → Bid=23c  Ask=28c
-2026-09-19 16:21:14,455 - MarketMaker - INFO - >> Placing new BID: 1 YES @ 23c
-2026-09-19 16:21:14,515 - MarketMaker - INFO - >> Placing new ASK: 1 YES @ 28c
-2026-09-19 16:21:18,120 - InventoryManager - INFO - Fill processed for KXNFLGAME-26SEP21NYGLAR-NYG: buy 1 yes @ 23c. New Net Pos: 1.
-2026-09-19 16:21:18,589 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Inventory=1 | Gamma=0.5 | ReservationPrice=25.00c | Spread=4c → Bid=23c  Ask=27c
-2026-09-19 16:21:18,590 - MarketMaker - INFO - >> Replacing ASK: 1 YES @ 27c
+Selected Market: KXNCAAFGAME-26OCT10INDNEB-NEB
+2026-10-10 16:03:12,240 - MarketMaker - INFO - Starting Market Maker for KXNCAAFGAME-26OCT10INDNEB-NEB
+2026-10-10 16:03:12,569 - KalshiWS - INFO - Connected successfully.
+2026-10-10 16:03:12,643 - MarketMaker - INFO - WebSocket Connected. Hydrating state...
+2026-10-10 16:03:12,773 - MarketMaker - INFO - State hydrated. Beginning quoting loop.
+2026-10-10 16:03:12,841 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=0 | Gamma=0.7 | ReservationPrice=25.50c | Spread=4c → Bid=23c  Ask=28c | Realized=+0.0c | Unrealized=+0.0c
+2026-10-10 16:03:12,842 - MarketMaker - INFO - >> Placing new BID: 4 YES @ 23c
+2026-10-10 16:03:12,916 - MarketMaker - INFO - >> Placing new ASK: 4 YES @ 28c
+2026-10-10 16:03:18,120 - InventoryManager - INFO - Fill processed for KXNCAAFGAME-26OCT10INDNEB-NEB: buy 4 yes @ 23c. New Net Pos: 4.
+2026-10-10 16:03:18,589 - MarketMaker - INFO - [A-S MATH] Mid=25.5c | Size=4 | Inventory=4 | Gamma=0.7 | ReservationPrice=22.70c | Spread=4c → Bid=20c  Ask=25c | Realized=+0.0c | Unrealized=-10.8c
+2026-10-10 16:03:18,590 - MarketMaker - INFO - >> Replacing ASK: 4 YES @ 25c
 ```
 
 ---
