@@ -437,20 +437,24 @@ class TestV2PayloadSchema:
             assert order_manager.rate_limiter.acquire_sync.call_count == 2
 
     def test_fetch_resting_orders_sync_retries_429_with_backoff(self, order_manager, monkeypatch):
-        """Verify fetch_resting_orders_sync retries 429 response with backoff."""
+        """Verify fetch_resting_orders_sync retries 429 response with backoff and acquires token per attempt."""
         resp_429 = MagicMock(status_code=429)
         resp_200 = MagicMock(status_code=200)
         resp_200.json.return_value = {"orders": [{"order_id": "k1"}], "cursor": None}
 
+        order_manager.rate_limiter.acquire_sync = MagicMock()
         mock_sleep = MagicMock()
         import time
         monkeypatch.setattr(time, "sleep", mock_sleep)
 
-        with patch("execution.order_manager.requests.get", side_effect=[resp_429, resp_200]):
+        with patch("execution.order_manager.requests.get", side_effect=[resp_429, resp_200]), \
+             patch("execution.order_manager.get_auth_headers", return_value={"mock": "header"}) as mock_headers:
             orders = order_manager.fetch_resting_orders_sync()
 
             assert len(orders) == 1
             mock_sleep.assert_called_once_with(1.0)
+            assert order_manager.rate_limiter.acquire_sync.call_count == 2
+            assert mock_headers.call_count == 2
 
     def test_rate_limiter_acquire_sync_and_async(self):
         """Verify RateLimiter acquire_sync consumes tokens and throttles when exhausted."""

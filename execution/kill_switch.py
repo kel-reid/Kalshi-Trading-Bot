@@ -175,7 +175,7 @@ class KillSwitch:
             kid = order_info.get("kalshi_order_id")
             if kid:
                 kalshi_ids_covered.add(kid)
-                tasks.append(self.om.cancel_order(cid))
+                tasks.append(asyncio.create_task(self.om.cancel_order(cid)))
                 cids_being_cancelled.append(cid)
             else:
                 unverified_cids.append(cid)
@@ -205,7 +205,7 @@ class KillSwitch:
                     kid = client_to_exchange[cid]
                     order_info["kalshi_order_id"] = kid
                     kalshi_ids_covered.add(kid)
-                    tasks.append(self.om.cancel_order(cid))
+                    tasks.append(asyncio.create_task(self.om.cancel_order(cid)))
                     cids_being_cancelled.append(cid)
                 else:
                     logger.info(f"Order {cid} verified not resting on exchange.")
@@ -225,7 +225,7 @@ class KillSwitch:
                     continue
                 kalshi_ids_covered.add(oid)
                 logger.warning(f"Canceling untracked exchange resting order: {oid} (client_id: {cid})")
-                tasks.append(self.om._cancel_by_kalshi_id(oid, cid))
+                tasks.append(asyncio.create_task(self.om._cancel_by_kalshi_id(oid, cid)))
                 cids_being_cancelled.append(cid or oid)
 
         if not tasks:

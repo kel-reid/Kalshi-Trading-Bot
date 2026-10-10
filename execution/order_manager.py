@@ -585,12 +585,6 @@ class OrderManager:
 
         try:
             while True:
-                # Reserve a rate-limit token for every paginated request
-                if hasattr(self, "rate_limiter") and self.rate_limiter:
-                    if hasattr(self.rate_limiter, "acquire_sync"):
-                        self.rate_limiter.acquire_sync()
-
-                headers = get_auth_headers(method="GET", sign_path=sign_path)
                 params: Dict[str, Any] = {"status": "resting", "limit": 100}
                 if ticker:
                     params["ticker"] = ticker
@@ -599,6 +593,12 @@ class OrderManager:
 
                 page_success = False
                 for attempt in range(max_retries + 1):
+                    # Reserve a rate-limit token and generate fresh signed headers for each attempt
+                    if hasattr(self, "rate_limiter") and self.rate_limiter:
+                        if hasattr(self.rate_limiter, "acquire_sync"):
+                            self.rate_limiter.acquire_sync()
+
+                    headers = get_auth_headers(method="GET", sign_path=sign_path)
                     with measure_latency("GET", sign_path):
                         resp = requests.get(
                             BASE_URL + sign_path,

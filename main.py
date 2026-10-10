@@ -24,6 +24,7 @@ async def main():
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     killer = None
+    bot = None
     shutdown_in_progress = False
     sync_kill_executed = False
 
@@ -34,7 +35,7 @@ async def main():
         shutdown_in_progress = True
         print(f"\n\n>>> Signal {signum} received. Initiating graceful shutdown... <<<")
         if killer is not None:
-            killer.trigger_synchronous()
+            killer.trigger_synchronous(ticker=bot.ticker if bot else None)
             sync_kill_executed = True
         shutdown_event.set()
 
@@ -102,16 +103,16 @@ async def main():
         order_dollars=ORDER_DOLLARS,
         target_preference=TARGET_TICKER,
     )
-    killer = KillSwitch(bot.om, ticker=ticker)
+    killer = KillSwitch(bot.om)
 
     # Reconcile pending-shutdown state if a signal arrived during bot construction
     if shutdown_event.is_set():
         print("Shutdown requested during bot initialization; cleaning up resting quotes and aborting startup.")
         if not sync_kill_executed:
-            await killer.trigger()
+            await killer.trigger(ticker=bot.ticker)
         shutdown_clean = await bot.stop()
         if not shutdown_clean:
-            killer.trigger_synchronous()
+            killer.trigger_synchronous(ticker=bot.ticker)
             raise RuntimeError("Shutdown failed: active orders could not be confirmed cancelled on exchange.")
         return
 
@@ -129,7 +130,7 @@ async def main():
             exc = bot_task.exception()
             if exc:
                 print(f"Bot crashed: {exc}")
-                await killer.trigger()
+                await killer.trigger(ticker=bot.ticker)
                 task_exception = exc
         else:
             bot.running = False
@@ -137,13 +138,13 @@ async def main():
             await asyncio.gather(bot_task, return_exceptions=True)
     except Exception as e:
         print(f"Bot crashed: {e}")
-        await killer.trigger()
+        await killer.trigger(ticker=bot.ticker)
         task_exception = e
     finally:
         stop_waiter.cancel()
         shutdown_clean = await bot.stop()
         if not shutdown_clean:
-            killer.trigger_synchronous()
+            killer.trigger_synchronous(ticker=bot.ticker)
             raise RuntimeError("Shutdown failed: active orders could not be confirmed cancelled on exchange.")
 
     if task_exception:

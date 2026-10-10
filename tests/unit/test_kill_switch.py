@@ -8,6 +8,8 @@ Verifies synchronous and asynchronous cancellation routines, ensuring:
 4. Unverified orders are NOT popped if reconciliation fails.
 """
 
+import asyncio
+import threading
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from execution.kill_switch import KillSwitch
@@ -420,16 +422,35 @@ async def test_kill_switch_async_cancels_verified_orders_concurrently_with_excha
         "verified-cid": {"kalshi_order_id": "verified-kid", "ticker": "KXTEST"},
         "unverified-cid": {"kalshi_order_id": None, "ticker": "KXTEST"},
     }
-    mock_order_manager.cancel_order = AsyncMock(return_value=True)
+
+    cancellation_started = asyncio.Event()
+
+    async def cancel_order(cid):
+        if cid == "verified-cid":
+            cancellation_started.set()
+        return True
+
+    mock_order_manager.cancel_order = AsyncMock(side_effect=cancel_order)
+
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
 
     def slow_fetch(ticker=None):
+        fetch_started.set()
+        release_fetch.wait(timeout=5)
         return [{"order_id": "unverified-kid", "client_order_id": "unverified-cid", "ticker": "KXTEST"}]
 
     killer = KillSwitch(mock_order_manager, ticker="KXTEST")
     killer._fetch_resting_orders_sync = slow_fetch
 
     with patch("execution.kill_switch.send_alert", new_callable=AsyncMock):
-        await killer.trigger()
+        trigger_task = asyncio.create_task(killer.trigger())
+        try:
+            assert await asyncio.to_thread(fetch_started.wait, 2)
+            await asyncio.wait_for(cancellation_started.wait(), timeout=2)
+        finally:
+            release_fetch.set()
+            await trigger_task
 
         # Both verified and reconciled unverified orders cancelled
         assert mock_order_manager.cancel_order.await_count == 2
