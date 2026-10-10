@@ -72,7 +72,7 @@ graph TD
 ## Core Components
 
 1. **Market Discovery & Dynamic Rotation**:
-   - Automated selection of in-season sports contracts (NFL, NBA, MLB) through `SportsSeasonRouter`.
+   - Automated selection of in-season sports contracts (College Football / NCAAF, NFL, NBA, MLB) through `SportsSeasonRouter`.
    - Pre-flight orderbook probing ensures the bot only quotes active contracts with existing two-sided liquidity.
    - Enforces a strict weekly horizon (`MAX_EXPIRATION_DAYS = 8`) to maintain capital velocity and prevent multi-month capital lockup.
 
@@ -81,7 +81,7 @@ graph TD
      $$R = \text{MidPrice} - (q \times \gamma)$$
    - Places quotes symmetrically around reservation price:
      $$\text{Bid} = R - \frac{\text{Spread}}{2}, \quad \text{Ask} = R + \frac{\text{Spread}}{2}$$
-   - Enforces active inventory hedging thresholds (+/- 5 contracts) to aggressively cross the spread and de-risk.
+   - Enforces active inventory hedging thresholds ($\min(5 \times \text{quote size}, \text{MAX\_HEDGE\_INVENTORY})$ when dollar-based sizing is enabled, or $\min(5, \text{MAX\_HEDGE\_INVENTORY})$ under fixed sizing) to aggressively cross the spread and de-risk.
 
 3. **Infrastructure & Observability**:
    - Hardened DigitalOcean Droplet managed via Terraform and Docker Compose.

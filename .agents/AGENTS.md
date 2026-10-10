@@ -4,13 +4,14 @@
 - Always run the full pytest test suite (`.venv/bin/pytest -v`) and application verification checks before code is committed.
 - Always remind the user to run the local `terraform validate` syntax check and `tfsec` security scan commands whenever changes are made to the Terraform configurations.
 - Never alter external API query parameters, response payload validations, or endpoint URLs based on static code review suggestions or test fixture inconsistencies without empirical verification against the live vendor API. When multi-value status predicates exist (e.g. `status in ("open", "active")`), treat them as intentional vendor API quirks unless proven otherwise by live telemetry; always preserve both values in parsing and unit tests.
-- Whenever fixes addressing PR review comments are committed and pushed, always post a response directly to the discussion thread with the commit reference and a summary of the resolution, and mark the corresponding GitHub review thread as resolved.
 - Whenever asked to review PR comments, use the following template:
   - **Location**:
   - **Finding**:
   - **Technical Assessment**:
   - **Recommendation**:
-- Do not manually request reviews from CodeRabbit on pull requests (e.g. do not post `@coderabbit full review`); let automated webhook triggers or the user handle review requests.
+- Do not manually request reviews from automated review bots on pull requests; let automated webhook triggers or the user handle review requests.
+- Whenever fixes addressing PR review comments are committed and pushed, always post a response directly to the discussion thread with the commit reference and a summary of the resolution, and mark the corresponding GitHub review thread as resolved.
+
 - **Strict SDLC & Production Deployment Protocol**: Never manually deploy, copy files, or patch the production DigitalOcean droplet via ad-hoc SSH/SCP from local feature branches or unmerged code under any circumstances. All production deployments must strictly flow through the automated GitHub Actions CI/CD pipeline triggered by merging approved pull requests into `main`. Pre-merge validation must strictly remain within local unit/integration tests (`.venv/bin/pytest -v`), local Terraform checks (`terraform validate` and `tfsec`) when Terraform configurations change, and GitHub Actions CI checks.
 - After each successful production deploy executed by the GitHub Actions CI/CD pipeline to DigitalOcean, always inspect the droplet container logs (e.g. via SSH `ssh -i infra/kalshi_deploy_key.pem root@<DROPLET_IP> "docker logs --tail 100 kalshi-bot"`) to empirically verify startup hydration, market discovery, and healthy quoting without runtime errors.
 
