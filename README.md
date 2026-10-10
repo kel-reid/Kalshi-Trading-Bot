@@ -6,7 +6,6 @@
 
 > **Official Documentation**: For interactive architecture diagrams, seasonal routing specifications, the engineering roadmap, and setup guides, visit the **[Kalshi Trading Bot Wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki)**.
 
----
 
 ## Overview
 
@@ -24,7 +23,6 @@ This project is an asynchronous algorithmic market-making trading bot built for 
 * **Automated Seasonal Sports Discovery:** Automatically targets high-liquidity in-season major sports contracts (College Football / NCAAF, NFL, NBA, MLB) with pre-flight orderbook probing and strict weekly horizon bounds (8 days or fewer).
 * **Real-Time Telemetry:** Emits live Prometheus metrics scraped by Grafana Alloy and monitored via Grafana Cloud.
 
----
 
 ## System Architecture
 
@@ -36,7 +34,6 @@ The trading bot executes as an asynchronous event-driven system on a hardened Di
 
 **For the complete interactive system architecture diagram and component workflows, see the [Wiki: System Architecture](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture).**
 
----
 
 ## Quick Start (Local Development)
 
@@ -64,7 +61,6 @@ pytest -v
 
 For server provisioning, Docker deployment, and Doppler secret configuration, follow the **[Setup & Operations Guide](docs/SETUP_GUIDE.md)**.
 
----
 
 ## Configuration Parameters
 
@@ -98,7 +94,6 @@ The bot loads configuration parameters dynamically from environment variables or
 
 For the seasonal matrix and series precedence rules, see the **[SportsSeasonRouter Specification](docs/SPORTS_SEASON_ROUTER.md)**.
 
----
 
 ## Live Output Preview
 
@@ -118,7 +113,6 @@ Selected Market: KXNCAAFGAME-26OCT10INDNEB-NEB
 2026-10-10 16:03:18,590 - MarketMaker - INFO - >> Replacing ASK: 4 YES @ 25c
 ```
 
----
 
 ## Production Operations & Risk Notice
 
