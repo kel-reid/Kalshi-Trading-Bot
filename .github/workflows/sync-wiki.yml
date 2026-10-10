@@ -37,6 +37,8 @@ jobs:
           cp docs/ARCHITECTURE_DECISIONS.md wiki/2.-Architecture-Decisions.md
           cp docs/SPORTS_SEASON_ROUTER.md wiki/3.-Sports-Season-Router.md
           cp docs/FEATURE_ROADMAP.md wiki/4.-Feature-Roadmap.md
+          cp docs/HOW_IT_WORKS.md wiki/5.-How-It-Works.md
+          cp docs/CONFIGURATION.md wiki/6.-Configuration.md
           
           # Copy wiki-specific navigation and home templates if present
           if [ -d "docs/wiki" ]; then

@@ -11,12 +11,14 @@ Verifies synchronous and asynchronous cancellation routines, ensuring:
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from execution.kill_switch import KillSwitch
+from execution.order_manager import OrderManager
 
 
 @pytest.fixture
 def mock_order_manager():
     om = MagicMock()
     om.active_orders = {}
+    om.fetch_resting_orders_sync = MagicMock(return_value=[])
     return om
 
 
@@ -145,20 +147,20 @@ def test_kill_switch_sync_verified_404_pops_order(mock_order_manager):
 
 
 def test_kill_switch_fetch_resting_orders_sync_success():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=200)
     mock_resp.json.return_value = {"orders": [{"order_id": "k1", "client_order_id": "c1"}]}
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result == [{"order_id": "k1", "client_order_id": "c1"}]
 
 
 def test_kill_switch_fetch_resting_orders_sync_paginates():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
 
     resp_page1 = MagicMock(status_code=200)
     resp_page1.json.return_value = {
@@ -172,7 +174,7 @@ def test_kill_switch_fetch_resting_orders_sync_paginates():
     }
 
     with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
 
         assert len(result) == 2
@@ -188,8 +190,8 @@ def test_kill_switch_fetch_resting_orders_sync_paginates():
 
 
 def test_kill_switch_fetch_resting_orders_sync_subsequent_page_failure_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
 
     resp_page1 = MagicMock(status_code=200)
     resp_page1.json.return_value = {
@@ -199,7 +201,7 @@ def test_kill_switch_fetch_resting_orders_sync_subsequent_page_failure_returns_n
     resp_page2 = MagicMock(status_code=500, text="Internal Server Error")
 
     with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
 
         assert result is None
@@ -207,8 +209,8 @@ def test_kill_switch_fetch_resting_orders_sync_subsequent_page_failure_returns_n
 
 
 def test_kill_switch_fetch_resting_orders_sync_stagnant_cursor_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
 
     resp_page1 = MagicMock(status_code=200)
     resp_page1.json.return_value = {
@@ -222,7 +224,7 @@ def test_kill_switch_fetch_resting_orders_sync_stagnant_cursor_returns_none():
     }
 
     with patch("requests.get", side_effect=[resp_page1, resp_page2]) as mock_get, \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
 
         assert result is None
@@ -230,8 +232,8 @@ def test_kill_switch_fetch_resting_orders_sync_stagnant_cursor_returns_none():
 
 
 def test_kill_switch_fetch_resting_orders_sync_cyclic_cursor_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
 
     resp_page1 = MagicMock(status_code=200)
     resp_page1.json.return_value = {
@@ -250,7 +252,7 @@ def test_kill_switch_fetch_resting_orders_sync_cyclic_cursor_returns_none():
     }
 
     with patch("requests.get", side_effect=[resp_page1, resp_page2, resp_page3]) as mock_get, \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
 
         assert result is None
@@ -258,67 +260,70 @@ def test_kill_switch_fetch_resting_orders_sync_cyclic_cursor_returns_none():
 
 
 def test_kill_switch_fetch_resting_orders_sync_error():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=500, text="Internal Error")
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result is None
 
 
 def test_kill_switch_fetch_resting_orders_sync_invalid_payload_not_dict_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=200)
     mock_resp.json.return_value = ["not", "a", "dict"]
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result is None
 
 
 def test_kill_switch_fetch_resting_orders_sync_missing_orders_field_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=200)
     mock_resp.json.return_value = {"cursor": "token_abc"}
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result is None
 
 
 def test_kill_switch_fetch_resting_orders_sync_orders_not_list_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=200)
     mock_resp.json.return_value = {"orders": None}
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result is None
 
 
 def test_kill_switch_fetch_resting_orders_sync_orders_elements_not_dict_returns_none():
-    mock_om = MagicMock()
-    killer = KillSwitch(mock_om)
+    om = OrderManager.__new__(OrderManager)
+    killer = KillSwitch(om)
     mock_resp = MagicMock(status_code=200)
     mock_resp.json.return_value = {"orders": ["string_order", 123]}
 
     with patch("requests.get", return_value=mock_resp), \
-         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+         patch("execution.order_manager.get_auth_headers", return_value={"test": "header"}):
         result = killer._fetch_resting_orders_sync()
         assert result is None
 
 
 @pytest.mark.asyncio
 async def test_kill_switch_async_delegates_to_order_manager(mock_order_manager):
-    mock_order_manager.active_orders = {"cid-1": {}, "cid-2": {}}
+    mock_order_manager.active_orders = {
+        "cid-1": {"kalshi_order_id": "kid-1"},
+        "cid-2": {"kalshi_order_id": "kid-2"},
+    }
     mock_order_manager.cancel_order = AsyncMock(return_value=True)
 
     killer = KillSwitch(mock_order_manager)
@@ -327,3 +332,82 @@ async def test_kill_switch_async_delegates_to_order_manager(mock_order_manager):
 
         mock_alert.assert_awaited_once()
         assert mock_order_manager.cancel_order.await_count == 2
+
+
+def test_kill_switch_sync_cancels_exchange_resting_when_local_empty(mock_order_manager):
+    mock_order_manager.active_orders = {}
+    killer = KillSwitch(mock_order_manager, ticker="KXTEST")
+    mock_resting = [
+        {"order_id": "exchange-kid-1", "client_order_id": "exchange-cid-1", "ticker": "KXTEST"}
+    ]
+    mock_del_resp = MagicMock(status_code=200)
+
+    with patch.object(killer, "_fetch_resting_orders_sync", return_value=mock_resting) as mock_fetch, \
+         patch("requests.delete", return_value=mock_del_resp) as mock_del, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        killer.trigger_synchronous()
+
+        mock_fetch.assert_called_once_with(ticker="KXTEST")
+        mock_del.assert_called_once()
+        called_url = mock_del.call_args[0][0]
+        assert "exchange-kid-1" in called_url
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_async_cancels_exchange_resting_when_local_empty(mock_order_manager):
+    mock_order_manager.active_orders = {}
+    mock_order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+    killer = KillSwitch(mock_order_manager, ticker="KXTEST")
+    mock_resting = [
+        {"order_id": "exchange-kid-2", "client_order_id": "exchange-cid-2", "ticker": "KXTEST"}
+    ]
+
+    with patch.object(killer, "_fetch_resting_orders_sync", return_value=mock_resting) as mock_fetch, \
+         patch("execution.kill_switch.send_alert", new_callable=AsyncMock):
+        await killer.trigger()
+
+        mock_fetch.assert_called_once_with(ticker="KXTEST")
+        mock_order_manager._cancel_by_kalshi_id.assert_awaited_once_with("exchange-kid-2", "exchange-cid-2")
+
+
+def test_kill_switch_sync_cancels_union_without_duplication(mock_order_manager):
+    mock_order_manager.active_orders = {
+        "local-cid-1": {"ticker": "KXTEST", "kalshi_order_id": "kid-1", "count": 1}
+    }
+    killer = KillSwitch(mock_order_manager, ticker="KXTEST")
+    mock_resting = [
+        {"order_id": "kid-1", "client_order_id": "local-cid-1", "ticker": "KXTEST"},
+        {"order_id": "kid-2", "client_order_id": "untracked-cid-2", "ticker": "KXTEST"},
+    ]
+    mock_del_resp = MagicMock(status_code=200)
+
+    with patch.object(killer, "_fetch_resting_orders_sync", return_value=mock_resting), \
+         patch("requests.delete", return_value=mock_del_resp) as mock_del, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        killer.trigger_synchronous()
+
+        # Both kid-1 and kid-2 cancelled, but kid-1 cancelled only once
+        assert mock_del.call_count == 2
+        called_urls = [call[0][0] for call in mock_del.call_args_list]
+        assert any("kid-1" in url for url in called_urls)
+        assert any("kid-2" in url for url in called_urls)
+
+
+def test_kill_switch_sync_filters_by_ticker(mock_order_manager):
+    mock_order_manager.active_orders = {}
+    killer = KillSwitch(mock_order_manager, ticker="KXTEST")
+    mock_resting = [
+        {"order_id": "other-kid", "client_order_id": "other-cid", "ticker": "OTHER-TICKER"},
+        {"order_id": "kxtest-kid", "client_order_id": "kxtest-cid", "ticker": "KXTEST"},
+    ]
+    mock_del_resp = MagicMock(status_code=200)
+
+    with patch.object(killer, "_fetch_resting_orders_sync", return_value=mock_resting), \
+         patch("requests.delete", return_value=mock_del_resp) as mock_del, \
+         patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
+        killer.trigger_synchronous()
+
+        assert mock_del.call_count == 1
+        called_url = mock_del.call_args[0][0]
+        assert "kxtest-kid" in called_url
+        assert "other-kid" not in called_url

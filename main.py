@@ -102,7 +102,7 @@ async def main():
         order_dollars=ORDER_DOLLARS,
         target_preference=TARGET_TICKER,
     )
-    killer = KillSwitch(bot.om)
+    killer = KillSwitch(bot.om, ticker=ticker)
 
     # Reconcile pending-shutdown state if a signal arrived during bot construction
     if shutdown_event.is_set():
