@@ -6,7 +6,7 @@ and formatting market text and numeric fields.
 """
 
 import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 def _parse_iso_timestamp(ts: Any) -> Optional[datetime.datetime]:
@@ -29,25 +29,54 @@ def _parse_iso_timestamp(ts: Any) -> Optional[datetime.datetime]:
         return None
 
 
+def _get_earliest_market_timestamp(
+    m: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[datetime.datetime]]:
+    """
+    Find the earliest valid timestamp among expected_expiration_time, close_time, and expiration_time.
+    Returns (raw_str, parsed_dt) for the earliest valid datetime found.
+    If any non-empty timestamp field cannot be parsed, returns (raw_str, None) to signal fail-closed.
+    If no timestamp fields are present or populated, returns (None, None).
+    """
+    candidates = []
+
+    for key in ("expected_expiration_time", "close_time", "expiration_time"):
+        raw_val = m.get(key)
+        if raw_val is not None:
+            raw_str = str(raw_val).strip()
+            if raw_str:
+                dt = _parse_iso_timestamp(raw_str)
+                if dt is None:
+                    # Fail closed on unparseable timestamp
+                    return (raw_str, None)
+                candidates.append((raw_str, dt))
+
+    if candidates:
+        # Sort by datetime ascending to find earliest cutoff
+        candidates.sort(key=lambda item: item[1])
+        return candidates[0]
+
+    return (None, None)
+
+
 def _is_within_horizon(
     m: Dict[str, Any],
     max_days: Optional[float],
     now_utc: Optional[datetime.datetime] = None,
 ) -> bool:
     """
-    Return True if market close_time / expiration_time is within max_days from now.
+    Return True if earliest market expiration timestamp is within max_days from now.
     Returns True if max_days is None.
-    If close_time is missing, returns True for backward-compatibility with untimed mock markets.
-    If close_time is present, parses into UTC and enforces 0.0 <= days_remaining <= max_days.
+    If timestamp fields are missing, returns True for backward-compatibility with untimed mock markets.
+    If timestamps are present, parses the earliest and enforces 0.0 <= days_remaining <= max_days.
     Fails closed (returns False) on any parse error, invalid timestamp, or out-of-horizon date.
     """
     if max_days is None:
         return True
-    close_time_str = m.get("close_time") or m.get("expiration_time")
-    if not close_time_str or not str(close_time_str).strip():
-        return True
 
-    close_dt = _parse_iso_timestamp(close_time_str)
+    raw_str, close_dt = _get_earliest_market_timestamp(m)
+    if raw_str is None:
+        return True
     if close_dt is None:
         return False
 
