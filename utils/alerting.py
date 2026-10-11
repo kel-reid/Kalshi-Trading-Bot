@@ -11,6 +11,7 @@ import logging
 import json
 import time
 import re
+import requests
 from typing import Dict, Tuple, Optional
 
 from config import ALERT_WEBHOOK_URL
@@ -99,33 +100,46 @@ async def send_alert(
     }
 
     delivery_succeeded = False
-    try:
-        import requests
-        resp = await asyncio.to_thread(
+    worker_task = asyncio.create_task(
+        asyncio.to_thread(
             requests.post,
             ALERT_WEBHOOK_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=5
+            timeout=5,
         )
-        if resp.status_code < 400:
-            delivery_succeeded = True
-            logger.info(f"Webhook alert sent successfully (key='{key}').")
-        else:
-            logger.error(f"Failed to send webhook alert (HTTP {resp.status_code}): {resp.text}")
-    except Exception as e:
-        logger.error(f"Failed to send webhook alert: {e}")
-
-    # If webhook delivery failed, roll back the reservation while preserving any in-flight suppressions
-    if throttle_active and not delivery_succeeded:
-        _, in_flight_suppressed = _alert_history.get(key, (now, 0))
-        if prior_entry is None:
-            if in_flight_suppressed > 0:
-                _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+    )
+    try:
+        try:
+            resp = await asyncio.shield(worker_task)
+            if resp.status_code < 400:
+                delivery_succeeded = True
+                logger.info(f"Webhook alert sent successfully (key='{key}').")
             else:
-                _alert_history.pop(key, None)
-        else:
-            prior_last_sent, _ = prior_entry
-            _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
+                logger.error(f"Failed to send webhook alert (HTTP {resp.status_code}): {resp.text}")
+        except asyncio.CancelledError:
+            # Task awaiting send_alert was cancelled. Await the shielded worker
+            # to determine actual delivery outcome before updating cooldown state.
+            try:
+                resp = await worker_task
+                if resp.status_code < 400:
+                    delivery_succeeded = True
+            except Exception:
+                delivery_succeeded = False
+            raise
+        except Exception as e:
+            logger.error(f"Failed to send webhook alert: {e}")
+    finally:
+        # If webhook delivery failed, roll back the reservation while preserving any in-flight suppressions
+        if throttle_active and not delivery_succeeded:
+            _, in_flight_suppressed = _alert_history.get(key, (now, 0))
+            if prior_entry is None:
+                if in_flight_suppressed > 0:
+                    _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+                else:
+                    _alert_history.pop(key, None)
+            else:
+                prior_last_sent, _ = prior_entry
+                _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
 
 
