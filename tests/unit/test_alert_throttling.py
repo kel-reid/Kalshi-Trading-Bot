@@ -154,3 +154,69 @@ async def test_concurrent_alerts_are_throttled_and_in_flight_suppressions_preser
             assert "[Suppressed 4 identical alerts in last 300s]" in payload["text"]
 
 
+@pytest.mark.asyncio
+async def test_alert_cancellation_preserves_cooldown_on_successful_delivery():
+    """Verify that if send_alert task is cancelled but delivery succeeds, cooldown reservation is kept."""
+    with patch("utils.alerting.ALERT_WEBHOOK_URL", "https://hooks.slack.com/services/TEST/123"), \
+         patch("requests.post") as mock_post:
+
+        def slow_post(*args, **kwargs):
+            import time as t
+            t.sleep(0.05)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            return mock_resp
+
+        mock_post.side_effect = slow_post
+
+        task = asyncio.create_task(send_alert("⚠️ Cancelled test alert", cooldown_seconds=300.0))
+        await asyncio.sleep(0.01)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The worker finished successfully
+        assert mock_post.call_count == 1
+
+        # An immediate subsequent alert should be throttled because delivery succeeded
+        await send_alert("⚠️ Cancelled test alert", cooldown_seconds=300.0)
+        assert mock_post.call_count == 1  # Not sent again!
+
+
+@pytest.mark.asyncio
+async def test_alert_cancellation_rolls_back_on_failed_delivery():
+    """Verify that if send_alert task is cancelled and delivery fails, cooldown reservation is rolled back."""
+    with patch("utils.alerting.ALERT_WEBHOOK_URL", "https://hooks.slack.com/services/TEST/123"), \
+         patch("requests.post") as mock_post:
+
+        def failing_post(*args, **kwargs):
+            import time as t
+            t.sleep(0.05)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 500
+            mock_resp.text = "Internal Server Error"
+            return mock_resp
+
+        mock_post.side_effect = failing_post
+
+        task = asyncio.create_task(send_alert("⚠️ Cancelled failing alert", cooldown_seconds=300.0))
+        await asyncio.sleep(0.01)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert mock_post.call_count == 1
+
+        # Because delivery failed, reservation rolled back: subsequent alert is eligible to retry
+        mock_post.side_effect = None
+        mock_success = MagicMock()
+        mock_success.status_code = 200
+        mock_post.return_value = mock_success
+
+        await send_alert("⚠️ Cancelled failing alert", cooldown_seconds=300.0)
+        assert mock_post.call_count == 2
+
+
+
