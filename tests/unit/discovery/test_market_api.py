@@ -23,6 +23,7 @@ from utils import market_discovery as md
 from utils.market_discovery import (
     fetch_eligible_markets,
     check_market_status,
+    get_raw_market_status,
     is_market_active,
 )
 
@@ -269,6 +270,25 @@ def test_check_market_status_sports_expected_expiration_time_cutoff():
 
         status = check_market_status("KXNCAAF-IMMINENT")
         assert status == "closed"
+
+
+def test_get_raw_market_status_preserves_open_status_within_cutoff():
+    """Verify get_raw_market_status returns true exchange status without cutoff augmentation."""
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "market": {
+                "ticker": "KXNCAAF-IMMINENT",
+                "status": "open",
+                "expected_expiration_time": "2026-10-10T22:30:00Z",
+            }
+        }
+        mock_get.return_value = mock_resp
+
+        # Raw status returns 'open', while check_market_status returns 'closed'
+        assert get_raw_market_status("KXNCAAF-IMMINENT") == "open"
+
 
 
 

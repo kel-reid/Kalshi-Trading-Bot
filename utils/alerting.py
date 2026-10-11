@@ -58,16 +58,12 @@ async def send_alert(
     When a suppressed alert is finally allowed to fire after cooldown, it summarizes the number
     of suppressed notifications.
     """
-    if not ALERT_WEBHOOK_URL:
-        # Fallback if no webhook is configured
-        logger.warning(f"ALERT (Local Only - No Webhook Configured): {message}")
-        return
-
     now = time.time()
     key = _normalize_alert_key(message)
     suppressed_count = 0
+    throttle_active = (not bypass_throttle) and (cooldown_seconds is not None) and (cooldown_seconds > 0)
 
-    if not bypass_throttle and cooldown_seconds is not None and cooldown_seconds > 0:
+    if throttle_active:
         if key in _alert_history:
             last_sent, count = _alert_history[key]
             elapsed = now - last_sent
@@ -80,14 +76,19 @@ async def send_alert(
             else:
                 suppressed_count = count
 
-        _alert_history[key] = (now, 0)
-
     # Prepend summary if repeating notifications were suppressed during the cooldown window
     delivered_message = message
     if suppressed_count > 0:
         delivered_message = (
             f"[Suppressed {suppressed_count} identical alerts in last {int(cooldown_seconds or 0)}s]\n{message}"
         )
+
+    if not ALERT_WEBHOOK_URL:
+        # Fallback if no webhook is configured (local logging)
+        logger.warning(f"ALERT (Local Only - No Webhook Configured): {delivered_message}")
+        if throttle_active:
+            _alert_history[key] = (now, 0)
+        return
 
     # Slack expects a JSON payload with a "text" field
     payload = {
@@ -96,13 +97,19 @@ async def send_alert(
 
     try:
         import requests
-        await asyncio.to_thread(
+        resp = await asyncio.to_thread(
             requests.post,
             ALERT_WEBHOOK_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=5
         )
-        logger.info(f"Webhook alert sent successfully (key='{key}').")
+        if resp.status_code < 400:
+            if throttle_active:
+                _alert_history[key] = (now, 0)
+            logger.info(f"Webhook alert sent successfully (key='{key}').")
+        else:
+            logger.error(f"Failed to send webhook alert (HTTP {resp.status_code}): {resp.text}")
     except Exception as e:
         logger.error(f"Failed to send webhook alert: {e}")
+

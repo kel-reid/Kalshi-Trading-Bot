@@ -315,6 +315,33 @@ def check_market_status(ticker: str) -> Optional[str]:
         return None
 
 
+def get_raw_market_status(ticker: str) -> Optional[str]:
+    """
+    Query the raw exchange status of a market directly from Kalshi REST API,
+    without augmenting with the local expiration cutoff rule.
+    Returns status string (e.g. 'open', 'active', 'closed', 'settled') or None if error.
+    Used for verifying true exchange terminal states (settlement/finalization).
+    """
+    try:
+        base_url = _get_base_url()
+        req_lib = _get_requests()
+        cert_path = _get_certifi().where()
+        resp = req_lib.get(
+            f"{base_url}/trade-api/v2/markets/{ticker}",
+            verify=cert_path,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            market_info = data.get("market", data)
+            return market_info.get("status")
+        logger.warning(f"Raw market status lookup for {ticker} returned HTTP {resp.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Error querying raw market status for {ticker}: {e}")
+        return None
+
+
 def _get_market_status_checker() -> Any:
     """Retrieve check_market_status function, honoring any mock in utils.market_discovery."""
     import sys
@@ -322,6 +349,7 @@ def _get_market_status_checker() -> Any:
     if md is not None and hasattr(md, "check_market_status"):
         return getattr(md, "check_market_status")
     return check_market_status
+
 
 
 def is_market_active(ticker: str) -> Optional[bool]:
