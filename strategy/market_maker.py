@@ -20,7 +20,12 @@ from data.orderbook_manager import OrderbookManager
 from data.inventory_manager import InventoryManager
 from execution.order_manager import OrderManager
 from utils.alerting import send_alert
-from utils.market_discovery import discover_active_market_async, is_market_active_async
+from utils.market_discovery import (
+    check_market_status_async,
+    discover_active_market_async,
+    get_raw_market_status_async,
+    is_market_active_async,
+)
 from utils.metrics import (
     start_metrics_server,
     BOT_INVENTORY_NET_POSITION,
@@ -289,10 +294,21 @@ class AvellanedaStoikovBot:
                 if self.inv_manager.get_position(self.ticker) != 0:
                     logger.warning(f"Retrying liquidation for inactive market {self.ticker}...")
                     if not await self.liquidate_inventory(self.ticker):
-                        await send_alert(
-                            f"⚠️ Inactive market liquidation retry failed for {self.ticker} "
-                            f"(position={self.inv_manager.get_position(self.ticker)})."
-                        )
+                        hydrated = False
+                        try:
+                            hydrated = await self.inv_manager.hydrate(is_startup=False)
+                        except Exception as e_hyd:
+                            logger.error(f"Failed to hydrate inventory on inactive retry for {self.ticker}: {e_hyd}")
+                        if not hydrated:
+                            await send_alert(
+                                f"⚠️ Inactive market liquidation could not be confirmed for {self.ticker}; "
+                                "position state is unknown after inventory hydration failed."
+                            )
+                        elif self.inv_manager.get_position(self.ticker) != 0:
+                            await send_alert(
+                                f"⚠️ Inactive market liquidation retry failed for {self.ticker} "
+                                f"(position={self.inv_manager.get_position(self.ticker)})."
+                            )
 
                 if self.auto_rotate:
                     logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
@@ -342,13 +358,25 @@ class AvellanedaStoikovBot:
                         logger.error(f"No replacement market found for {self.ticker}.")
                         if inventory != 0:
                             if not await self.liquidate_inventory(self.ticker):
-                                await send_alert(f"⚠️ Safeguard liquidation failed for {self.ticker}; open position remains unhedged.")
+                                hydrated = False
+                                try:
+                                    hydrated = await self.inv_manager.hydrate(is_startup=False)
+                                except Exception as e_hyd:
+                                    logger.error(f"Failed to hydrate inventory during cutoff for {self.ticker}: {e_hyd}")
+                                if not hydrated or self.inv_manager.get_position(self.ticker) != 0:
+                                    await send_alert(f"⚠️ Safeguard liquidation for {self.ticker} is unconfirmed.")
                         self._market_inactive = True
                         self._last_inactive_retry = now
                 else:
                     if inventory != 0:
                         if not await self.liquidate_inventory(self.ticker):
-                            await send_alert(f"⚠️ Safeguard liquidation failed for {self.ticker}; open position remains unhedged.")
+                            hydrated = False
+                            try:
+                                hydrated = await self.inv_manager.hydrate(is_startup=False)
+                            except Exception as e_hyd:
+                                logger.error(f"Failed to hydrate inventory during cutoff for {self.ticker}: {e_hyd}")
+                            if not hydrated or self.inv_manager.get_position(self.ticker) != 0:
+                                await send_alert(f"⚠️ Safeguard liquidation for {self.ticker} is unconfirmed.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
                 self._maybe_schedule_pnl_snapshot(now, inventory)
@@ -1191,14 +1219,39 @@ class AvellanedaStoikovBot:
             )
             liquidation_ok = await self.liquidate_inventory(ticker=old_ticker)
             if not liquidation_ok:
-                logger.error(
-                    f"Aborting rotation from {old_ticker} to {new_ticker}: failed to liquidate existing inventory. "
-                    f"Remaining inventory: {self.inv_manager.get_position(old_ticker)}"
-                )
-                await send_alert(
-                    f"⚠️ Rotation aborted: liquidation of {old_ticker} incomplete. Remaining on {old_ticker}."
-                )
-                return False
+                # Trigger immediate portfolio REST hydration to reconcile potential exchange settlement
+                hydration_succeeded = False
+                try:
+                    hydration_succeeded = await self.inv_manager.hydrate(is_startup=False)
+                except Exception as e_hyd:
+                    logger.error(f"Failed to hydrate inventory during rotation from {old_ticker}: {e_hyd}")
+
+                remaining_inv = self.inv_manager.get_position(old_ticker)
+                if hydration_succeeded and remaining_inv == 0:
+                    logger.info(
+                        f"Inventory for {old_ticker} reconciled to 0 following exchange hydration; proceeding with rotation."
+                    )
+                else:
+                    raw_status = await get_raw_market_status_async(old_ticker)
+                    if raw_status in ("closed", "settled", "determined", "finalized"):
+                        logger.warning(
+                            f"Market {old_ticker} is {raw_status} on exchange with unliquidated inventory {remaining_inv}. "
+                            f"Proceeding with rotation to {new_ticker} as exchange settlement will finalize position."
+                        )
+                        await send_alert(
+                            f"⚠️ Market {old_ticker} is {raw_status} with remaining position {remaining_inv}. "
+                            f"Rotating to {new_ticker}; awaiting exchange settlement."
+                        )
+                    else:
+                        logger.error(
+                            f"Aborting rotation from {old_ticker} to {new_ticker}: failed to liquidate existing inventory. "
+                            f"Remaining inventory: {remaining_inv} (market status: {raw_status})"
+                        )
+                        await send_alert(
+                            f"⚠️ Rotation aborted: liquidation of {old_ticker} incomplete. "
+                            f"Remaining position: {remaining_inv} (market status: {raw_status})."
+                        )
+                        return False
 
         # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
         await asyncio.sleep(0)

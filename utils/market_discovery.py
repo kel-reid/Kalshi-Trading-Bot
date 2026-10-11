@@ -26,6 +26,7 @@ import requests
 
 from config import BASE_URL, MAX_EXPIRATION_DAYS
 from utils.horizon import (
+    _get_earliest_market_timestamp,
     _is_within_horizon,
     _parse_float,
     _parse_iso_timestamp,
@@ -35,6 +36,7 @@ from utils.market_api import (
     check_market_status,
     check_orderbook_has_quotes,
     fetch_eligible_markets,
+    get_raw_market_status,
 )
 from utils.market_scoring import (
     DEFAULT_MAX_PROBES_GAME_LINES,
@@ -64,6 +66,7 @@ __all__ = [
     "DEFAULT_MAX_TOTAL_PROBES",
     "SPORTS_KEYWORDS",
     "SportsSeasonRouter",
+    "_get_earliest_market_timestamp",
     "_is_within_horizon",
     "_liquidity_key",
     "_markets_for_series",
@@ -78,6 +81,8 @@ __all__ = [
     "discover_active_market",
     "discover_active_market_async",
     "fetch_eligible_markets",
+    "get_raw_market_status",
+    "get_raw_market_status_async",
     "is_market_active",
     "is_market_active_async",
     "requests",
@@ -453,3 +458,8 @@ async def is_market_active_async(ticker: str) -> Optional[bool]:
 async def check_market_status_async(ticker: str) -> Optional[str]:
     """Non-blocking async wrapper for check_market_status."""
     return await asyncio.to_thread(check_market_status, ticker)
+
+
+async def get_raw_market_status_async(ticker: str) -> Optional[str]:
+    """Non-blocking async wrapper for get_raw_market_status."""
+    return await asyncio.to_thread(get_raw_market_status, ticker)

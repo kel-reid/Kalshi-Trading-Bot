@@ -15,6 +15,7 @@ from unittest.mock import patch, MagicMock
 from utils.market_discovery import (
     discover_active_market,
     fetch_eligible_markets,
+    _get_earliest_market_timestamp,
     _parse_iso_timestamp,
     _is_within_horizon,
 )
@@ -316,3 +317,79 @@ def test_is_within_horizon_clock_seam_fallback():
     finally:
         if saved_md is not None:
             sys.modules["utils.market_discovery"] = saved_md
+
+
+def test_get_earliest_market_timestamp_prioritizes_earliest():
+    """Verify _get_earliest_market_timestamp finds earliest timestamp among expected_expiration_time, close_time, and expiration_time."""
+    # 1. expected_expiration_time earlier than expiration_time (sports game scenario)
+    m_sports = {
+        "expected_expiration_time": "2026-10-10T22:30:00Z",
+        "expiration_time": "2026-10-12T15:00:00Z",
+    }
+    raw_str, dt = _get_earliest_market_timestamp(m_sports)
+    assert raw_str == "2026-10-10T22:30:00Z"
+    assert dt == datetime.datetime(2026, 10, 10, 22, 30, tzinfo=datetime.timezone.utc)
+
+    # 2. close_time earlier than expected_expiration_time
+    m_early_close = {
+        "expected_expiration_time": "2026-10-10T23:30:00Z",
+        "close_time": "2026-10-10T21:00:00Z",
+        "expiration_time": "2026-10-12T15:00:00Z",
+    }
+    raw_str, dt = _get_earliest_market_timestamp(m_early_close)
+    assert raw_str == "2026-10-10T21:00:00Z"
+    assert dt == datetime.datetime(2026, 10, 10, 21, 0, tzinfo=datetime.timezone.utc)
+
+    # 3. All timestamps missing or empty
+    assert _get_earliest_market_timestamp({}) == (None, None)
+    assert _get_earliest_market_timestamp({"close_time": "", "expiration_time": None}) == (None, None)
+
+
+def test_get_earliest_market_timestamp_unparseable_fails_closed():
+    """Verify unparseable timestamp returns (raw_str, None) to signal fail-closed."""
+    m_corrupt = {
+        "expected_expiration_time": "corrupt_iso",
+        "expiration_time": "2026-10-12T15:00:00Z",
+    }
+    raw_str, dt = _get_earliest_market_timestamp(m_corrupt)
+    assert raw_str == "corrupt_iso"
+    assert dt is None
+
+
+def test_sports_expected_expiration_time_enforces_expiration_cutoff():
+    """
+    Verify that a sports market with distant expiration_time (48h later)
+    but imminent expected_expiration_time (within cutoff) is rejected.
+    """
+    now = datetime.datetime(2026, 10, 10, 22, 0, 0, tzinfo=datetime.timezone.utc)
+    # expected_expiration_time is in 30 minutes (1800s <= 5400s cutoff)
+    # expiration_time is 48 hours in the future
+    m_game = {
+        "ticker": "KXNCAAF-TEST",
+        "status": "open",
+        "expected_expiration_time": "2026-10-10T22:30:00Z",
+        "expiration_time": "2026-10-12T15:00:00Z",
+    }
+
+    # In horizon helper, if expected_expiration_time has passed or is outside max_days
+    past_game = {
+        "ticker": "KXNCAAF-PAST",
+        "status": "open",
+        "expected_expiration_time": "2026-10-10T21:00:00Z",  # 1 hour ago
+        "expiration_time": "2026-10-12T15:00:00Z",
+    }
+    assert _is_within_horizon(past_game, max_days=8.0, now_utc=now) is False
+    assert _is_within_horizon(m_game, max_days=8.0, now_utc=now) is True
+
+    # In fetch_eligible_markets, cutoff is enforced against expected_expiration_time
+    with patch("requests.get") as mock_get, \
+         patch("utils.market_api.datetime") as mock_dt:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": [m_game]}
+        mock_get.return_value = mock_resp
+        mock_dt.datetime.now.return_value = now
+        mock_dt.timezone = datetime.timezone
+
+        eligible = fetch_eligible_markets()
+        assert len(eligible) == 0  # Filtered out because 30m <= 90m cutoff!
