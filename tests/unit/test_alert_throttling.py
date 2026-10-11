@@ -2,6 +2,7 @@
 Unit tests for alert throttling, deduplication, and cooldown behavior in utils/alerting.py.
 """
 
+import asyncio
 import pytest
 import time
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -118,4 +119,38 @@ async def test_alert_no_webhook_configured_cooldown_throttling(caplog):
         with patch("time.time", return_value=time.time() + 305):
             await send_alert("Local test alert", cooldown_seconds=300.0)
             assert any("[Suppressed 1 identical alerts in last 300s]" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_alerts_are_throttled_and_in_flight_suppressions_preserved():
+    """Verify concurrent send_alert calls during network I/O are throttled and suppression counts preserved."""
+    with patch("utils.alerting.ALERT_WEBHOOK_URL", "https://hooks.slack.com/services/TEST/123"), \
+         patch("requests.post") as mock_post:
+
+        def blocking_post(*args, **kwargs):
+            import time as t
+            t.sleep(0.02)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            return mock_resp
+
+        mock_post.side_effect = blocking_post
+
+        # Launch 5 concurrent alerts with the same key
+        tasks = [
+            send_alert("⚠️ Concurrent test alert", cooldown_seconds=300.0)
+            for _ in range(5)
+        ]
+        await asyncio.gather(*tasks)
+
+        # Exactly 1 HTTP POST should have been dispatched; the other 4 were throttled in flight!
+        assert mock_post.call_count == 1
+
+        # Advance time past cooldown and fire again; verify the 4 in-flight alerts are reported as suppressed
+        with patch("time.time", return_value=time.time() + 305):
+            await send_alert("⚠️ Concurrent test alert", cooldown_seconds=300.0)
+            assert mock_post.call_count == 2
+            payload = mock_post.call_args[1]["json"]
+            assert "[Suppressed 4 identical alerts in last 300s]" in payload["text"]
+
 
