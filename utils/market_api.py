@@ -12,7 +12,7 @@ import certifi
 import requests
 
 from config import BASE_URL
-from utils.horizon import _is_within_horizon, _parse_iso_timestamp
+from utils.horizon import _get_earliest_market_timestamp, _is_within_horizon, _parse_iso_timestamp
 
 logger = logging.getLogger("MarketDiscovery")
 
@@ -149,10 +149,9 @@ def fetch_eligible_markets(
                 continue
             if str(m.get("ticker", "")).upper().startswith(("KXMVE", "KXNHL")):
                 continue
-            # Filter out markets whose close_time or expiration_time has passed or is within expiration cutoff
-            close_time_str = m.get("close_time") or m.get("expiration_time")
+            # Filter out markets whose earliest expiration timestamp has passed or is within expiration cutoff
+            close_time_str, close_dt = _get_earliest_market_timestamp(m)
             if close_time_str:
-                close_dt = _parse_iso_timestamp(close_time_str)
                 if close_dt is None:
                     continue
                 from config import MIN_TIME_TO_CLOSE_SECONDS
@@ -288,10 +287,9 @@ def check_market_status(ticker: str) -> Optional[str]:
             market_info = data.get("market", data)
             status = market_info.get("status")
 
-            # Check close_time / expiration_time
-            close_time_str = market_info.get("close_time") or market_info.get("expiration_time")
+            # Check earliest expiration timestamp (expected_expiration_time, close_time, expiration_time)
+            close_time_str, close_dt = _get_earliest_market_timestamp(market_info)
             if close_time_str:
-                close_dt = _parse_iso_timestamp(close_time_str)
                 if close_dt is None:
                     logger.warning(f"Market {ticker} has unparseable close_time ({close_time_str}); treating as closed.")
                     return "closed"

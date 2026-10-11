@@ -11,6 +11,7 @@ Tests Kalshi vendor API interaction:
 """
 
 import certifi
+import datetime
 import pytest
 import requests
 import sys
@@ -245,6 +246,30 @@ def test_check_market_status_expired_close_time():
         status = check_market_status("KXPLATINUMH-EXPIRED")
         assert status == "closed"
         assert is_market_active("KXPLATINUMH-EXPIRED") is False
+
+
+def test_check_market_status_sports_expected_expiration_time_cutoff():
+    """Verify check_market_status marks market as closed when expected_expiration_time is within cutoff."""
+    now = datetime.datetime(2026, 10, 10, 22, 0, 0, tzinfo=datetime.timezone.utc)
+    with patch("requests.get") as mock_get, \
+         patch("utils.market_api.datetime") as mock_dt:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "market": {
+                "ticker": "KXNCAAF-IMMINENT",
+                "status": "open",
+                "expected_expiration_time": "2026-10-10T22:30:00Z",  # in 30 mins (<= 90m cutoff)
+                "expiration_time": "2026-10-12T15:00:00Z",          # 48h later
+            }
+        }
+        mock_get.return_value = mock_resp
+        mock_dt.datetime.now.return_value = now
+        mock_dt.timezone = datetime.timezone
+
+        status = check_market_status("KXNCAAF-IMMINENT")
+        assert status == "closed"
+
 
 
 def test_check_market_status_unknown():

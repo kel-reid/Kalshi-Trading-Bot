@@ -26,6 +26,7 @@ import requests
 
 from config import BASE_URL, MAX_EXPIRATION_DAYS
 from utils.horizon import (
+    _get_earliest_market_timestamp,
     _is_within_horizon,
     _parse_float,
     _parse_iso_timestamp,
@@ -64,6 +65,7 @@ __all__ = [
     "DEFAULT_MAX_TOTAL_PROBES",
     "SPORTS_KEYWORDS",
     "SportsSeasonRouter",
+    "_get_earliest_market_timestamp",
     "_is_within_horizon",
     "_liquidity_key",
     "_markets_for_series",

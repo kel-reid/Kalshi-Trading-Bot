@@ -157,7 +157,7 @@ class KillSwitch:
     async def trigger(self, ticker: Optional[str] = None):
         """Asynchronously triggers the kill switch using the core order manager."""
         logger.warning("Kill Switch Triggered (Async). Canceling all resting orders...")
-        await send_alert("Kill Switch Triggered (Asynchronous). Withdrawing all quotes.")
+        await send_alert("Kill Switch Triggered (Asynchronous). Withdrawing all quotes.", bypass_throttle=True)
         
         target_ticker = ticker or self.ticker
         active_ids = list(self.om.active_orders.keys())
