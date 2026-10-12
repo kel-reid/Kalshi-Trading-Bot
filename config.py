@@ -80,9 +80,9 @@ def _get_int_env(name: str, default: int, allow_zero: bool = False) -> int:
 
 
 # Strategy Tuning Parameters
-# Default: Gamma 0.7 (Risk Aversion), 4 cent minimum spread, $1.00 minimum dynamic order size
-RISK_GAMMA = float(os.getenv("RISK_GAMMA", "0.7"))
-MIN_SPREAD = int(os.getenv("MIN_SPREAD", "4"))
+# Default: Gamma 1.2 (Risk Aversion), 7 cent minimum spread, $1.00 minimum dynamic order size
+RISK_GAMMA = float(os.getenv("RISK_GAMMA", "1.2"))
+MIN_SPREAD = int(os.getenv("MIN_SPREAD", "7"))
 ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 1.0))
 MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
@@ -102,12 +102,12 @@ if MIN_MID_PRICE < 1 or MAX_MID_PRICE > 99 or MIN_MID_PRICE >= MAX_MID_PRICE:
 
 # Expiration Cutoff Safeguard (Seconds / Minutes)
 # Cease quoting, liquidate inventory, and rotate away when market close_time is within this buffer.
-# Supports either EXPIRATION_BUFFER_MINUTES (Doppler/env) or MIN_TIME_TO_CLOSE_SECONDS (default 90 mins = 5400s).
+# Supports either EXPIRATION_BUFFER_MINUTES (Doppler/env) or MIN_TIME_TO_CLOSE_SECONDS (default 120 mins = 7200s).
 if os.getenv("EXPIRATION_BUFFER_MINUTES"):
-    EXPIRATION_BUFFER_MINUTES = _get_int_env("EXPIRATION_BUFFER_MINUTES", 90, allow_zero=True)
+    EXPIRATION_BUFFER_MINUTES = _get_int_env("EXPIRATION_BUFFER_MINUTES", 120, allow_zero=True)
     MIN_TIME_TO_CLOSE_SECONDS = EXPIRATION_BUFFER_MINUTES * 60
 else:
-    MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 5400, allow_zero=True)
+    MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 7200, allow_zero=True)
     EXPIRATION_BUFFER_MINUTES = MIN_TIME_TO_CLOSE_SECONDS // 60
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
@@ -119,11 +119,11 @@ MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
 
 # Post-Fill Adverse Selection Protection (Seconds)
 # Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
-POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 3.0, allow_zero=True)
+POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 8.0, allow_zero=True)
 
 # Fast Market / Price Velocity Circuit Breaker Safeguards
 # Automatically withdraw resting quotes when orderbook midpoint shifts faster than threshold over rolling window.
-PRICE_VELOCITY_THRESHOLD_CENTS = _get_float_env("PRICE_VELOCITY_THRESHOLD_CENTS", 6.0, allow_zero=True)
+PRICE_VELOCITY_THRESHOLD_CENTS = _get_float_env("PRICE_VELOCITY_THRESHOLD_CENTS", 4.0, allow_zero=True)
 PRICE_VELOCITY_WINDOW_SECONDS = _get_float_env("PRICE_VELOCITY_WINDOW_SECONDS", 20.0, allow_zero=True)
 PRICE_VELOCITY_QUIESCE_SECONDS = _get_float_env("PRICE_VELOCITY_QUIESCE_SECONDS", 30.0, allow_zero=True)
 
