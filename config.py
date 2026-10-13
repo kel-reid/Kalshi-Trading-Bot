@@ -80,11 +80,11 @@ def _get_int_env(name: str, default: int, allow_zero: bool = False) -> int:
 
 
 # Strategy Tuning Parameters
-# Default: Gamma 1.2 (Risk Aversion), 7 cent minimum spread, $1.00 minimum dynamic order size
+# Default: Gamma 1.2 (Risk Aversion), 7 cent minimum spread, $3.00 minimum dynamic order size
 RISK_GAMMA = float(os.getenv("RISK_GAMMA", "1.2"))
 MIN_SPREAD = int(os.getenv("MIN_SPREAD", "7"))
 ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
-ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 1.0))
+ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 3.0))
 MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
 TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
@@ -114,8 +114,8 @@ MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling windo
 
 # Fee Churn & Session Stop-Loss Safeguards (Cents)
 # Cease quoting, liquidate inventory, and rotate away if fees or net loss on a single market session exceed these thresholds.
-MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 250)
-MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 300)
+MAX_SESSION_FEES_CENTS = _get_int_env("MAX_SESSION_FEES_CENTS", 750)
+MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 900)
 
 # Post-Fill Adverse Selection Protection (Seconds)
 # Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
