@@ -73,15 +73,18 @@ def calculate_spread_floor_cents(
     exchange transaction fees plus a target profit edge:
         spread_floor = ceil(round_trip_fee + target_edge)
 
+    Kalshi rounds transaction fees up to the next integer cent per execution fill leg.
     Guarantees that any filled round-trip (buy at bid, sell at ask) locks in
-    net positive expected value after fees.
+    net positive expected value >= target_edge_cents after fees.
     """
     if not isinstance(mid_price_cents, (int, float)) or isinstance(mid_price_cents, bool) or not math.isfinite(mid_price_cents):
         return max(1, min_floor_cents)
 
     edge = target_edge_cents if (isinstance(target_edge_cents, (int, float)) and math.isfinite(target_edge_cents) and target_edge_cents >= 0.0) else DEFAULT_TARGET_EDGE_CENTS
     one_way_fee = calculate_fee_cents(mid_price_cents, fee_rate=fee_rate)
-    round_trip_fee = 2.0 * one_way_fee
+    # Account for Kalshi integer cent fee rounding on each fill leg
+    per_leg_fee = int(math.ceil(one_way_fee))
+    round_trip_fee = 2 * per_leg_fee
 
     calculated_floor = int(math.ceil(round_trip_fee + edge))
     return max(min_floor_cents, calculated_floor)
@@ -124,7 +127,7 @@ class RollingVolatilityEstimator:
 
     def get_realized_volatility(self, now: Optional[float] = None) -> float:
         """
-        Calculate sample standard deviation of midpoint price changes in cents.
+        Calculate sample standard deviation of consecutive midpoint price changes in cents.
         Falls back to baseline_volatility if observations are insufficient.
         """
         if now is not None and math.isfinite(now):
@@ -135,8 +138,13 @@ class RollingVolatilityEstimator:
             return self.baseline_volatility
 
         prices = [p for _, p in self._history]
-        mean_p = sum(prices) / n
-        variance = sum((p - mean_p) ** 2 for p in prices) / (n - 1)
+        diffs = [b - a for a, b in zip(prices, prices[1:])]
+        m = len(diffs)
+        if m < 2:
+            return self.baseline_volatility
+
+        mean_d = sum(diffs) / m
+        variance = sum((d - mean_d) ** 2 for d in diffs) / (m - 1)
         stdev = math.sqrt(variance)
         return max(0.1, round(stdev, 4))
 
@@ -194,10 +202,14 @@ def calculate_optimal_spread(
     arrival_term = (2.0 / safe_gamma) * math.log(1.0 + (safe_gamma / kappa))
 
     raw_as_spread = volatility_term + arrival_term
-    as_spread_cents = int(math.ceil(raw_as_spread))
+    as_spread_cents = math.ceil(raw_as_spread)
 
     # Take the maximum between the fee floor and the volatility-driven A-S spread
     optimal_spread = max(spread_floor, as_spread_cents)
 
-    # Bound strictly between min_spread_cents and max_spread_cents
-    return max(min_spread_cents, min(optimal_spread, max_spread_cents))
+    # The fee floor takes precedence over a conflicting upper bound
+    return max(
+        min_spread_cents,
+        spread_floor,
+        min(optimal_spread, max_spread_cents),
+    )
