@@ -196,3 +196,61 @@ def test_liquidity_key_does_not_penalize_untraded_markets():
     assert score_untraded > score_blowout
     assert score_untraded == pytest.approx(score_blowout * 100.0)
 
+
+def test_liquidity_key_imminent_active_slate_preference():
+    """Verify that markets in the imminent active slate (<=18h) outscore distant markets (e.g. 3 days out)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    imminent_4h = (now + datetime.timedelta(hours=4)).isoformat()
+    imminent_12h = (now + datetime.timedelta(hours=12)).isoformat()
+    tomorrow_30h = (now + datetime.timedelta(hours=30)).isoformat()
+    distant_3d = (now + datetime.timedelta(days=3)).isoformat()
+
+    # Active market today (4 hours out) with moderate volume
+    m_imminent_4h = {
+        "ticker": "KXNCAAFGAME-TODAY-4H",
+        "volume_fp": "5000.00",
+        "yes_bid_dollars": "0.4500",
+        "yes_ask_dollars": "0.5500",
+        "expected_expiration_time": imminent_4h,
+    }
+
+    # Active market today (12 hours out) with identical liquidity
+    m_imminent_12h = {
+        "ticker": "KXNCAAFGAME-TODAY-12H",
+        "volume_fp": "5000.00",
+        "yes_bid_dollars": "0.4500",
+        "yes_ask_dollars": "0.5500",
+        "expected_expiration_time": imminent_12h,
+    }
+
+    # Tomorrow's market (30 hours out)
+    m_tomorrow = {
+        "ticker": "KXNCAAFGAME-TOMORROW",
+        "volume_fp": "5000.00",
+        "yes_bid_dollars": "0.4500",
+        "yes_ask_dollars": "0.5500",
+        "expected_expiration_time": tomorrow_30h,
+    }
+
+    # Distant market (3 days out) with 10x higher volume
+    m_distant = {
+        "ticker": "KXNFLGAME-SUNDAY-3D",
+        "volume_fp": "50000.00",
+        "yes_bid_dollars": "0.4500",
+        "yes_ask_dollars": "0.5500",
+        "close_time": distant_3d,
+    }
+
+    score_4h = _liquidity_key(m_imminent_4h)
+    score_12h = _liquidity_key(m_imminent_12h)
+    score_tomorrow = _liquidity_key(m_tomorrow)
+    score_distant = _liquidity_key(m_distant)
+
+    # 4h imminent game outscores 12h game due to nearest kickoff boost
+    assert score_4h > score_12h
+    # Imminent today's slate outscores tomorrow
+    assert score_12h > score_tomorrow
+    # Imminent today's game outscores distant game even though distant has 10x volume
+    assert score_4h > score_distant
+
+
