@@ -36,6 +36,7 @@ from utils.market_api import (
     check_market_status,
     check_orderbook_has_quotes,
     fetch_eligible_markets,
+    get_market_details,
     get_raw_market_status,
 )
 from utils.market_scoring import (
@@ -81,6 +82,8 @@ __all__ = [
     "discover_active_market",
     "discover_active_market_async",
     "fetch_eligible_markets",
+    "get_market_details",
+    "get_market_details_async",
     "get_raw_market_status",
     "get_raw_market_status_async",
     "is_market_active",
@@ -463,3 +466,9 @@ async def check_market_status_async(ticker: str) -> Optional[str]:
 async def get_raw_market_status_async(ticker: str) -> Optional[str]:
     """Non-blocking async wrapper for get_raw_market_status."""
     return await asyncio.to_thread(get_raw_market_status, ticker)
+
+
+async def get_market_details_async(ticker: str) -> Optional[Dict[str, Any]]:
+    """Non-blocking async wrapper for get_market_details."""
+    return await asyncio.to_thread(get_market_details, ticker)
+

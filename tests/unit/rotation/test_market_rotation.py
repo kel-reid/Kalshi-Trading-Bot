@@ -306,3 +306,26 @@ async def test_rotate_market_succeeds_when_market_is_closed_or_settled():
     assert any("Market Rotated: Switched target" in m for m in alert_msgs)
 
 
+@pytest.mark.asyncio
+async def test_rotate_market_aborts_without_liquidation_when_disallowed():
+    """Verify rotate_market aborts without calling liquidate_inventory when allow_liquidation is False."""
+    bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.liquidate_inventory = AsyncMock()
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+
+    # Old ticker has 5 contracts (e.g. filled during cancellation)
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+
+    rotated = await bot.rotate_market("NEW-TICKER", allow_liquidation=False)
+
+    assert rotated is False
+    assert bot.ticker == "OLD-TICKER"
+    bot.liquidate_inventory.assert_not_called()
+    bot.ob_manager.unsubscribe.assert_not_called()
+    bot.ob_manager.subscribe.assert_not_called()
+
+
+

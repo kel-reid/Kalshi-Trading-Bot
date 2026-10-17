@@ -9,7 +9,7 @@ import datetime
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from utils.horizon import _parse_float, _parse_iso_timestamp
+from utils.horizon import _get_earliest_market_timestamp, _parse_float, _parse_iso_timestamp
 from utils.sports_router import SportsSeasonRouter
 
 logger = logging.getLogger("MarketDiscovery")
@@ -47,29 +47,36 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     has_quotes = 1.0 if (bid > 0 and ask > 0 and ask > bid) else 0.0
 
     # Expiration Horizon Multiplier
-    # Prioritize near-term weekly contracts (<7 to 14 days) over distant future props (e.g. 2028-2030)
+    # Prioritize active pre-game window (<=18h) and near-term weekly contracts (<7 to 14 days)
+    # over distant future props (e.g. 2028-2030)
     horizon_multiplier = 1.0
-    close_time_str = m.get("close_time") or m.get("expiration_time")
-    if close_time_str:
-        close_dt = _parse_iso_timestamp(close_time_str)
-        if close_dt is not None:
-            import sys
-            md = sys.modules.get("utils.market_discovery")
-            dt_module = getattr(md, "datetime", datetime) if md else datetime
-            now_utc = dt_module.datetime.now(datetime.timezone.utc)
-            days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
-            if days_to_close <= 7:
-                horizon_multiplier = 3.0
-            elif days_to_close <= 14:
-                horizon_multiplier = 2.0
-            elif days_to_close <= 30:
-                horizon_multiplier = 1.5
-            elif days_to_close <= 90:
-                horizon_multiplier = 1.0
-            elif days_to_close <= 365:
-                horizon_multiplier = 0.5
-            else:
-                horizon_multiplier = 0.05
+    _close_time_str, close_dt = _get_earliest_market_timestamp(m)
+    if close_dt is not None:
+        import sys
+        md = sys.modules.get("utils.market_discovery")
+        dt_module = getattr(md, "datetime", datetime) if md else datetime
+        now_utc = dt_module.datetime.now(datetime.timezone.utc)
+        hours_to_close = (close_dt - now_utc).total_seconds() / 3600.0
+        days_to_close = hours_to_close / 24.0
+
+        if hours_to_close <= 18:
+            # Imminent active slate bonus: 8.0x base + continuous nearest kickoff bonus up to 2.0x
+            imminent_boost = max(0.0, (18.0 - max(0.0, hours_to_close)) / 18.0) * 2.0
+            horizon_multiplier = 8.0 + imminent_boost
+        elif hours_to_close <= 36:
+            horizon_multiplier = 5.0
+        elif days_to_close <= 7:
+            horizon_multiplier = 3.0
+        elif days_to_close <= 14:
+            horizon_multiplier = 2.0
+        elif days_to_close <= 30:
+            horizon_multiplier = 1.5
+        elif days_to_close <= 90:
+            horizon_multiplier = 1.0
+        elif days_to_close <= 365:
+            horizon_multiplier = 0.5
+        else:
+            horizon_multiplier = 0.05
 
     # In-season sports bonus: prioritize high-velocity weekly game lines and player props
     series_bonus = 0.0
