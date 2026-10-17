@@ -1201,10 +1201,16 @@ class AvellanedaStoikovBot:
             logger.critical(f"Emergency kill switch failed during {context}: {e}")
             return False
 
-    async def rotate_market(self, new_ticker: str) -> bool:
+    async def rotate_market(self, new_ticker: str, allow_liquidation: bool = True) -> bool:
         """
         Dynamically rotate bot quoting and orderbook subscription to a new market ticker
         without restarting the container process.
+
+        Args:
+            new_ticker: The target ticker to switch quoting to.
+            allow_liquidation: Whether to liquidate existing inventory if detected. For scheduled
+                slate rotations, set to False so an in-flight fill during quote cancellation
+                aborts the rotation and retains the position for standard market-making unwinds.
         """
         old_ticker = self.ticker
         if new_ticker == old_ticker:
@@ -1242,6 +1248,12 @@ class AvellanedaStoikovBot:
         # 1b. Liquidate any open inventory on old_ticker before unsubscribing
         old_inv = self.inv_manager.get_position(old_ticker)
         if old_inv != 0:
+            if not allow_liquidation:
+                logger.warning(
+                    f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation "
+                    f"with allow_liquidation=False. Aborting rotation to manage existing position."
+                )
+                return False
             logger.warning(
                 f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation. "
                 f"Liquidating position to prevent unhedged inventory decay..."
@@ -1438,7 +1450,7 @@ class AvellanedaStoikovBot:
             f"(event in {repl_hours:.1f}h, primary={repl_in_primary}) vs current {self.ticker} "
             f"(event in {current_hours:.1f}h, primary={current_in_primary}). Rotating..."
         )
-        return await self.rotate_market(replacement)
+        return await self.rotate_market(replacement, allow_liquidation=False)
 
     async def stop(self) -> bool:
         self.running = False

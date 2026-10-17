@@ -255,3 +255,56 @@ async def test_slate_rotation_handles_discovery_timeout(bot):
         assert rotated is False
         bot.rotate_market.assert_not_called()
 
+
+@pytest.mark.asyncio
+async def test_slate_rotation_aborts_without_liquidation_if_fill_occurs_during_cancel(bot):
+    """Verify that if quotes fill while cancellation is in flight, rotation aborts and never liquidates."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    current_dt = (now_utc + datetime.timedelta(hours=40)).isoformat()
+    repl_dt = (now_utc + datetime.timedelta(hours=4)).isoformat()
+
+    current_market = {
+        "ticker": "KXNFLGAME-26OCT18CARPHI-CAR",
+        "close_time": current_dt,
+    }
+    replacement_market = {
+        "ticker": "KXNCAAFGAME-26OCT17NDBYU-BYU",
+        "close_time": repl_dt,
+    }
+
+    bot.ticker = "KXNFLGAME-26OCT18CARPHI-CAR"
+    bot.target_preference = "SPORTS"
+    bot.liquidate_inventory = AsyncMock()
+
+    # Initial checks see 0 inventory
+    # But after _cancel_all_quotes, inv_manager reports a fill of 3 contracts
+    pos_state = {"val": 0}
+    def get_pos(ticker):
+        if ticker == "KXNFLGAME-26OCT18CARPHI-CAR":
+            return pos_state["val"]
+        return 0
+
+    bot.inv_manager.get_position = MagicMock(side_effect=get_pos)
+
+    async def mock_cancel_all():
+        # Simulate in-flight fill arriving right before/during cancel confirmation
+        pos_state["val"] = 3
+        return True
+
+    bot._cancel_all_quotes = AsyncMock(side_effect=mock_cancel_all)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+
+    with patch("strategy.market_maker.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NCAAF"]), \
+         patch("strategy.market_maker.get_market_details_async") as mock_details, \
+         patch("strategy.market_maker.discover_active_market_async", new_callable=AsyncMock) as mock_disc:
+
+        mock_details.side_effect = lambda ticker: current_market if ticker == bot.ticker else replacement_market
+        mock_disc.return_value = "KXNCAAFGAME-26OCT17NDBYU-BYU"
+
+        rotated = await bot._maybe_recheck_slate(now=now_utc.timestamp())
+
+        assert rotated is False
+        assert bot.ticker == "KXNFLGAME-26OCT18CARPHI-CAR"
+        bot.liquidate_inventory.assert_not_called()
+
+
