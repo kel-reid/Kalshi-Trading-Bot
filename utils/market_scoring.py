@@ -50,7 +50,7 @@ def _liquidity_key(m: Dict[str, Any]) -> float:
     # Prioritize active pre-game window (<=18h) and near-term weekly contracts (<7 to 14 days)
     # over distant future props (e.g. 2028-2030)
     horizon_multiplier = 1.0
-    close_time_str, close_dt = _get_earliest_market_timestamp(m)
+    _close_time_str, close_dt = _get_earliest_market_timestamp(m)
     if close_dt is not None:
         import sys
         md = sys.modules.get("utils.market_discovery")

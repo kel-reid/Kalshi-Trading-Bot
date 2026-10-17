@@ -411,6 +411,9 @@ class AvellanedaStoikovBot:
                 if await self._maybe_recheck_slate(now):
                     self._maybe_schedule_pnl_snapshot(now, inventory)
                     return
+                # Refresh inventory from inv_manager following async discovery check
+                inventory = self.inv_manager.get_position(self.ticker)
+
         
         best_bid = self.ob_manager.get_best_bid(self.ticker)
         best_ask = self.ob_manager.get_best_ask(self.ticker)
@@ -1369,13 +1372,26 @@ class AvellanedaStoikovBot:
             return False
 
         # Current market is distant (> 18h) or not in the primary in-season league.
-        # Probe market discovery for an active imminent candidate
-        replacement = await discover_active_market_async(
-            target_preference=self.target_preference,
-            exclude_tickers=[self.ticker],
-            min_mid_price=self.min_mid_price,
-            max_mid_price=self.max_mid_price,
-        )
+        # Probe market discovery for an active imminent candidate with a bounded timeout
+        try:
+            replacement = await asyncio.wait_for(
+                discover_active_market_async(
+                    target_preference=self.target_preference,
+                    exclude_tickers=[self.ticker],
+                    min_mid_price=self.min_mid_price,
+                    max_mid_price=self.max_mid_price,
+                ),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[SLATE ROTATION] Discovery timed out while probing replacements for {self.ticker}; "
+                f"retaining current market."
+            )
+            return False
+        except Exception as e:
+            logger.error(f"[SLATE ROTATION] Discovery error while probing replacements: {e}")
+            return False
 
         if not replacement or replacement == self.ticker:
             return False
@@ -1405,6 +1421,16 @@ class AvellanedaStoikovBot:
             is_superior = True
 
         if not is_superior:
+            return False
+
+        # Check inventory again immediately before rotating!
+        # If a fill occurred while awaiting discovery REST calls, abort rotation to avoid adverse liquidation
+        latest_inv = self.inv_manager.get_position(self.ticker)
+        if latest_inv != 0:
+            logger.warning(
+                f"[SLATE ROTATION] Aborting rotation to {replacement}: position changed to {latest_inv} "
+                f"during discovery evaluation for {self.ticker}."
+            )
             return False
 
         logger.info(

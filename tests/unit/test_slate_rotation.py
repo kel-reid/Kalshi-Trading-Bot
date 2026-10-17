@@ -126,6 +126,7 @@ async def test_slate_rotation_gated_by_zero_inventory(bot):
     bot.inv_manager.get_position.return_value = 5  # Open position of 5 contracts
     bot._last_slate_check = 0.0
     bot._slate_check_interval = 10.0
+    bot._market_attached_time = 0.0  # Dwell satisfied; only inventory gate blocks
     now = 100.0
 
     bot._maybe_recheck_slate = AsyncMock(return_value=True)
@@ -189,3 +190,68 @@ async def test_slate_rotation_fails_closed_on_unconfirmed_details(bot):
 
         assert rotated is False
         mock_disc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_slate_rotation_aborted_if_position_fills_during_discovery(bot):
+    """Verify rotation is aborted without liquidation if inventory changes from 0 to non-zero during discovery."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    current_dt = (now_utc + datetime.timedelta(hours=40)).isoformat()
+    repl_dt = (now_utc + datetime.timedelta(hours=4)).isoformat()
+
+    current_market = {
+        "ticker": "KXNFLGAME-26OCT18CARPHI-CAR",
+        "close_time": current_dt,
+    }
+    replacement_market = {
+        "ticker": "KXNCAAFGAME-26OCT17NDBYU-BYU",
+        "close_time": repl_dt,
+    }
+
+    bot.ticker = "KXNFLGAME-26OCT18CARPHI-CAR"
+    bot.target_preference = "SPORTS"
+    # Initially 0, but during discovery evaluation position becomes 2
+    bot.inv_manager.get_position.return_value = 2
+    bot.rotate_market = AsyncMock(return_value=True)
+
+    with patch("strategy.market_maker.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NCAAF"]), \
+         patch("strategy.market_maker.get_market_details_async") as mock_details, \
+         patch("strategy.market_maker.discover_active_market_async", new_callable=AsyncMock) as mock_disc:
+
+        mock_details.side_effect = lambda ticker: current_market if ticker == bot.ticker else replacement_market
+        mock_disc.return_value = "KXNCAAFGAME-26OCT17NDBYU-BYU"
+
+        rotated = await bot._maybe_recheck_slate(now=now_utc.timestamp())
+
+        assert rotated is False
+        bot.rotate_market.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_slate_rotation_handles_discovery_timeout(bot):
+    """Verify slate re-evaluation catches discovery timeout and retains current market."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    current_dt = (now_utc + datetime.timedelta(hours=40)).isoformat()
+
+    current_market = {
+        "ticker": "KXNFLGAME-26OCT18CARPHI-CAR",
+        "close_time": current_dt,
+    }
+
+    bot.ticker = "KXNFLGAME-26OCT18CARPHI-CAR"
+    bot.target_preference = "SPORTS"
+    bot.inv_manager.get_position.return_value = 0
+    bot.rotate_market = AsyncMock(return_value=True)
+
+    async def timeout_disc(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    with patch("strategy.market_maker.SportsSeasonRouter.get_in_season_leagues", return_value=["NFL", "NCAAF"]), \
+         patch("strategy.market_maker.get_market_details_async", AsyncMock(return_value=current_market)), \
+         patch("strategy.market_maker.discover_active_market_async", side_effect=timeout_disc):
+
+        rotated = await bot._maybe_recheck_slate(now=now_utc.timestamp())
+
+        assert rotated is False
+        bot.rotate_market.assert_not_called()
+
