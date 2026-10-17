@@ -11,6 +11,7 @@ import logging
 import time
 import math
 import os
+import datetime
 from collections import deque
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
@@ -23,9 +24,12 @@ from utils.alerting import send_alert
 from utils.market_discovery import (
     check_market_status_async,
     discover_active_market_async,
+    get_market_details_async,
     get_raw_market_status_async,
     is_market_active_async,
 )
+from utils.horizon import _get_earliest_market_timestamp
+from utils.sports_router import SportsSeasonRouter
 from utils.metrics import (
     start_metrics_server,
     BOT_INVENTORY_NET_POSITION,
@@ -51,6 +55,8 @@ from config import (
     PRICE_VELOCITY_THRESHOLD_CENTS,
     PRICE_VELOCITY_WINDOW_SECONDS,
     PRICE_VELOCITY_QUIESCE_SECONDS,
+    SLATE_REEVALUATION_INTERVAL_SECONDS,
+    MIN_MARKET_DWELL_SECONDS,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -185,6 +191,13 @@ class AvellanedaStoikovBot:
         # Fast Market / Price Velocity Circuit Breaker tracking
         self._mid_price_history: deque = deque()
         self._fast_market_until: float = 0.0
+
+        # Periodic active slate and event-horizon re-evaluation
+        # Re-evaluates whether current market is off-slate/distant while inventory is flat
+        self._last_slate_check: float = time.time()
+        self._slate_check_interval: float = float(SLATE_REEVALUATION_INTERVAL_SECONDS)
+        self._min_market_dwell_time: float = float(MIN_MARKET_DWELL_SECONDS)
+        self._market_attached_time: float = time.time()
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
@@ -385,6 +398,19 @@ class AvellanedaStoikovBot:
                 self._market_inactive = False
             else:
                 logger.warning(f"Unable to confirm market status for {self.ticker}; retaining current market.")
+
+        # Periodic active slate and event-horizon re-evaluation (only when inventory is 0 and dwell time elapsed)
+        if now - self._last_slate_check >= self._slate_check_interval:
+            self._last_slate_check = now
+            if (
+                self.auto_rotate
+                and not self._market_inactive
+                and inventory == 0
+                and (now - self._market_attached_time >= self._min_market_dwell_time)
+            ):
+                if await self._maybe_recheck_slate(now):
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
         
         best_bid = self.ob_manager.get_best_bid(self.ticker)
         best_ask = self.ob_manager.get_best_ask(self.ticker)
@@ -1289,6 +1315,8 @@ class AvellanedaStoikovBot:
         self._last_pnl_snapshot = time.time()
         self._mid_price_history.clear()
         self._fast_market_until = 0.0
+        self._market_attached_time = time.time()
+        self._last_slate_check = time.time()
 
         # Start a new tracking session for the new market ticker
         self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
@@ -1296,6 +1324,95 @@ class AvellanedaStoikovBot:
         logger.info(f"Market rotation complete. Now trading {new_ticker}.")
         await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
+
+    async def _maybe_recheck_slate(self, now: float) -> bool:
+        """
+        Periodically re-evaluate whether the currently quoted market is off-slate or distant,
+        and rotate to a higher-priority, imminent live game if available.
+        
+        Invariants:
+        - Only executes when inventory == 0 (zero-inventory gating).
+        - Enforces minimum market dwell time (e.g. 30 mins) to prevent order churn and preserve queue priority.
+        - Does not rotate if current market is already in its active pre-game window (<= 18h)
+          and in the current top-priority in-season league.
+        - Operator-targeted exact markets bypass automatic slate re-evaluation.
+        """
+        # Check if operator targeted an exact non-sports market or explicit ticker
+        pref = (self.target_preference or "").strip().upper()
+        is_sports_pref = pref in (
+            "NFL", "FOOTBALL", "NBA", "BASKETBALL", "MLB", "BASEBALL",
+            "CFB", "NCAAF", "COLLEGE FOOTBALL",
+            "SPORTS", "SPORT", "MAJOR SPORTS"
+        ) or not pref
+        if not is_sports_pref and pref == self.ticker.upper():
+            return False
+
+        # 1. Inspect current market's event horizon and league
+        current_details = await get_market_details_async(self.ticker)
+        if not current_details:
+            return False
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        _, current_close_dt = _get_earliest_market_timestamp(current_details)
+
+        current_hours = 999.0
+        if current_close_dt is not None:
+            current_hours = max(0.0, (current_close_dt - now_utc).total_seconds() / 3600.0)
+
+        # Check calendar-driven in-season league priority
+        in_season_leagues = SportsSeasonRouter.get_in_season_leagues(now_utc)
+        primary_league = in_season_leagues[0] if in_season_leagues else ""
+        current_in_primary = bool(primary_league and self.ticker.startswith(f"KX{primary_league}"))
+
+        # If current market is already in its active imminent window (<= 18h) AND in primary league, stay!
+        if current_hours <= 18.0 and current_in_primary:
+            return False
+
+        # Current market is distant (> 18h) or not in the primary in-season league.
+        # Probe market discovery for an active imminent candidate
+        replacement = await discover_active_market_async(
+            target_preference=self.target_preference,
+            exclude_tickers=[self.ticker],
+            min_mid_price=self.min_mid_price,
+            max_mid_price=self.max_mid_price,
+        )
+
+        if not replacement or replacement == self.ticker:
+            return False
+
+        # Verify replacement market details
+        repl_details = await get_market_details_async(replacement)
+        if not repl_details:
+            return False
+
+        _, repl_close_dt = _get_earliest_market_timestamp(repl_details)
+        repl_hours = 999.0
+        if repl_close_dt is not None:
+            repl_hours = max(0.0, (repl_close_dt - now_utc).total_seconds() / 3600.0)
+
+        repl_in_primary = bool(primary_league and replacement.startswith(f"KX{primary_league}"))
+
+        # Ensure replacement is strictly superior:
+        # 1) Replacement is in the active imminent pre-game window (<= 18h) and current is not, OR
+        # 2) Replacement is in the primary league while current is not, OR
+        # 3) Both are in primary league, but replacement kicks off significantly sooner (e.g. >= 12h sooner).
+        is_superior = False
+        if repl_hours <= 18.0 and current_hours > 18.0:
+            is_superior = True
+        elif repl_in_primary and not current_in_primary:
+            is_superior = True
+        elif repl_in_primary == current_in_primary and (current_hours - repl_hours) >= 12.0:
+            is_superior = True
+
+        if not is_superior:
+            return False
+
+        logger.info(
+            f"[SLATE ROTATION] Scheduled re-evaluation found superior market {replacement} "
+            f"(event in {repl_hours:.1f}h, primary={repl_in_primary}) vs current {self.ticker} "
+            f"(event in {current_hours:.1f}h, primary={current_in_primary}). Rotating..."
+        )
+        return await self.rotate_market(replacement)
 
     async def stop(self) -> bool:
         self.running = False
