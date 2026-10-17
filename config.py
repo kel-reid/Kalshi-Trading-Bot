@@ -129,7 +129,7 @@ PRICE_VELOCITY_QUIESCE_SECONDS = _get_float_env("PRICE_VELOCITY_QUIESCE_SECONDS"
 
 # Scheduled Slate Re-Evaluation & Market Dwell Safeguards (Seconds)
 # Periodically re-evaluate whether current market is off-slate/distant while inventory is flat.
-SLATE_REEVALUATION_INTERVAL_SECONDS = _get_int_env("SLATE_REEVALUATION_INTERVAL_SECONDS", 1800, allow_zero=True)
+SLATE_REEVALUATION_INTERVAL_SECONDS = _get_int_env("SLATE_REEVALUATION_INTERVAL_SECONDS", 1800)
 MIN_MARKET_DWELL_SECONDS = _get_int_env("MIN_MARKET_DWELL_SECONDS", 1800, allow_zero=True)
 
 # Database Configurations (PostgreSQL)
