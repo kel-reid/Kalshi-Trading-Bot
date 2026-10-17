@@ -127,6 +127,11 @@ PRICE_VELOCITY_THRESHOLD_CENTS = _get_float_env("PRICE_VELOCITY_THRESHOLD_CENTS"
 PRICE_VELOCITY_WINDOW_SECONDS = _get_float_env("PRICE_VELOCITY_WINDOW_SECONDS", 20.0, allow_zero=True)
 PRICE_VELOCITY_QUIESCE_SECONDS = _get_float_env("PRICE_VELOCITY_QUIESCE_SECONDS", 30.0, allow_zero=True)
 
+# Scheduled Slate Re-Evaluation & Market Dwell Safeguards (Seconds)
+# Periodically re-evaluate whether current market is off-slate/distant while inventory is flat.
+SLATE_REEVALUATION_INTERVAL_SECONDS = _get_int_env("SLATE_REEVALUATION_INTERVAL_SECONDS", 1800, allow_zero=True)
+MIN_MARKET_DWELL_SECONDS = _get_int_env("MIN_MARKET_DWELL_SECONDS", 1800, allow_zero=True)
+
 # Database Configurations (PostgreSQL)
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))

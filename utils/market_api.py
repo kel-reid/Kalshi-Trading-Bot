@@ -342,6 +342,30 @@ def get_raw_market_status(ticker: str) -> Optional[str]:
         return None
 
 
+def get_market_details(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch full market details dictionary from Kalshi REST API (/trade-api/v2/markets/{ticker}).
+    Returns market dict or None if request fails or market not found.
+    """
+    try:
+        base_url = _get_base_url()
+        req_lib = _get_requests()
+        cert_path = _get_certifi().where()
+        resp = req_lib.get(
+            f"{base_url}/trade-api/v2/markets/{ticker}",
+            verify=cert_path,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("market", data)
+        logger.warning(f"Market details lookup for {ticker} returned HTTP {resp.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching market details for {ticker}: {e}")
+        return None
+
+
 def _get_market_status_checker() -> Any:
     """Retrieve check_market_status function, honoring any mock in utils.market_discovery."""
     import sys
