@@ -57,6 +57,18 @@ from config import (
     PRICE_VELOCITY_QUIESCE_SECONDS,
     SLATE_REEVALUATION_INTERVAL_SECONDS,
     MIN_MARKET_DWELL_SECONDS,
+    DYNAMIC_SPREAD_ENABLED,
+    TARGET_EDGE_CENTS,
+    MIN_DYNAMIC_SPREAD_CENTS,
+    MAX_DYNAMIC_SPREAD_CENTS,
+    VOLATILITY_WINDOW_SECONDS,
+    KALSHI_FEE_RATE,
+)
+from strategy.dynamic_spread import (
+    RollingVolatilityEstimator,
+    calculate_optimal_spread,
+    calculate_fee_cents,
+    calculate_spread_floor_cents,
 )
 
 logger = logging.getLogger("MarketMaker")
@@ -97,6 +109,12 @@ class AvellanedaStoikovBot:
         price_velocity_threshold_cents: Optional[float] = None,
         price_velocity_window_seconds: Optional[float] = None,
         price_velocity_quiesce_seconds: Optional[float] = None,
+        dynamic_spread_enabled: Optional[bool] = None,
+        target_edge_cents: Optional[float] = None,
+        min_dynamic_spread_cents: Optional[int] = None,
+        max_dynamic_spread_cents: Optional[int] = None,
+        volatility_window_seconds: Optional[float] = None,
+        kalshi_fee_rate: Optional[float] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -130,6 +148,44 @@ class AvellanedaStoikovBot:
             max(0.0, float(price_velocity_quiesce_seconds))
             if price_velocity_quiesce_seconds is not None
             else PRICE_VELOCITY_QUIESCE_SECONDS
+        )
+
+        # Dynamic Volatility & Fee-Aware Spread Configuration
+        if dynamic_spread_enabled is not None:
+            self.dynamic_spread_enabled = bool(dynamic_spread_enabled)
+        elif min_spread is not None:
+            # Caller explicitly passed static min_spread (e.g. in deterministic unit tests)
+            self.dynamic_spread_enabled = False
+        else:
+            self.dynamic_spread_enabled = DYNAMIC_SPREAD_ENABLED
+
+        self.target_edge_cents = (
+            float(target_edge_cents)
+            if target_edge_cents is not None
+            else TARGET_EDGE_CENTS
+        )
+        self.min_dynamic_spread_cents = (
+            int(min_dynamic_spread_cents)
+            if min_dynamic_spread_cents is not None
+            else MIN_DYNAMIC_SPREAD_CENTS
+        )
+        self.max_dynamic_spread_cents = (
+            int(max_dynamic_spread_cents)
+            if max_dynamic_spread_cents is not None
+            else MAX_DYNAMIC_SPREAD_CENTS
+        )
+        self.volatility_window_seconds = (
+            max(5.0, float(volatility_window_seconds))
+            if volatility_window_seconds is not None
+            else VOLATILITY_WINDOW_SECONDS
+        )
+        self.kalshi_fee_rate = (
+            float(kalshi_fee_rate)
+            if kalshi_fee_rate is not None
+            else KALSHI_FEE_RATE
+        )
+        self.volatility_estimator = RollingVolatilityEstimator(
+            window_seconds=self.volatility_window_seconds
         )
 
 
@@ -717,10 +773,35 @@ class AvellanedaStoikovBot:
         # q = inventory / quote_size
         normalized_q = (inventory / quote_size) if (self.order_dollars and quote_size > 0) else inventory
         reservation_price = mid_price - (normalized_q * self.gamma)
+
+        # 5. Determine Quoting Spread (Dynamic Volatility & Fee-Aware Spread vs. Static Fallback)
+        if self.dynamic_spread_enabled:
+            self.volatility_estimator.update(mid_price, timestamp=now)
+            realized_vol = self.volatility_estimator.get_realized_volatility(now=now)
+            book_depth = 1
+            if best_bid and len(best_bid) > 1 and isinstance(best_bid[1], (int, float)):
+                book_depth += int(best_bid[1])
+            if best_ask and len(best_ask) > 1 and isinstance(best_ask[1], (int, float)):
+                book_depth += int(best_ask[1])
+
+            effective_spread = calculate_optimal_spread(
+                mid_price_cents=mid_price,
+                realized_volatility_cents=realized_vol,
+                gamma=self.gamma,
+                book_depth=book_depth,
+                target_edge_cents=self.target_edge_cents,
+                fee_rate=self.kalshi_fee_rate,
+                min_spread_cents=self.min_dynamic_spread_cents,
+                max_spread_cents=self.max_dynamic_spread_cents,
+            )
+            spread_log_info = f"Spread={effective_spread}c (Vol={realized_vol:.2f}c)"
+        else:
+            effective_spread = self.min_spread
+            spread_log_info = f"Spread={effective_spread}c"
         
-        # 5. Calculate Optimal Bid/Ask
-        optimal_bid = math.floor(reservation_price - (self.min_spread / 2.0))
-        optimal_ask = math.ceil(reservation_price + (self.min_spread / 2.0))
+        # 6. Calculate Optimal Bid/Ask
+        optimal_bid = math.floor(reservation_price - (effective_spread / 2.0))
+        optimal_ask = math.ceil(reservation_price + (effective_spread / 2.0))
         
         # Ensure prices fit within Kalshi bounds (1c to 99c)
         optimal_bid = max(1, min(optimal_bid, 98))
@@ -748,7 +829,7 @@ class AvellanedaStoikovBot:
         if optimal_bid is not None and optimal_ask is not None:
             logger.info(
                 f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | Gamma={self.gamma} | "
-                f"ReservationPrice={reservation_price:.2f}c | Spread={self.min_spread}c "
+                f"ReservationPrice={reservation_price:.2f}c | {spread_log_info} "
                 f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
@@ -1329,6 +1410,8 @@ class AvellanedaStoikovBot:
         self._market_inactive = False
         self._last_pnl_snapshot = time.time()
         self._mid_price_history.clear()
+        if hasattr(self, "volatility_estimator"):
+            self.volatility_estimator.reset()
         self._fast_market_until = 0.0
         self._market_attached_time = time.time()
         self._last_slate_check = time.time()
@@ -1506,3 +1589,7 @@ class AvellanedaStoikovBot:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
         return quotes_cancelled
+
+
+# Backward-compatible alias
+MarketMaker = AvellanedaStoikovBot
