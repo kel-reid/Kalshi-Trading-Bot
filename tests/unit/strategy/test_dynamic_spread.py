@@ -47,15 +47,19 @@ class TestSpreadFloor:
     """Tests for minimum fee-clearing spread floors."""
 
     def test_spread_floor_at_midpoint(self):
-        """Spread floor at 50c covers 2 * 1.75c = 3.5c fee + 2c edge -> 6c."""
+        """Spread floor at 50c covers 2 * ceil(1.75c) = 4c fee + 2c edge -> 6c."""
         floor = calculate_spread_floor_cents(50.0, target_edge_cents=2.0)
         assert floor == 6
 
     def test_spread_floor_at_tail_prices(self):
-        """Wings (20c/80c) have lower fees (2 * 1.12c = 2.24c), so floor is tighter."""
+        """Tail prices account for per-leg integer cent fee ceiling rounding."""
+        # At 20c: fee=1.12c -> ceil(1.12)=2c per leg -> 4c round-trip + 1.5c -> 6c
         floor_20 = calculate_spread_floor_cents(20.0, target_edge_cents=1.5)
-        # 2.24 + 1.5 = 3.74 -> ceil = 4
-        assert floor_20 == 4
+        assert floor_20 == 6
+
+        # At 2c: fee=0.1372c -> ceil=1c per leg -> 2c round-trip + 1.5c -> 4c
+        floor_2 = calculate_spread_floor_cents(2.0, target_edge_cents=1.5)
+        assert floor_2 == 4
 
     def test_spread_floor_respects_minimum_bound(self):
         """Even with 0 fee, spread floor respects min_floor_cents."""
@@ -75,15 +79,23 @@ class TestRollingVolatilityEstimator:
         assert estimator.get_realized_volatility() == 1.5
 
     def test_sample_standard_deviation_calculation(self):
-        """With >= 3 samples, computes standard deviation correctly."""
+        """Computes sample standard deviation from consecutive price increments."""
         estimator = RollingVolatilityEstimator(window_seconds=30.0, min_samples=3)
         t = 1000.0
+        # Equal price increments: diffs = [10.0, 10.0] -> variance = 0 -> clamped to 0.1c
         estimator.update(10.0, timestamp=t)
         estimator.update(20.0, timestamp=t + 1)
         estimator.update(30.0, timestamp=t + 2)
-        # Values: 10, 20, 30. Mean: 20. Variance: ((10-20)^2 + 0 + (30-20)^2) / 2 = 200/2 = 100. Stdev = 10.0.
-        vol = estimator.get_realized_volatility(now=t + 2)
-        assert vol == pytest.approx(10.0, abs=0.01)
+        vol_equal = estimator.get_realized_volatility(now=t + 2)
+        assert vol_equal == pytest.approx(0.1, abs=0.01)
+
+        # Variable price increments: diffs = [10.0, 15.0] -> mean = 12.5 -> variance = 12.5 -> stdev = 3.5355
+        estimator_var = RollingVolatilityEstimator(window_seconds=30.0, min_samples=3)
+        estimator_var.update(10.0, timestamp=t)
+        estimator_var.update(20.0, timestamp=t + 1)
+        estimator_var.update(35.0, timestamp=t + 2)
+        vol_var = estimator_var.get_realized_volatility(now=t + 2)
+        assert vol_var == pytest.approx(math.sqrt(12.5), abs=0.01)
 
     def test_sliding_window_pruning(self):
         """Observations outside window_seconds are pruned."""
@@ -126,13 +138,13 @@ class TestOptimalSpreadCalculation:
     def test_spread_tightens_with_deep_book(self):
         """Deeper book / higher liquidity density should tighten the spread."""
         thin_book_spread = calculate_optimal_spread(
-            mid_price_cents=20.0,
+            mid_price_cents=2.0,
             realized_volatility_cents=0.5,
             book_depth=1,
             min_spread_cents=2,
         )
         deep_book_spread = calculate_optimal_spread(
-            mid_price_cents=20.0,
+            mid_price_cents=2.0,
             realized_volatility_cents=0.5,
             book_depth=50,
             min_spread_cents=2,
@@ -151,8 +163,24 @@ class TestOptimalSpreadCalculation:
         )
         assert spread >= floor
 
-    def test_spread_capped_at_max(self):
-        """Extreme volatility cannot exceed max_spread_cents."""
+    def test_fee_floor_precedence_over_lower_max_spread(self):
+        """Fee floor strictly overrides any conflicting max_spread_cents ceiling."""
+        # At 50c, fee floor is 6c
+        floor = calculate_spread_floor_cents(50.0, target_edge_cents=2.0)
+        assert floor == 6
+
+        # Even if operator set max_spread_cents=3, fee floor must take precedence
+        spread = calculate_optimal_spread(
+            mid_price_cents=50.0,
+            realized_volatility_cents=0.1,
+            book_depth=100,
+            target_edge_cents=2.0,
+            max_spread_cents=3,
+        )
+        assert spread >= floor
+
+    def test_spread_capped_at_max_when_above_floor(self):
+        """Extreme volatility cannot exceed max_spread_cents if max_spread_cents >= floor."""
         spread = calculate_optimal_spread(
             mid_price_cents=50.0,
             realized_volatility_cents=50.0,  # massive volatility
