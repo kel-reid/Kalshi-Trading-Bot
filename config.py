@@ -89,6 +89,16 @@ MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
 TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
 
+# Dynamic Volatility & Fee-Aware Spread Engine (Phase 1 & Phase 2)
+# Replaces static MIN_SPREAD with real-time Avellaneda-Stoikov volatility spread
+# bounded from below by the exact round-trip Kalshi fee floor + target edge.
+DYNAMIC_SPREAD_ENABLED = os.getenv("DYNAMIC_SPREAD_ENABLED", "true").lower() in ("true", "1", "yes")
+TARGET_EDGE_CENTS = _get_float_env("TARGET_EDGE_CENTS", 1.5, allow_zero=True)
+MIN_DYNAMIC_SPREAD_CENTS = _get_int_env("MIN_DYNAMIC_SPREAD_CENTS", 2)
+MAX_DYNAMIC_SPREAD_CENTS = _get_int_env("MAX_DYNAMIC_SPREAD_CENTS", 15)
+VOLATILITY_WINDOW_SECONDS = _get_float_env("VOLATILITY_WINDOW_SECONDS", 30.0)
+KALSHI_FEE_RATE = _get_float_env("KALSHI_FEE_RATE", 0.07)
+
 # Extreme Price Collar Safeguards (Cents)
 # In binary markets ($0-$1.00), quoting outside safe collars (e.g. < 10c or > 90c) introduces
 # asymmetric adverse selection and settlement-at-zero holding risk.
@@ -102,12 +112,12 @@ if MIN_MID_PRICE < 1 or MAX_MID_PRICE > 99 or MIN_MID_PRICE >= MAX_MID_PRICE:
 
 # Expiration Cutoff Safeguard (Seconds / Minutes)
 # Cease quoting, liquidate inventory, and rotate away when market close_time is within this buffer.
-# Supports either EXPIRATION_BUFFER_MINUTES (Doppler/env) or MIN_TIME_TO_CLOSE_SECONDS (default 120 mins = 7200s).
+# Supports either EXPIRATION_BUFFER_MINUTES (Doppler/env) or MIN_TIME_TO_CLOSE_SECONDS (default 45 mins = 2700s).
 if os.getenv("EXPIRATION_BUFFER_MINUTES"):
-    EXPIRATION_BUFFER_MINUTES = _get_int_env("EXPIRATION_BUFFER_MINUTES", 120, allow_zero=True)
+    EXPIRATION_BUFFER_MINUTES = _get_int_env("EXPIRATION_BUFFER_MINUTES", 45, allow_zero=True)
     MIN_TIME_TO_CLOSE_SECONDS = EXPIRATION_BUFFER_MINUTES * 60
 else:
-    MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 7200, allow_zero=True)
+    MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 2700, allow_zero=True)
     EXPIRATION_BUFFER_MINUTES = MIN_TIME_TO_CLOSE_SECONDS // 60
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
