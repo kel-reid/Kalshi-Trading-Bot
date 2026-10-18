@@ -83,10 +83,10 @@ def calculate_spread_floor_cents(
     edge = target_edge_cents if (isinstance(target_edge_cents, (int, float)) and math.isfinite(target_edge_cents) and target_edge_cents >= 0.0) else DEFAULT_TARGET_EDGE_CENTS
     one_way_fee = calculate_fee_cents(mid_price_cents, fee_rate=fee_rate)
     # Account for Kalshi integer cent fee rounding on each fill leg
-    per_leg_fee = int(math.ceil(one_way_fee))
+    per_leg_fee = math.ceil(one_way_fee)
     round_trip_fee = 2 * per_leg_fee
 
-    calculated_floor = int(math.ceil(round_trip_fee + edge))
+    calculated_floor = math.ceil(round_trip_fee + edge)
     return max(min_floor_cents, calculated_floor)
 
 
