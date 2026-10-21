@@ -385,6 +385,44 @@ class TestV2PayloadSchema:
         mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_handles_404_real_response(self, order_manager):
+        """Verify _cancel_by_kalshi_id handles real requests.Response with 404 (falsy in bool()) as success."""
+        import requests
+        resp_404 = requests.Response()
+        resp_404.status_code = 404
+        assert not bool(resp_404), "requests.Response with 404 must be falsy to test boolean evaluation regression"
+
+        order_manager._delete_request = MagicMock(return_value=resp_404)
+        order_manager._update_db_order_status = MagicMock()
+        order_manager.rate_limiter.acquire = AsyncMock()
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-404", "client-cid-404")
+
+        assert result is True
+        order_manager.rate_limiter.acquire.assert_awaited_once()
+        order_manager._update_db_order_status.assert_called_once_with(
+            "client-cid-404", "cancelled_or_filled_404", kalshi_order_id="kalshi-oid-404"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_handles_error_response(self, order_manager):
+        """Verify _cancel_by_kalshi_id handles non-404 error responses and logs correctly."""
+        import requests
+        resp_500 = requests.Response()
+        resp_500.status_code = 500
+        resp_500._content = b'{"error": "Internal Error"}'
+
+        order_manager._delete_request = MagicMock(return_value=resp_500)
+        order_manager._update_db_order_status = MagicMock()
+        order_manager.rate_limiter.acquire = AsyncMock()
+
+        result = await order_manager._cancel_by_kalshi_id("kalshi-oid-500", "client-cid-500")
+
+        assert result is False
+        order_manager.rate_limiter.acquire.assert_awaited_once()
+        order_manager._update_db_order_status.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_sync_and_recover_state_paginates_beyond_100_orders(self, order_manager):
         """Verify sync_and_recover_state paginates past 100 orders and cancels all orphans."""
         page1_orders = [{"order_id": f"p1-ord-{i}", "client_order_id": f"p1-cid-{i}"} for i in range(100)]
