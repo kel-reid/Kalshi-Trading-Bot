@@ -8,6 +8,7 @@ See docs/SPORTS_SEASON_ROUTER.md for full architecture and seasonal priority cal
 """
 
 import datetime
+import logging
 from typing import List, Optional
 
 try:
@@ -15,6 +16,8 @@ try:
     ET_TZ = zoneinfo.ZoneInfo("America/New_York")
 except (ImportError, Exception):  # pragma: no cover
     ET_TZ = datetime.timezone(datetime.timedelta(hours=-4))
+
+logger = logging.getLogger("SportsRouter")
 
 
 SPORTS_KEYWORDS = (
@@ -56,10 +59,14 @@ class SportsSeasonRouter:
     ALL_IN_SEASON_PREFIXES = ("KXNFL", "KXNBA", "KXMLB", "KXNCAAF")
 
     @classmethod
-    def get_in_season_leagues(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
+    def get_in_season_leagues(
+        cls,
+        dt: Optional[datetime.datetime] = None,
+        use_live_schedule: bool = True,
+    ) -> List[str]:
         """
-        Return ordered list of active leagues ('NFL', 'NCAAF', 'NBA', 'MLB') based on calendar month
-        and day-of-week scheduling dynamics in US Eastern Time (ET).
+        Return ordered list of active leagues ('NFL', 'NCAAF', 'NBA', 'MLB') based on calendar month,
+        day-of-week scheduling dynamics in US Eastern Time (ET), and optional live ESPN daily schedule counts.
 
         Day-of-Week Football Scheduling Dynamics (Sep - Jan):
         - Friday & Saturday: College Football (NCAAF) is the primary attraction across the country.
@@ -95,17 +102,47 @@ class SportsSeasonRouter:
         is_cfb_primetime = weekday in (4, 5)  # Friday & Saturday
 
         if month == 9:
-            return ["NCAAF", "NFL", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "MLB"]
+            base = ["NCAAF", "NFL", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "MLB"]
         elif month == 10:
-            return ["NCAAF", "NFL", "NBA", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA", "MLB"]
+            base = ["NCAAF", "NFL", "NBA", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA", "MLB"]
         elif month in (11, 12, 1):
-            return ["NCAAF", "NFL", "NBA"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA"]
+            base = ["NCAAF", "NFL", "NBA"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA"]
         elif month == 2:
-            return ["NFL", "NBA"]
+            base = ["NFL", "NBA"]
         elif month in (3, 4, 5, 6):
-            return ["NBA", "MLB"]
+            base = ["NBA", "MLB"]
         else:  # July, August (Summer lull: MLB only; NFL/NCAAF preseason excluded)
-            return ["MLB"]
+            base = ["MLB"]
+
+        if not use_live_schedule:
+            return base
+
+        # Dynamically elevate leagues that have live or scheduled games today via ESPN
+        try:
+            from utils.espn_client import get_daily_slate_counts
+            counts = get_daily_slate_counts(dt=dt_et, leagues=base)
+            if (
+                counts
+                and all(counts.get(l) is not None for l in base)
+                and any((counts.get(l) or 0) > 0 for l in base)
+            ):
+                with_games = [l for l in base if (counts.get(l) or 0) > 0]
+                without_games = [l for l in base if (counts.get(l) or 0) == 0]
+                return with_games + without_games
+        except Exception as e_espn:
+            logger.debug(f"Failed to query live ESPN slate schedule: {e_espn}")
+
+        return base
+
+    @classmethod
+    async def get_in_season_leagues_async(
+        cls,
+        dt: Optional[datetime.datetime] = None,
+        use_live_schedule: bool = True,
+    ) -> List[str]:
+        """Non-blocking async wrapper for get_in_season_leagues."""
+        import asyncio
+        return await asyncio.to_thread(cls.get_in_season_leagues, dt=dt, use_live_schedule=use_live_schedule)
 
     @classmethod
     def get_primary_series_for_league(cls, league: str) -> str:
@@ -156,11 +193,16 @@ class SportsSeasonRouter:
         return mapping.get(league.upper(), [])
 
     @classmethod
-    def get_in_season_series(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
+    def get_in_season_series(
+        cls,
+        dt: Optional[datetime.datetime] = None,
+        use_live_schedule: bool = False,
+    ) -> List[str]:
         """
         Return prioritized list of series tickers to query across all active in-season leagues.
+        Defaults to static calendar order (use_live_schedule=False) to ensure deterministic series queries.
         """
-        leagues = cls.get_in_season_leagues(dt)
+        leagues = cls.get_in_season_leagues(dt, use_live_schedule=use_live_schedule)
         series_list: List[str] = []
         for league in leagues:
             series_list.extend(cls.get_series_for_league(league))

@@ -121,8 +121,9 @@ def discover_active_market(
     """
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
-    budget_tracker: Dict[str, int] = {
+    budget_tracker: Dict[str, Any] = {
         "remaining": max(0, max_total_probes),
+        "probed_tickers": set(),
         "targeted_fallbacks_remaining": (
             max(0, min(max_targeted_series_fallbacks, max_total_probes))
             if preflight_check
@@ -170,6 +171,8 @@ def discover_active_market(
                     return None
                 if budget_tracker is not None:
                     budget_tracker["remaining"] -= 1
+                    if exact_ticker:
+                        budget_tracker.setdefault("probed_tickers", set()).add(exact_ticker)
                 if exact_ticker:
                     try:
                         has_quotes = check_orderbook_has_quotes(
@@ -284,7 +287,32 @@ def discover_active_market(
 
     # 5. SportsSeasonRouter Waterfall for in-season leagues and full product suites
     if target_leagues:
-        # Tier 1A: Primary Moneylines across all active in-season leagues (NFL -> NBA -> MLB)
+        # Tier 1A (Imminent Phase): Check for active games starting TODAY (<= 18h) across all in-season leagues
+        for league in target_leagues:
+            if preflight_check and budget_tracker["remaining"] <= 0:
+                break
+            primary_series = SportsSeasonRouter.get_primary_series_for_league(league)
+            if primary_series:
+                series_markets = _ensure_series_markets(primary_series)
+                imminent_markets = [
+                    m for m in series_markets
+                    if _get_earliest_market_timestamp(m)[1] is not None
+                    and max(0.0, (_get_earliest_market_timestamp(m)[1] - now_utc).total_seconds() / 3600.0) <= 18.0
+                ]
+                if imminent_markets:
+                    selected = _select_best_market(
+                        imminent_markets,
+                        preflight_check=preflight_check,
+                        max_probes=DEFAULT_MAX_PROBES_PRIMARY_GAME,
+                        budget_tracker=budget_tracker,
+                        min_mid_price=min_mid_price,
+                        max_mid_price=max_mid_price,
+                    )
+                    if selected:
+                        logger.info(f"SportsSeasonRouter selected imminent {league} Primary Moneyline ({primary_series}): {selected}")
+                        return selected
+
+        # Tier 1A (Standard Phase): Primary Moneylines across all active in-season leagues (fallback when no imminent games)
         for league in target_leagues:
             if preflight_check and budget_tracker["remaining"] <= 0:
                 logger.info("Probe quota exhausted during Tier 1A Primary Moneylines; stopping further probes.")
