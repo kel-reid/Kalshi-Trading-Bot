@@ -87,7 +87,8 @@ ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 3.0))
 MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
-TARGET_TICKER = os.getenv("TARGET_TICKER", "") # Can be injected to force a specific market
+TARGET_TICKER = os.getenv("TARGET_TICKER", os.getenv("TARGET_PREFERENCE", "")) # Can be injected to force a specific market or league
+TARGET_PREFERENCE = os.getenv("TARGET_PREFERENCE", os.getenv("TARGET_TICKER", ""))
 
 # Dynamic Volatility & Fee-Aware Spread Engine (Phase 1 & Phase 2)
 # Replaces static MIN_SPREAD with real-time Avellaneda-Stoikov volatility spread
