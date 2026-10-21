@@ -144,8 +144,8 @@ def test_get_daily_slate_counts_merges_missing_leagues_into_cache():
         assert mock_fetch.call_count == 2
 
 
-def test_get_daily_slate_counts_does_not_cache_partial_failures():
-    """Verify that if one league fails (returns None), the partial result is returned without being cached."""
+def test_get_daily_slate_counts_caches_successes_on_partial_failures():
+    """Verify that if one league fails (returns None), successful leagues are cached while failed leagues retry."""
     test_dt = datetime.datetime(2026, 10, 21, 19, 0, tzinfo=datetime.timezone.utc)
 
     with patch("utils.espn_client.fetch_espn_league_games_today") as mock_fetch:
@@ -154,9 +154,12 @@ def test_get_daily_slate_counts_does_not_cache_partial_failures():
 
         counts = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
         assert counts == {"NBA": 11, "NFL": None}
+        assert mock_fetch.call_count == 2
 
-        # Since it had a failure, cache should not hold failed data; next call re-attempts fetch
-        mock_fetch.side_effect = lambda league, date: 11 if league == "NBA" else 1
+        # NBA is now cached, so only NFL is retried on second call
+        mock_fetch.side_effect = lambda league, date: 1
         counts_retry = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
         assert counts_retry == {"NBA": 11, "NFL": 1}
+        # mock_fetch only called once more (for NFL)
+        assert mock_fetch.call_count == 3
 
