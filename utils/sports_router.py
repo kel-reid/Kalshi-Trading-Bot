@@ -193,11 +193,16 @@ class SportsSeasonRouter:
         return mapping.get(league.upper(), [])
 
     @classmethod
-    def get_in_season_series(cls, dt: Optional[datetime.datetime] = None) -> List[str]:
+    def get_in_season_series(
+        cls,
+        dt: Optional[datetime.datetime] = None,
+        use_live_schedule: bool = False,
+    ) -> List[str]:
         """
         Return prioritized list of series tickers to query across all active in-season leagues.
+        Defaults to static calendar order (use_live_schedule=False) to ensure deterministic series queries.
         """
-        leagues = cls.get_in_season_leagues(dt)
+        leagues = cls.get_in_season_leagues(dt, use_live_schedule=use_live_schedule)
         series_list: List[str] = []
         for league in leagues:
             series_list.extend(cls.get_series_for_league(league))

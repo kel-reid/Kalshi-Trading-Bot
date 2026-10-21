@@ -157,7 +157,13 @@ def get_daily_slate_counts(
         count = fetch_espn_league_games_today(league, target_date)
         fetched_counts[league] = count
 
-    # If any league failed (returned None), do not cache partial results; return uncommitted union
+    # Merge any successfully fetched league counts into the shared cache
+    successful_fetches = {l: c for l, c in fetched_counts.items() if c is not None}
+    if successful_fetches:
+        cached_counts.update(successful_fetches)
+        _SLATE_CACHE["timestamp"] = now_monotonic
+
+    # If any league failed (returned None), return union without caching the failed league(s)
     if any(count is None for count in fetched_counts.values()):
         result: Dict[str, Optional[int]] = {}
         for l in target_leagues:
@@ -166,10 +172,6 @@ def get_daily_slate_counts(
             else:
                 result[l] = fetched_counts.get(l)
         return result
-
-    # All requested leagues fetched successfully: merge into shared cache
-    cached_counts.update(fetched_counts)
-    _SLATE_CACHE["timestamp"] = now_monotonic
 
     logger.info(f"ESPN Daily Slate Counts for {target_date_str}: {cached_counts}")
     return {l: cached_counts.get(l) for l in target_leagues}
