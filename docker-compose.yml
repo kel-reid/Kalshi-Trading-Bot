@@ -36,6 +36,7 @@ services:
       - MIN_SPREAD
       - ORDER_SIZE
       - TARGET_TICKER
+      - TARGET_PREFERENCE
       - MAX_EXPIRATION_DAYS
       - MIN_MID_PRICE
       - MAX_MID_PRICE

@@ -102,7 +102,7 @@ def _select_best_market(
     candidates: List[Dict[str, Any]],
     preflight_check: bool = True,
     max_probes: int = 10,
-    budget_tracker: Optional[Dict[str, int]] = None,
+    budget_tracker: Optional[Dict[str, Any]] = None,
     min_mid_price: Optional[float] = None,
     max_mid_price: Optional[float] = None,
 ) -> Optional[str]:
@@ -129,12 +129,25 @@ def _select_best_market(
             logger.info("Pre-flight probe quota exhausted; skipping further probes.")
             return None
 
-        probe_limit = min(max_probes, len(pool))
+        probed_tickers = (
+            budget_tracker.setdefault("probed_tickers", set())
+            if budget_tracker is not None
+            else None
+        )
+        probe_pool = [
+            market for market in pool
+            if probed_tickers is None
+            or market.get("ticker") not in probed_tickers
+        ]
+        if not probe_pool:
+            return None
+
+        probe_limit = min(max_probes, len(probe_pool))
         if budget_tracker is not None:
             probe_limit = min(probe_limit, budget_tracker["remaining"])
 
         check_orderbook_has_quotes = _get_orderbook_checker()
-        top_candidates = pool[:probe_limit]
+        top_candidates = probe_pool[:probe_limit]
         for candidate in top_candidates:
             cand_ticker = candidate.get("ticker")
             if not cand_ticker:
@@ -142,6 +155,8 @@ def _select_best_market(
 
             if budget_tracker is not None:
                 budget_tracker["remaining"] -= 1
+            if probed_tickers is not None:
+                probed_tickers.add(cand_ticker)
 
             try:
                 has_quotes = check_orderbook_has_quotes(
