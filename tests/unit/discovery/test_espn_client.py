@@ -92,17 +92,20 @@ def test_fetch_espn_league_games_today_filters_postponed_and_wrong_date():
 
 
 def test_fetch_espn_league_games_today_handles_network_error_gracefully():
-    """Verify network error or non-200 status code returns 0 without crashing."""
+    """Verify network error or non-200 status code returns None without crashing."""
     target_date = datetime.date(2026, 10, 21)
 
     with patch("utils.espn_client.requests.get", side_effect=Exception("Connection reset")):
         count = fetch_espn_league_games_today("NBA", target_date)
-        assert count == 0
+        assert count is None
 
     mock_500 = MagicMock(status_code=500)
     with patch("utils.espn_client.requests.get", return_value=mock_500):
         count = fetch_espn_league_games_today("NBA", target_date)
-        assert count == 0
+        assert count is None
+
+    # Unknown league
+    assert fetch_espn_league_games_today("UNKNOWN", target_date) is None
 
 
 def test_get_daily_slate_counts_caches_results():
@@ -121,3 +124,39 @@ def test_get_daily_slate_counts_caches_results():
         counts2 = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
         assert counts2 == {"NBA": 11, "NFL": 0}
         assert mock_fetch.call_count == 2
+
+
+def test_get_daily_slate_counts_merges_missing_leagues_into_cache():
+    """Verify requesting a subset first and superset second fetches and merges missing leagues."""
+    test_dt = datetime.datetime(2026, 10, 21, 19, 0, tzinfo=datetime.timezone.utc)
+
+    with patch("utils.espn_client.fetch_espn_league_games_today") as mock_fetch:
+        mock_fetch.side_effect = lambda league, date: 11 if league == "NBA" else 2
+
+        # First call queries only NBA
+        counts1 = get_daily_slate_counts(dt=test_dt, leagues=["NBA"])
+        assert counts1 == {"NBA": 11}
+        assert mock_fetch.call_count == 1
+
+        # Second call queries NBA and NFL; only NFL should be fetched
+        counts2 = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
+        assert counts2 == {"NBA": 11, "NFL": 2}
+        assert mock_fetch.call_count == 2
+
+
+def test_get_daily_slate_counts_does_not_cache_partial_failures():
+    """Verify that if one league fails (returns None), the partial result is returned without being cached."""
+    test_dt = datetime.datetime(2026, 10, 21, 19, 0, tzinfo=datetime.timezone.utc)
+
+    with patch("utils.espn_client.fetch_espn_league_games_today") as mock_fetch:
+        # NBA succeeds, NFL fails
+        mock_fetch.side_effect = lambda league, date: 11 if league == "NBA" else None
+
+        counts = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
+        assert counts == {"NBA": 11, "NFL": None}
+
+        # Since it had a failure, cache should not hold failed data; next call re-attempts fetch
+        mock_fetch.side_effect = lambda league, date: 11 if league == "NBA" else 1
+        counts_retry = get_daily_slate_counts(dt=test_dt, leagues=["NBA", "NFL"])
+        assert counts_retry == {"NBA": 11, "NFL": 1}
+
