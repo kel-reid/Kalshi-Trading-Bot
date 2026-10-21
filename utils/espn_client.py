@@ -7,6 +7,7 @@ Provides game counts for the current calendar day in US Eastern Time (ET) to dyn
 elevate leagues with active daily slates over leagues on off-days.
 """
 
+import asyncio
 import datetime
 import logging
 import time
@@ -46,14 +47,14 @@ def clear_slate_cache() -> None:
     }
 
 
-def fetch_espn_league_games_today(league: str, target_date_et: datetime.date, timeout: float = 3.0) -> int:
+def fetch_espn_league_games_today(league: str, target_date_et: datetime.date, timeout: float = 3.0) -> Optional[int]:
     """
     Query ESPN scoreboard for a given league and count games scheduled or live on target_date_et.
-    Returns integer game count (0 on error, timeout, or no games).
+    Returns integer game count on success (>= 0), or None on error, timeout, or unknown league.
     """
     url = ESPN_SCOREBOARD_URLS.get(league.upper())
     if not url:
-        return 0
+        return None
 
     try:
         # Date parameter formatted as YYYYMMDD (e.g. 20261021)
@@ -62,12 +63,12 @@ def fetch_espn_league_games_today(league: str, target_date_et: datetime.date, ti
         resp = requests.get(url, params=params, timeout=timeout, verify=certifi.where())
         if resp.status_code != 200:
             logger.debug(f"ESPN scoreboard for {league} returned HTTP {resp.status_code}")
-            return 0
+            return None
 
         data = resp.json()
         events = data.get("events", [])
         if not isinstance(events, list):
-            return 0
+            return None
 
         active_count = 0
         for event in events:
@@ -101,17 +102,19 @@ def fetch_espn_league_games_today(league: str, target_date_et: datetime.date, ti
         return active_count
     except Exception as e:
         logger.debug(f"Failed to fetch ESPN scoreboard for {league}: {e}")
-        return 0
+        return None
 
 
 def get_daily_slate_counts(
     dt: Optional[datetime.datetime] = None,
     ttl_seconds: float = CACHE_TTL_SECONDS,
     leagues: Optional[List[str]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Optional[int]]:
     """
     Get the count of active/scheduled games today across requested leagues.
     Results are cached by date and TTL to prevent rate limits or redundant network calls.
+    Merges missing leagues when a different league set is requested for the same date.
+    Returns without caching if any requested league fails to fetch (preserving fail-open semantics).
     """
     global _SLATE_CACHE
 
@@ -125,26 +128,58 @@ def get_daily_slate_counts(
     target_date_str = target_date.isoformat()
     now_monotonic = time.monotonic()
 
-    # Check cache validity
-    if (
+    target_leagues = leagues or list(ESPN_SCOREBOARD_URLS.keys())
+
+    # Check cache date & TTL validity
+    cache_valid = (
         _SLATE_CACHE["date_str"] == target_date_str
         and (now_monotonic - _SLATE_CACHE["timestamp"]) < ttl_seconds
-        and _SLATE_CACHE["counts"]
-    ):
-        return dict(_SLATE_CACHE["counts"])
+        and isinstance(_SLATE_CACHE.get("counts"), dict)
+    )
 
-    target_leagues = leagues or list(ESPN_SCOREBOARD_URLS.keys())
-    counts: Dict[str, int] = {}
+    if not cache_valid:
+        # Reset cache on date change or TTL expiration
+        _SLATE_CACHE = {
+            "date_str": target_date_str,
+            "timestamp": now_monotonic,
+            "counts": {},
+        }
 
-    for league in target_leagues:
+    cached_counts: Dict[str, int] = _SLATE_CACHE["counts"]
+    missing_leagues = [l for l in target_leagues if l not in cached_counts]
+
+    if not missing_leagues:
+        return {l: cached_counts.get(l) for l in target_leagues}
+
+    # Fetch missing leagues
+    fetched_counts: Dict[str, Optional[int]] = {}
+    for league in missing_leagues:
         count = fetch_espn_league_games_today(league, target_date)
-        counts[league] = count
+        fetched_counts[league] = count
 
-    _SLATE_CACHE = {
-        "date_str": target_date_str,
-        "timestamp": now_monotonic,
-        "counts": counts,
-    }
+    # If any league failed (returned None), do not cache partial results; return uncommitted union
+    if any(count is None for count in fetched_counts.values()):
+        result: Dict[str, Optional[int]] = {}
+        for l in target_leagues:
+            if l in cached_counts:
+                result[l] = cached_counts[l]
+            else:
+                result[l] = fetched_counts.get(l)
+        return result
 
-    logger.info(f"ESPN Daily Slate Counts for {target_date_str}: {counts}")
-    return dict(counts)
+    # All requested leagues fetched successfully: merge into shared cache
+    cached_counts.update(fetched_counts)
+    _SLATE_CACHE["timestamp"] = now_monotonic
+
+    logger.info(f"ESPN Daily Slate Counts for {target_date_str}: {cached_counts}")
+    return {l: cached_counts.get(l) for l in target_leagues}
+
+
+async def get_daily_slate_counts_async(
+    dt: Optional[datetime.datetime] = None,
+    ttl_seconds: float = CACHE_TTL_SECONDS,
+    leagues: Optional[List[str]] = None,
+) -> Dict[str, Optional[int]]:
+    """Non-blocking async wrapper for get_daily_slate_counts."""
+    return await asyncio.to_thread(get_daily_slate_counts, dt, ttl_seconds, leagues)
+

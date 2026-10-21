@@ -101,3 +101,40 @@ def test_discover_active_market_prefers_imminent_game_over_distant_higher_priori
 
         # Must select the imminent NBA game (starts in 3h) rather than the NFL game (starts in 28h)
         assert selected == "KXNBAGAME-26OCT21ATLORL-ATL"
+
+
+def test_sports_season_router_preserves_base_order_on_partial_failure():
+    """Verify SportsSeasonRouter preserves standard calendar order if any league fails (returns None)."""
+    dt_wed = datetime.datetime(2026, 10, 21, 18, 0, tzinfo=datetime.timezone.utc)
+    # NBA succeeds with 11 games, but NFL failed (None)
+    mock_partial = {"NBA": 11, "NFL": None, "NCAAF": 0, "MLB": 0}
+
+    with patch("utils.espn_client.get_daily_slate_counts", return_value=mock_partial):
+        leagues = SportsSeasonRouter.get_in_season_leagues(dt_wed, use_live_schedule=True)
+        # Must preserve original calendar order without demoting NFL
+        assert leagues == ["NFL", "NCAAF", "NBA", "MLB"]
+
+
+def test_select_best_market_avoids_duplicate_probes():
+    """Verify _select_best_market skips tickers already recorded in budget_tracker['probed_tickers']."""
+    from utils.market_scoring import _select_best_market
+
+    candidates = [
+        {"ticker": "MKT-1", "volume_fp": "100.0"},
+        {"ticker": "MKT-2", "volume_fp": "50.0"},
+    ]
+
+    budget_tracker = {
+        "remaining": 5,
+        "probed_tickers": {"MKT-1"},  # MKT-1 already probed in a previous phase
+    }
+
+    mock_checker = MagicMock(return_value=True)
+    with patch("utils.market_scoring._get_orderbook_checker", return_value=mock_checker):
+        selected = _select_best_market(candidates, preflight_check=True, budget_tracker=budget_tracker)
+        # MKT-1 must be skipped, MKT-2 probed and selected
+        assert selected == "MKT-2"
+        mock_checker.assert_called_once_with("MKT-2", min_mid_price=None, max_mid_price=None)
+        assert "MKT-2" in budget_tracker["probed_tickers"]
+        assert budget_tracker["remaining"] == 4
+

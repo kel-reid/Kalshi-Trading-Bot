@@ -121,14 +121,28 @@ class SportsSeasonRouter:
         try:
             from utils.espn_client import get_daily_slate_counts
             counts = get_daily_slate_counts(dt=dt_et, leagues=base)
-            if counts and any(c > 0 for c in counts.values()):
-                with_games = [l for l in base if counts.get(l, 0) > 0]
-                without_games = [l for l in base if counts.get(l, 0) == 0]
+            if (
+                counts
+                and all(counts.get(l) is not None for l in base)
+                and any((counts.get(l) or 0) > 0 for l in base)
+            ):
+                with_games = [l for l in base if (counts.get(l) or 0) > 0]
+                without_games = [l for l in base if (counts.get(l) or 0) == 0]
                 return with_games + without_games
         except Exception as e_espn:
             logger.debug(f"Failed to query live ESPN slate schedule: {e_espn}")
 
         return base
+
+    @classmethod
+    async def get_in_season_leagues_async(
+        cls,
+        dt: Optional[datetime.datetime] = None,
+        use_live_schedule: bool = True,
+    ) -> List[str]:
+        """Non-blocking async wrapper for get_in_season_leagues."""
+        import asyncio
+        return await asyncio.to_thread(cls.get_in_season_leagues, dt=dt, use_live_schedule=use_live_schedule)
 
     @classmethod
     def get_primary_series_for_league(cls, league: str) -> str:

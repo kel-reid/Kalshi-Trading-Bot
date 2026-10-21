@@ -1457,8 +1457,8 @@ class AvellanedaStoikovBot:
         if current_close_dt is not None:
             current_hours = max(0.0, (current_close_dt - now_utc).total_seconds() / 3600.0)
 
-        # Check calendar-driven in-season league priority
-        in_season_leagues = SportsSeasonRouter.get_in_season_leagues(now_utc)
+        # Check calendar-driven in-season league priority (offloaded to thread to avoid event-loop blocking)
+        in_season_leagues = await SportsSeasonRouter.get_in_season_leagues_async(now_utc)
         primary_league = in_season_leagues[0] if in_season_leagues else ""
         current_in_primary = bool(primary_league and self.ticker.startswith(f"KX{primary_league}"))
 

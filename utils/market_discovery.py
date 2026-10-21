@@ -121,8 +121,9 @@ def discover_active_market(
     """
     exclude = set(exclude_tickers or [])
     pref = target_preference.strip().upper() if target_preference else ""
-    budget_tracker: Dict[str, int] = {
+    budget_tracker: Dict[str, Any] = {
         "remaining": max(0, max_total_probes),
+        "probed_tickers": set(),
         "targeted_fallbacks_remaining": (
             max(0, min(max_targeted_series_fallbacks, max_total_probes))
             if preflight_check
@@ -170,6 +171,8 @@ def discover_active_market(
                     return None
                 if budget_tracker is not None:
                     budget_tracker["remaining"] -= 1
+                    if exact_ticker:
+                        budget_tracker.setdefault("probed_tickers", set()).add(exact_ticker)
                 if exact_ticker:
                     try:
                         has_quotes = check_orderbook_has_quotes(
