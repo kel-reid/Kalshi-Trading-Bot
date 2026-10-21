@@ -470,34 +470,35 @@ class OrderManager:
         for attempt in range(max_retries + 1):
             await self.rate_limiter.acquire()
             resp = await asyncio.to_thread(self._delete_request, cancel_path)
-            if resp and resp.status_code in [200, 204]:
-                logger.info(f"Successfully cancelled orphaned order {cancel_path}")
-                if client_order_id:
-                    self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
-                return True
-            elif resp and resp.status_code == 404:
-                logger.info(f"Orphaned order {cancel_path} already cleared on exchange (404).")
-                if client_order_id:
-                    self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
-                return True
-            elif resp and resp.status_code == 429:
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(
-                        f"Rate limited (429) canceling orphaned order {order_id}. "
-                        f"Retrying in {delay}s (Attempt {attempt+1}/{max_retries})"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"Failed to cancel orphaned order {order_id} after {max_retries} retries due to rate limits.")
-                    ORDER_ERRORS_TOTAL.labels(type="cancel_rate_limit").inc()
-                    return False
-            else:
-                err = resp.text if resp else "No response"
-                logger.error(f"Failed to cancel orphaned order {cancel_path}: {err}")
-                ORDER_ERRORS_TOTAL.labels(type="cancel_api_error").inc()
-                return False
+            if resp is not None:
+                if resp.status_code in [200, 204]:
+                    logger.info(f"Successfully cancelled orphaned order {cancel_path}")
+                    if client_order_id:
+                        self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
+                    return True
+                elif resp.status_code == 404:
+                    logger.info(f"Orphaned order {cancel_path} already cleared on exchange (404).")
+                    if client_order_id:
+                        self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
+                    return True
+                elif resp.status_code == 429:
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Rate limited (429) canceling orphaned order {order_id}. "
+                            f"Retrying in {delay}s (Attempt {attempt+1}/{max_retries})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Failed to cancel orphaned order {order_id} after {max_retries} retries due to rate limits.")
+                        ORDER_ERRORS_TOTAL.labels(type="cancel_rate_limit").inc()
+                        return False
+
+            err = resp.text if resp is not None else "No response"
+            logger.error(f"Failed to cancel orphaned order {cancel_path}: {err}")
+            ORDER_ERRORS_TOTAL.labels(type="cancel_api_error").inc()
+            return False
         return False
 
     async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
