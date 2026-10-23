@@ -262,7 +262,7 @@ class AvellanedaStoikovBot:
         self._snapshot_task: Optional[asyncio.Task] = None
 
         # Exchange Shard Routing & Hedging Circuit Breaker
-        self.exchange_index: int = get_market_exchange_index(self.ticker)
+        self.exchange_index: Optional[int] = get_market_exchange_index(self.ticker)
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
 
@@ -272,7 +272,14 @@ class AvellanedaStoikovBot:
         If the market resides on a non-default shard (e.g. Shard 3 for sports/NBA) and collateral is low,
         initiates an intra-exchange instance transfer from Shard 0 (main balance).
         """
-        target_shard = getattr(self, "exchange_index", 0)
+        if getattr(self, "exchange_index", None) is None:
+            self.exchange_index = get_market_exchange_index(self.ticker)
+
+        target_shard = getattr(self, "exchange_index", None)
+        if target_shard is None:
+            logger.warning(f"Could not resolve exchange_index for {self.ticker}; cannot verify shard collateral.")
+            return False
+
         if target_shard == 0:
             return True
 
@@ -383,6 +390,8 @@ class AvellanedaStoikovBot:
             raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
         
         # 3a. Ensure exchange shard collateral before quoting starts
+        if getattr(self, "exchange_index", None) is None:
+            self.exchange_index = get_market_exchange_index(self.ticker)
         await self.ensure_shard_collateral()
 
         # 3b. Launch the periodic reconciliation background task
@@ -1008,7 +1017,8 @@ class AvellanedaStoikovBot:
                             f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
                             f"Attempting shard rebalance..."
                         )
-                        await self.ensure_shard_collateral(min_required_dollars=20.0)
+                        hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
+                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
                         if self._consecutive_hedge_failures >= 3:
                             logger.critical(
                                 f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
@@ -1051,7 +1061,8 @@ class AvellanedaStoikovBot:
                             f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
                             f"Attempting shard rebalance..."
                         )
-                        await self.ensure_shard_collateral(min_required_dollars=20.0)
+                        hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
+                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
                         if self._consecutive_hedge_failures >= 3:
                             logger.critical(
                                 f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
