@@ -46,16 +46,28 @@ class KillSwitch:
             return []
         return []
 
-    def _delete_order_sync(self, kalshi_order_id: str, client_order_id: Optional[str] = None):
-        """Helper to synchronously send DELETE request for an order."""
+    def _delete_order_sync(
+        self,
+        kalshi_order_id: str,
+        client_order_id: Optional[str] = None,
+        exchange_index: Optional[int] = None,
+        ticker: Optional[str] = None,
+    ):
+        """Helper to synchronously send DELETE request for an order with shard routing."""
         ref = client_order_id or kalshi_order_id
-        logger.warning(f"Canceling {ref} (Kalshi ID: {kalshi_order_id})...")
+        logger.warning(f"Canceling {ref} (Kalshi ID: {kalshi_order_id}, shard: {exchange_index})...")
         sign_path = f"/trade-api/v2/portfolio/events/orders/{kalshi_order_id}"
+        params = {}
+        if exchange_index is not None:
+            params["exchange_index"] = int(exchange_index)
+        if ticker:
+            params["ticker"] = ticker
         try:
             headers = get_auth_headers(method="DELETE", sign_path=sign_path)
             resp = requests.delete(
                 BASE_URL + sign_path, 
-                headers=headers, 
+                headers=headers,
+                params=params if params else None,
                 timeout=5, 
                 verify=certifi.where()
             )
@@ -64,7 +76,7 @@ class KillSwitch:
                 if client_order_id:
                     self.om.active_orders.pop(client_order_id, None)
             elif resp.status_code == 404:
-                logger.info(f"Order {ref} ({kalshi_order_id}) already closed/filled on exchange.")
+                logger.info(f"Order {ref} ({kalshi_order_id}) returned 404 on exchange delete.")
                 if client_order_id:
                     self.om.active_orders.pop(client_order_id, None)
             else:
@@ -94,15 +106,22 @@ class KillSwitch:
         cancelled_kalshi_ids = set()
         unverified_ids = []
 
-        # 1. Immediately cancel all known orders with verified exchange IDs
+        # 1. Immediately cancel all known orders with verified exchange IDs and shard params
         for client_order_id in active_ids:
             order_info = self.om.active_orders.get(client_order_id) or {}
             if target_ticker and order_info.get("ticker") and order_info.get("ticker") != target_ticker:
                 continue
 
             kalshi_order_id = order_info.get("kalshi_order_id")
+            order_shard = order_info.get("exchange_index")
+            order_tick = order_info.get("ticker") or target_ticker
             if kalshi_order_id:
-                self._delete_order_sync(kalshi_order_id, client_order_id)
+                self._delete_order_sync(
+                    kalshi_order_id,
+                    client_order_id,
+                    exchange_index=order_shard,
+                    ticker=order_tick,
+                )
                 cancelled_kalshi_ids.add(kalshi_order_id)
             else:
                 unverified_ids.append(client_order_id)
@@ -113,12 +132,14 @@ class KillSwitch:
             exchange_orders = [o for o in exchange_orders if o.get("ticker") == target_ticker]
 
         client_to_exchange = {}
+        client_to_shard = {}
         if exchange_orders is not None:
-            client_to_exchange = {
-                o.get("client_order_id"): o.get("order_id")
-                for o in exchange_orders
-                if o.get("client_order_id") and o.get("order_id")
-            }
+            for o in exchange_orders:
+                cid = o.get("client_order_id")
+                oid = o.get("order_id")
+                if cid and oid:
+                    client_to_exchange[cid] = oid
+                    client_to_shard[cid] = o.get("exchange_index")
 
         # 3. Reconcile and cancel unverified orders
         for client_order_id in unverified_ids:
@@ -127,8 +148,15 @@ class KillSwitch:
                 if client_order_id in client_to_exchange:
                     kalshi_order_id = client_to_exchange[client_order_id]
                     order_info["kalshi_order_id"] = kalshi_order_id
+                    order_shard = client_to_shard.get(client_order_id)
+                    order_tick = order_info.get("ticker") or target_ticker
                     if kalshi_order_id not in cancelled_kalshi_ids:
-                        self._delete_order_sync(kalshi_order_id, client_order_id)
+                        self._delete_order_sync(
+                            kalshi_order_id,
+                            client_order_id,
+                            exchange_index=order_shard,
+                            ticker=order_tick,
+                        )
                         cancelled_kalshi_ids.add(kalshi_order_id)
                 else:
                     logger.info(f"Order {client_order_id} verified not resting on exchange.")
@@ -139,13 +167,20 @@ class KillSwitch:
                     "missing exchange order ID and resting order reconciliation failed."
                 )
 
-        # 4. Cancel untracked exchange resting orders
+        # 4. Cancel untracked exchange resting orders with shard routing
         if exchange_orders is not None:
             for order in exchange_orders:
                 oid = order.get("order_id")
                 cid = order.get("client_order_id")
+                order_shard = order.get("exchange_index")
+                order_tick = order.get("ticker")
                 if oid and oid not in cancelled_kalshi_ids:
-                    self._delete_order_sync(oid, cid)
+                    self._delete_order_sync(
+                        oid,
+                        cid,
+                        exchange_index=order_shard,
+                        ticker=order_tick,
+                    )
                     cancelled_kalshi_ids.add(oid)
 
         if not cancelled_kalshi_ids:
@@ -221,11 +256,22 @@ class KillSwitch:
             for order in exchange_orders:
                 oid = order.get("order_id")
                 cid = order.get("client_order_id")
+                order_shard = order.get("exchange_index")
+                order_tick = order.get("ticker")
                 if not oid or oid in kalshi_ids_covered:
                     continue
                 kalshi_ids_covered.add(oid)
-                logger.warning(f"Canceling untracked exchange resting order: {oid} (client_id: {cid})")
-                tasks.append(asyncio.create_task(self.om._cancel_by_kalshi_id(oid, cid)))
+                logger.warning(f"Canceling untracked exchange resting order: {oid} (client_id: {cid}, shard: {order_shard})")
+                cancel_kwargs = {}
+                if order_shard is not None:
+                    cancel_kwargs["exchange_index"] = order_shard
+                    if order_tick:
+                        cancel_kwargs["ticker"] = order_tick
+                tasks.append(
+                    asyncio.create_task(
+                        self.om._cancel_by_kalshi_id(oid, cid, **cancel_kwargs)
+                    )
+                )
                 cids_being_cancelled.append(cid or oid)
 
         if not tasks:
