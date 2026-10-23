@@ -385,10 +385,12 @@ def is_market_active(ticker: str) -> Optional[bool]:
     return status in ("open", "active")
 
 
-def get_market_exchange_index(ticker: str) -> int:
+def get_market_exchange_index(ticker: str) -> Optional[int]:
     """
     Retrieve the exchange_index (shard) for a given market ticker.
-    Defaults to 0 (default shard) if not specified or lookup fails.
+    Returns:
+        int: Shard index (e.g. 0, 3) if confirmed by market metadata.
+        None: If market metadata lookup failed or could not be determined.
     """
     try:
         details = get_market_details(ticker)
@@ -396,8 +398,10 @@ def get_market_exchange_index(ticker: str) -> int:
             idx = details.get("exchange_index")
             if idx is not None:
                 return int(idx)
+            return 0
     except Exception as e:
         logger.debug(f"Could not resolve exchange_index for {ticker}: {e}")
-    return 0
+        return None
+    return None
 
 

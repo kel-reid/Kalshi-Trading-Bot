@@ -36,8 +36,25 @@ def test_get_market_exchange_index_fallback_on_missing_or_error():
     with patch("utils.market_api.get_market_details", return_value={"ticker": "NFL-GAME-1"}):
         assert get_market_exchange_index("NFL-GAME-1") == 0
 
+    with patch("utils.market_api.get_market_details", return_value=None):
+        assert get_market_exchange_index("FAIL-TICKER") is None
+
     with patch("utils.market_api.get_market_details", side_effect=Exception("API Error")):
-        assert get_market_exchange_index("ERR-TICKER") == 0
+        assert get_market_exchange_index("ERR-TICKER") is None
+
+
+def test_order_manager_get_ticker_exchange_index_does_not_cache_none():
+    om = OrderManager()
+    with patch("utils.market_api.get_market_details", return_value=None):
+        idx = om.get_ticker_exchange_index("NBA-FAIL")
+        assert idx is None
+        assert "NBA-FAIL" not in om._ticker_exchange_indices
+
+    # Subsequent recovery caches the verified shard
+    with patch("utils.market_api.get_market_details", return_value={"exchange_index": 3}):
+        idx = om.get_ticker_exchange_index("NBA-FAIL")
+        assert idx == 3
+        assert om._ticker_exchange_indices["NBA-FAIL"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +306,44 @@ async def test_stop_loss_hedge_success_resets_failure_counter():
 
         assert bot._consecutive_hedge_failures == 0
         assert bot.current_ask_id == "order-success-123"
+
+
+def test_kill_switch_sync_retries_failed_deletion_in_step_4():
+    om = MagicMock()
+    om.active_orders = {
+        "cid-1": {"kalshi_order_id": "kid-1", "ticker": "NBA-1", "exchange_index": 3}
+    }
+    killer = KillSwitch(om, ticker="NBA-1")
+
+    # Step 1 fails on kid-1 (returns False), Step 4 retries and succeeds (returns True)
+    delete_calls = []
+    def fake_delete(kalshi_id, client_id=None, exchange_index=None, ticker=None):
+        delete_calls.append(kalshi_id)
+        if len(delete_calls) == 1:
+            return False  # Failed on initial attempt
+        return True  # Succeeded on sweep retry
+
+    killer._delete_order_sync = MagicMock(side_effect=fake_delete)
+    killer._fetch_resting_orders_sync = MagicMock(return_value=[
+        {"order_id": "kid-1", "client_order_id": "cid-1", "ticker": "NBA-1", "exchange_index": 3}
+    ])
+
+    killer.trigger_synchronous(ticker="NBA-1")
+
+    # kid-1 must be called twice: first in step 1, then retried in step 4 because step 1 failed
+    assert killer._delete_order_sync.call_count == 2
+    assert delete_calls == ["kid-1", "kid-1"]
+
+
+@pytest.mark.asyncio
+async def test_market_maker_hedge_failure_uses_dynamic_collateral_floor():
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("NBA-GAME-1")
+        bot.om.place_order = AsyncMock(return_value=None)
+        bot.ensure_shard_collateral = AsyncMock(return_value=False)
+
+        # 50 contracts @ 60c = $30.00 notional. Floor should be $30.00 + $5.00 = $35.00
+        bot._current_quote_size = 50
+        await bot._update_quotes(new_bid=None, new_ask=60)
+
+        bot.ensure_shard_collateral.assert_awaited_once_with(min_required_dollars=35.0)

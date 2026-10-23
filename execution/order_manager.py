@@ -59,7 +59,8 @@ class OrderManager:
         try:
             from utils.market_api import get_market_exchange_index
             idx = get_market_exchange_index(ticker)
-            self._ticker_exchange_indices[ticker] = idx
+            if idx is not None:
+                self._ticker_exchange_indices[ticker] = idx
             return idx
         except Exception:
             return None
