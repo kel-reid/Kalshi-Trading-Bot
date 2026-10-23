@@ -37,6 +37,7 @@ from utils.market_api import (
     check_orderbook_has_quotes,
     fetch_eligible_markets,
     get_market_details,
+    get_market_exchange_index,
     get_raw_market_status,
 )
 from utils.market_scoring import (
@@ -84,6 +85,7 @@ __all__ = [
     "fetch_eligible_markets",
     "get_market_details",
     "get_market_details_async",
+    "get_market_exchange_index",
     "get_raw_market_status",
     "get_raw_market_status_async",
     "is_market_active",

@@ -48,6 +48,22 @@ class OrderManager:
 
         # Kalshi Rate Limit: 10 requests per second
         self.rate_limiter = RateLimiter(rate=10, per=1.0)
+        self._ticker_exchange_indices: Dict[str, int] = {}
+
+    def get_ticker_exchange_index(self, ticker: str) -> Optional[int]:
+        """Returns cached exchange_index for ticker, or queries market_api if uncached."""
+        if not ticker:
+            return None
+        if ticker in self._ticker_exchange_indices:
+            return self._ticker_exchange_indices[ticker]
+        try:
+            from utils.market_api import get_market_exchange_index
+            idx = get_market_exchange_index(ticker)
+            self._ticker_exchange_indices[ticker] = idx
+            return idx
+        except Exception:
+            return None
+
 
     def _init_db_pool(self, allow_retries: bool = True):
         """Initializes a ThreadedConnectionPool for PostgreSQL."""
@@ -122,8 +138,12 @@ class OrderManager:
                         count INTEGER,
                         status VARCHAR(255),
                         created_at TIMESTAMPTZ,
-                        updated_at TIMESTAMPTZ
+                        updated_at TIMESTAMPTZ,
+                        exchange_index INTEGER
                     )
+                ''')
+                cursor.execute('''
+                    ALTER TABLE orders ADD COLUMN IF NOT EXISTS exchange_index INTEGER
                 ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS pnl_attribution (
@@ -201,7 +221,7 @@ class OrderManager:
             rotation_session_id=rotation_session_id
         )
 
-    def _update_db_order_status(self, client_order_id: str, status: str, kalshi_order_id: str = None, order_details: dict = None):
+    def _update_db_order_status(self, client_order_id: str, status: str, kalshi_order_id: str = None, order_details: dict = None, exchange_index: int = None):
         """Updates or inserts an order record into the PostgreSQL database. Fails fast without blocking."""
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
@@ -211,25 +231,28 @@ class OrderManager:
                     cursor.execute("SELECT client_order_id FROM orders WHERE client_order_id = %s", (client_order_id,))
                     exists = cursor.fetchone()
                     
+                    eff_exchange_index = exchange_index
+                    if eff_exchange_index is None and order_details:
+                        eff_exchange_index = order_details.get("exchange_index")
+
                     if exists:
+                        updates = ["status = %s", "updated_at = %s"]
+                        params = [status, now]
                         if kalshi_order_id:
-                            cursor.execute('''
-                                UPDATE orders 
-                                SET status = %s, kalshi_order_id = %s, updated_at = %s
-                                WHERE client_order_id = %s
-                            ''', (status, kalshi_order_id, now, client_order_id))
-                        else:
-                            cursor.execute('''
-                                UPDATE orders 
-                                SET status = %s, updated_at = %s
-                                WHERE client_order_id = %s
-                            ''', (status, now, client_order_id))
+                            updates.append("kalshi_order_id = %s")
+                            params.append(kalshi_order_id)
+                        if eff_exchange_index is not None:
+                            updates.append("exchange_index = %s")
+                            params.append(eff_exchange_index)
+                        params.append(client_order_id)
+                        query = f"UPDATE orders SET {', '.join(updates)} WHERE client_order_id = %s"
+                        cursor.execute(query, tuple(params))
                     elif order_details:
                         cursor.execute('''
                             INSERT INTO orders (
                                 client_order_id, kalshi_order_id, ticker, action, side, 
-                                price, count, status, created_at, updated_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                price, count, status, created_at, updated_at, exchange_index
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ''', (
                             client_order_id, 
                             kalshi_order_id, 
@@ -240,19 +263,29 @@ class OrderManager:
                             order_details.get("count"), 
                             status, 
                             now, 
-                            now
+                            now,
+                            eff_exchange_index
                         ))
                     conn.commit()
         except Exception as e:
             logger.error(f"Failed to write order status to database (client_id: {client_order_id}, status: {status}): {e}")
 
-    async def place_order(self, ticker: str, side: str, action: str, count: int, price: Union[int, float]) -> Optional[str]:
+    async def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: Union[int, float],
+        exchange_index: Optional[int] = None,
+    ) -> Optional[str]:
         """
         Place a new order.
         side: "yes" or "no"
         action: "buy" or "sell"
         count: number of contracts
         price: limit price in cents (1-99, or sub-cent float like 32.4)
+        exchange_index: optional exchange shard index (0=default, 3=NBA/sports, etc.)
         Returns the client_order_id if successful, None otherwise.
         """
         client_order_id = str(uuid.uuid4())
@@ -278,6 +311,10 @@ class OrderManager:
         else:
             price_str = f"{price_dollars:.4f}".rstrip("0")
 
+        target_shard = exchange_index
+        if target_shard is None:
+            target_shard = self.get_ticker_exchange_index(ticker)
+
         payload = {
             "side": v2_side,
             "count": str(count),
@@ -288,6 +325,8 @@ class OrderManager:
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross"
         }
+        if target_shard is not None:
+            payload["exchange_index"] = int(target_shard)
         
         sign_path = "/trade-api/v2/portfolio/events/orders"
         
@@ -305,28 +344,38 @@ class OrderManager:
                 
                 if response is not None:
                     if response.status_code == 201:
-                        logger.info(f"Order Placed: {action} {count} {side} @ {price}c for {ticker} (ID: {client_order_id})")
+                        logger.info(f"Order Placed: {action} {count} {side} @ {price}c for {ticker} (ID: {client_order_id}, shard: {target_shard})")
                         ORDERS_PLACED_TOTAL.labels(ticker=ticker, action=action, side=side).inc()
                         
                         resp_json = response.json() if callable(getattr(response, "json", None)) else {}
                         # Kalshi V2 events/orders returns root order_id; fallback to legacy/mocked {"order": {"order_id": ...}}
                         kalshi_order_id = resp_json.get("order_id") or resp_json.get("order", {}).get("order_id")
-                        
-                        self.active_orders[client_order_id] = {
+                        confirmed_shard = resp_json.get("exchange_index")
+                        if confirmed_shard is None:
+                            confirmed_shard = resp_json.get("order", {}).get("exchange_index")
+                        if confirmed_shard is None:
+                            confirmed_shard = target_shard
+
+                        order_record = {
                             "ticker": ticker,
                             "side": side,
                             "action": action,
                             "count": count,
                             "price": price,
-                            "kalshi_order_id": kalshi_order_id
+                            "kalshi_order_id": kalshi_order_id,
+                            "exchange_index": confirmed_shard,
                         }
+                        self.active_orders[client_order_id] = order_record
+                        if confirmed_shard is not None and ticker:
+                            self._ticker_exchange_indices[ticker] = int(confirmed_shard)
                         
                         # Persist to database
                         self._update_db_order_status(
                             client_order_id, 
                             "resting", 
                             kalshi_order_id=kalshi_order_id,
-                            order_details=self.active_orders[client_order_id]
+                            order_details=order_record,
+                            exchange_index=confirmed_shard,
                         )
                         
                         return client_order_id
@@ -367,6 +416,17 @@ class OrderManager:
             
         sign_path = f"/trade-api/v2/portfolio/events/orders/{order_id}"
         
+        shard_idx = (order_to_cancel or {}).get("exchange_index")
+        order_ticker = (order_to_cancel or {}).get("ticker")
+        if shard_idx is None and order_ticker:
+            shard_idx = self.get_ticker_exchange_index(order_ticker)
+
+        params = {}
+        if shard_idx is not None:
+            params["exchange_index"] = shard_idx
+        if order_ticker:
+            params["ticker"] = order_ticker
+
         max_retries = 3
         base_delay = 1.0
         
@@ -374,35 +434,63 @@ class OrderManager:
             # 1. Wait for token to enforce overall rate limit
             await self.rate_limiter.acquire()
             
-            response = await asyncio.to_thread(self._delete_request, sign_path)
+            response = await asyncio.to_thread(self._delete_request, sign_path, params if params else None)
             
             if response is not None:
                 if response.status_code in [200, 204]:
-                    logger.info(f"Order Cancelled: {client_order_id} (kalshi_id: {order_id})")
+                    logger.info(f"Order Cancelled: {client_order_id} (kalshi_id: {order_id}, shard: {shard_idx})")
                     self.active_orders.pop(client_order_id, None)
                     self._update_db_order_status(client_order_id, "cancelled")
                     return True
                 elif response.status_code == 404:
-                    if order_to_cancel and order_to_cancel.get("kalshi_order_id"):
-                        # We had an authentic kalshi_order_id; 404 confirms it is already cleared from the exchange
-                        logger.info(f"Order {client_order_id} ({order_id}) not found on server (may be filled/cancelled already).")
+                    # Never assume 404 means the order is already cleared without empirical verification!
+                    logger.warning(
+                        f"DELETE 404 for order {client_order_id} ({order_id}, shard={shard_idx}); "
+                        f"verifying ground-truth order status..."
+                    )
+                    order_status = await self.get_order_status(order_id)
+                    if order_status is not None:
+                        status_str = str(order_status.get("status", "")).lower()
+                        rem_count = float(
+                            order_status.get("remaining_count")
+                            or order_status.get("remaining_count_fp")
+                            or 0
+                        )
+                        if status_str == "resting" or rem_count > 0:
+                            logger.error(
+                                f"DELETE returned 404 for order {client_order_id} ({order_id}), but exchange status "
+                                f"confirms order is STILL ACTIVE (status={status_str}, rem={rem_count})! "
+                                f"Retaining active order tracking and attempting resting order reconciliation."
+                            )
+                            recon = await self.reconcile_resting_orders(
+                                ticker=order_ticker,
+                                target_client_order_id=client_order_id,
+                            )
+                            if recon is not None and recon > 0:
+                                self.active_orders.pop(client_order_id, None)
+                                self._update_db_order_status(client_order_id, "reconciled_after_404")
+                                return True
+                            return False
+                        elif status_str in ("canceled", "cancelled", "executed"):
+                            logger.info(
+                                f"Order {client_order_id} ({order_id}) verified cleared on exchange (status={status_str})."
+                            )
+                            self.active_orders.pop(client_order_id, None)
+                            self._update_db_order_status(client_order_id, f"verified_{status_str}")
+                            return True
+
+                    # Fallback reconciliation if order status was None
+                    recon_result = await self.reconcile_resting_orders(
+                        ticker=order_ticker,
+                        target_client_order_id=client_order_id,
+                    )
+                    if recon_result is not None:
                         self.active_orders.pop(client_order_id, None)
-                        self._update_db_order_status(client_order_id, "cancelled_or_filled_404")
+                        self._update_db_order_status(client_order_id, "reconciled_after_404")
                         return True
                     else:
-                        # We lacked a verified kalshi_order_id; 404 indicates Kalshi rejected client_order_id.
-                        logger.warning(f"DELETE 404 for unverified order {order_id}; reconciling resting orders...")
-                        recon_result = await self.reconcile_resting_orders(
-                            ticker=(order_to_cancel or {}).get("ticker"),
-                            target_client_order_id=client_order_id,
-                        )
-                        if recon_result is not None:
-                            self.active_orders.pop(client_order_id, None)
-                            self._update_db_order_status(client_order_id, "reconciled_after_404")
-                            return True
-                        else:
-                            logger.error(f"Failed to verify/reconcile unverified order {client_order_id} after 404.")
-                            return False
+                        logger.error(f"Failed to verify/reconcile order {client_order_id} after 404.")
+                        return False
                 elif response.status_code == 429:
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -446,7 +534,7 @@ class OrderManager:
             logger.error(f"POST Request Exception: {e}\n{traceback.format_exc()}")
             return None
 
-    def _delete_request(self, sign_path: str) -> Optional[requests.Response]:
+    def _delete_request(self, sign_path: str, params: Optional[dict] = None) -> Optional[requests.Response]:
         """Synchronous wrapper for DELETE requests"""
         try:
             headers = get_auth_headers(method="DELETE", sign_path=sign_path)
@@ -454,6 +542,7 @@ class OrderManager:
                 return requests.delete(
                     BASE_URL + sign_path,
                     headers=headers,
+                    params=params,
                     timeout=10,
                     verify=certifi.where()
                 )
@@ -461,23 +550,35 @@ class OrderManager:
             logger.error(f"DELETE Request Exception: {e}")
             return None
 
-    async def _cancel_by_kalshi_id(self, order_id: str, client_order_id: Optional[str]) -> bool:
-        """Helper method to cancel an order directly by Kalshi order ID (used during recovery)."""
+    async def _cancel_by_kalshi_id(
+        self,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+        exchange_index: Optional[int] = None,
+        ticker: Optional[str] = None,
+    ) -> bool:
+        """Helper method to cancel an order directly by Kalshi order ID (used during recovery/reconciliation)."""
         cancel_path = f"/trade-api/v2/portfolio/events/orders/{order_id}"
         max_retries = 3
         base_delay = 1.0
 
+        params = {}
+        if exchange_index is not None:
+            params["exchange_index"] = exchange_index
+        if ticker:
+            params["ticker"] = ticker
+
         for attempt in range(max_retries + 1):
             await self.rate_limiter.acquire()
-            resp = await asyncio.to_thread(self._delete_request, cancel_path)
+            resp = await asyncio.to_thread(self._delete_request, cancel_path, params if params else None)
             if resp is not None:
                 if resp.status_code in [200, 204]:
-                    logger.info(f"Successfully cancelled orphaned order {cancel_path}")
+                    logger.info(f"Successfully cancelled orphaned order {cancel_path} (shard={exchange_index})")
                     if client_order_id:
                         self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
                     return True
                 elif resp.status_code == 404:
-                    logger.info(f"Orphaned order {cancel_path} already cleared on exchange (404).")
+                    logger.info(f"Orphaned order {cancel_path} confirmed cleared on exchange (404).")
                     if client_order_id:
                         self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
                     return True
@@ -660,6 +761,7 @@ class OrderManager:
         self,
         ticker: Optional[str] = None,
         target_client_order_id: Optional[str] = None,
+        exchange_index: Optional[int] = None,
     ) -> Optional[int]:
         """
         Actively queries Kalshi for all resting orders on the exchange.
@@ -684,9 +786,12 @@ class OrderManager:
                 oid = order.get("order_id")
                 cid = order.get("client_order_id")
                 order_ticker = order.get("ticker")
+                order_shard = order.get("exchange_index")
                 if not oid:
                     continue
                 if ticker and order_ticker != ticker:
+                    continue
+                if exchange_index is not None and order_shard is not None and order_shard != exchange_index:
                     continue
                 
                 is_target = bool(target_client_order_id and cid == target_client_order_id)
@@ -699,9 +804,16 @@ class OrderManager:
                 if is_target or is_orphan:
                     logger.warning(
                         f"Reconciling {'target' if is_target else 'orphaned'} resting order on exchange: {oid} "
-                        f"(client_id: {cid}, ticker: {order_ticker})"
+                        f"(client_id: {cid}, ticker: {order_ticker}, shard: {order_shard})"
                     )
-                    cancel_tasks.append(self._cancel_by_kalshi_id(oid, cid))
+                    cancel_kwargs = {}
+                    if order_shard is not None:
+                        cancel_kwargs["exchange_index"] = order_shard
+                        if order_ticker:
+                            cancel_kwargs["ticker"] = order_ticker
+                    cancel_tasks.append(
+                        self._cancel_by_kalshi_id(oid, cid, **cancel_kwargs)
+                    )
                     cancelled_count += 1
                     
             if cancel_tasks:
@@ -733,10 +845,22 @@ class OrderManager:
                 for order in orders_list:
                     order_id = order.get("order_id")
                     client_order_id = order.get("client_order_id")
-                    logger.info(f"Preparing to cancel orphaned order: {order_id} (Client ID: {client_order_id})")
+                    order_ticker = order.get("ticker")
+                    order_shard = order.get("exchange_index")
+                    logger.info(
+                        f"Preparing to cancel orphaned order: {order_id} "
+                        f"(Client ID: {client_order_id}, ticker: {order_ticker}, shard: {order_shard})"
+                    )
                     
-                    # We can use the REST API directly to cancel by Kalshi order_id to be safe
-                    cancel_tasks.append(self._cancel_by_kalshi_id(order_id, client_order_id))
+                    # Pass verified exchange_index and ticker to route to correct shard
+                    cancel_tasks.append(
+                        self._cancel_by_kalshi_id(
+                            order_id,
+                            client_order_id,
+                            exchange_index=order_shard,
+                            ticker=order_ticker
+                        )
+                    )
                     
                 if cancel_tasks:
                     logger.info(f"Executing {len(cancel_tasks)} cancellation tasks...")
@@ -797,3 +921,104 @@ class OrderManager:
         except Exception as e:
             import traceback
             logger.error(f"Exception during state recovery: {e}\n{traceback.format_exc()}")
+
+    def cancel_all_orders_sync(
+        self,
+        exchange_index: Optional[int] = None,
+        ticker: Optional[str] = None,
+    ) -> bool:
+        """
+        Executes Kalshi portfolio-level bulk order cancellation across an exchange shard or portfolio.
+        """
+        sign_path = "/trade-api/v2/portfolio/events/orders"
+        params = {}
+        if exchange_index is not None:
+            params["exchange_index"] = int(exchange_index)
+        if ticker:
+            params["ticker"] = ticker
+        resp = self._delete_request(sign_path, params=params if params else None)
+        if resp is not None and resp.status_code in (200, 204):
+            logger.info(f"Successfully bulk cancelled orders (exchange_index={exchange_index}, ticker={ticker})")
+            return True
+        logger.warning(f"Bulk order cancellation response: {resp.status_code if resp else 'None'}")
+        return False
+
+    def get_portfolio_balances(self) -> Dict[str, Any]:
+        """
+        Queries portfolio balance breakdown across all exchange shards.
+        Returns dict containing total balance and per-shard balances:
+        {
+            "total_balance_dollars": float,
+            "shard_balances": {0: float, 1: float, 2: float, 3: float, ...}
+        }
+        """
+        sign_path = "/trade-api/v2/portfolio/balance"
+        headers = get_auth_headers(method="GET", sign_path=sign_path)
+        try:
+            resp = requests.get(
+                BASE_URL + sign_path,
+                headers=headers,
+                timeout=10,
+                verify=certifi.where()
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                shards: Dict[int, float] = {}
+                for b in data.get("balance_breakdown", []):
+                    idx = b.get("exchange_index")
+                    if idx is not None:
+                        shards[int(idx)] = float(b.get("balance", 0.0))
+                total_dollars = float(data.get("balance_dollars") or (data.get("balance", 0) / 100.0))
+                return {
+                    "total_balance_dollars": total_dollars,
+                    "shard_balances": shards
+                }
+            logger.error(f"Failed to fetch portfolio balances: {resp.status_code} - {resp.text}")
+            return {"total_balance_dollars": 0.0, "shard_balances": {}}
+        except Exception as e:
+            logger.error(f"Exception fetching portfolio balances: {e}")
+            return {"total_balance_dollars": 0.0, "shard_balances": {}}
+
+    def transfer_intra_exchange(
+        self,
+        source_shard: int,
+        destination_shard: int,
+        amount_dollars: float,
+        source_subaccount: int = 0,
+        destination_subaccount: int = 0,
+    ) -> bool:
+        """
+        Transfers funds between exchange shards via Kalshi intra-exchange transfer API.
+        Amount is specified in dollars (converted to cents integer).
+        """
+        amount_cents = int(round(amount_dollars * 100))
+        if amount_cents <= 0:
+            logger.warning(f"Invalid transfer amount: {amount_dollars} (cents: {amount_cents})")
+            return False
+            
+        sign_path = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
+        payload = {
+            "amount": amount_cents,
+            "client_transfer_id": str(uuid.uuid4()),
+            "source_exchange_shard": int(source_shard),
+            "destination_exchange_shard": int(destination_shard),
+            "source_subaccount": int(source_subaccount),
+            "destination_subaccount": int(destination_subaccount),
+        }
+        
+        logger.info(
+            f"Executing intra-exchange transfer: ${amount_dollars:.2f} ({amount_cents}c) "
+            f"from Shard {source_shard} -> Shard {destination_shard}"
+        )
+        resp = self._post_request(sign_path, payload)
+        if resp is not None and resp.status_code in (200, 201):
+            logger.info(
+                f"Successfully transferred ${amount_dollars:.2f} from Shard {source_shard} to Shard {destination_shard}"
+            )
+            return True
+        logger.error(
+            f"Failed intra-exchange transfer from Shard {source_shard} to Shard {destination_shard}: "
+            f"{resp.status_code if resp else 'No response'} - {resp.text if resp else ''}"
+        )
+        return False
+

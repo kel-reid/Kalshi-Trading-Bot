@@ -384,3 +384,20 @@ def is_market_active(ticker: str) -> Optional[bool]:
         return None
     return status in ("open", "active")
 
+
+def get_market_exchange_index(ticker: str) -> int:
+    """
+    Retrieve the exchange_index (shard) for a given market ticker.
+    Defaults to 0 (default shard) if not specified or lookup fails.
+    """
+    try:
+        details = get_market_details(ticker)
+        if details and isinstance(details, dict):
+            idx = details.get("exchange_index")
+            if idx is not None:
+                return int(idx)
+    except Exception as e:
+        logger.debug(f"Could not resolve exchange_index for {ticker}: {e}")
+    return 0
+
+
