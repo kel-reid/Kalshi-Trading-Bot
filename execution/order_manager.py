@@ -314,7 +314,7 @@ class OrderManager:
 
         target_shard = exchange_index
         if target_shard is None:
-            target_shard = self.get_ticker_exchange_index(ticker)
+            target_shard = await asyncio.to_thread(self.get_ticker_exchange_index, ticker)
 
         payload = {
             "side": v2_side,
@@ -420,13 +420,14 @@ class OrderManager:
         shard_idx = (order_to_cancel or {}).get("exchange_index")
         order_ticker = (order_to_cancel or {}).get("ticker")
         if shard_idx is None and order_ticker:
-            shard_idx = self.get_ticker_exchange_index(order_ticker)
+            shard_idx = await asyncio.to_thread(self.get_ticker_exchange_index, order_ticker)
 
         params = {}
         if shard_idx is not None:
             params["exchange_index"] = shard_idx
         if order_ticker:
             params["ticker"] = order_ticker
+            params["market_ticker"] = order_ticker
 
         max_retries = 3
         base_delay = 1.0
@@ -568,6 +569,7 @@ class OrderManager:
             params["exchange_index"] = exchange_index
         if ticker:
             params["ticker"] = ticker
+            params["market_ticker"] = ticker
 
         for attempt in range(max_retries + 1):
             await self.rate_limiter.acquire()
@@ -786,8 +788,10 @@ class OrderManager:
             for order in orders_list:
                 oid = order.get("order_id")
                 cid = order.get("client_order_id")
-                order_ticker = order.get("ticker")
+                order_ticker = order.get("ticker") or ticker
                 order_shard = order.get("exchange_index")
+                if order_shard is None:
+                    order_shard = exchange_index
                 if not oid:
                     continue
                 if ticker and order_ticker != ticker:
@@ -937,6 +941,7 @@ class OrderManager:
             params["exchange_index"] = int(exchange_index)
         if ticker:
             params["ticker"] = ticker
+            params["market_ticker"] = ticker
         resp = self._delete_request(sign_path, params=params if params else None)
         if resp is not None and resp.status_code in (200, 204):
             logger.info(f"Successfully bulk cancelled orders (exchange_index={exchange_index}, ticker={ticker})")
@@ -990,16 +995,16 @@ class OrderManager:
     ) -> bool:
         """
         Transfers funds between exchange shards via Kalshi intra-exchange transfer API.
-        Amount is specified in dollars (converted to cents integer).
+        Amount is specified in dollars (converted to centicents integer, 10,000 per dollar).
         """
-        amount_cents = int(round(amount_dollars * 100))
-        if amount_cents <= 0:
-            logger.warning(f"Invalid transfer amount: {amount_dollars} (cents: {amount_cents})")
+        amount_centicents = int(round(amount_dollars * 10000))
+        if amount_centicents <= 0:
+            logger.warning(f"Invalid transfer amount: {amount_dollars} (centicents: {amount_centicents})")
             return False
             
         sign_path = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
         payload = {
-            "amount": amount_cents,
+            "amount": amount_centicents,
             "client_transfer_id": str(uuid.uuid4()),
             "source_exchange_shard": int(source_shard),
             "destination_exchange_shard": int(destination_shard),
@@ -1008,7 +1013,7 @@ class OrderManager:
         }
         
         logger.info(
-            f"Executing intra-exchange transfer: ${amount_dollars:.2f} ({amount_cents}c) "
+            f"Executing intra-exchange transfer: ${amount_dollars:.2f} ({amount_centicents} centicents) "
             f"from Shard {source_shard} -> Shard {destination_shard}"
         )
         resp = self._post_request(sign_path, payload)

@@ -273,7 +273,7 @@ class AvellanedaStoikovBot:
         initiates an intra-exchange instance transfer from Shard 0 (main balance).
         """
         if getattr(self, "exchange_index", None) is None:
-            self.exchange_index = get_market_exchange_index(self.ticker)
+            self.exchange_index = await asyncio.to_thread(get_market_exchange_index, self.ticker)
 
         target_shard = getattr(self, "exchange_index", None)
         if target_shard is None:
@@ -391,7 +391,7 @@ class AvellanedaStoikovBot:
         
         # 3a. Ensure exchange shard collateral before quoting starts
         if getattr(self, "exchange_index", None) is None:
-            self.exchange_index = get_market_exchange_index(self.ticker)
+            self.exchange_index = await asyncio.to_thread(get_market_exchange_index, self.ticker)
         await self.ensure_shard_collateral()
 
         # 3b. Launch the periodic reconciliation background task
@@ -1549,7 +1549,7 @@ class AvellanedaStoikovBot:
 
         # 3. Update target ticker and reset state trackers
         self.ticker = new_ticker
-        self.exchange_index = get_market_exchange_index(new_ticker)
+        self.exchange_index = await asyncio.to_thread(get_market_exchange_index, new_ticker)
         self._consecutive_hedge_failures = 0
         self._starvation_start_time = None
         self._starvation_alert_sent = False

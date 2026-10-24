@@ -62,6 +62,7 @@ class KillSwitch:
             params["exchange_index"] = int(exchange_index)
         if ticker:
             params["ticker"] = ticker
+            params["market_ticker"] = ticker
         try:
             headers = get_auth_headers(method="DELETE", sign_path=sign_path)
             resp = requests.delete(
