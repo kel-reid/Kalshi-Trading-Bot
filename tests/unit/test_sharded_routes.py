@@ -123,7 +123,7 @@ async def test_order_manager_cancel_order_sends_shard_query_params():
     success = await om.cancel_order("client-1")
     assert success is True
     assert "client-1" not in om.active_orders
-    assert captured_delete_params == {"exchange_index": 3, "ticker": "KXNBAGAME-TEST"}
+    assert captured_delete_params == {"exchange_index": 3, "ticker": "KXNBAGAME-TEST", "market_ticker": "KXNBAGAME-TEST"}
 
 
 @pytest.mark.asyncio
@@ -220,10 +220,35 @@ def test_order_manager_transfer_intra_exchange_execution():
     )
 
     assert success is True
-    assert captured_payload["amount"] == 1500  # Cents integer
+    assert captured_payload["amount"] == 150000  # Centicents integer (10,000 per dollar)
     assert captured_payload["source_exchange_shard"] == 0
     assert captured_payload["destination_exchange_shard"] == 3
     assert "client_transfer_id" in captured_payload
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resting_orders_propagates_fallback_shard_and_tickers():
+    om = OrderManager()
+    captured_cancel_kwargs = {}
+
+    async def fake_cancel(kalshi_id, client_id=None, **kwargs):
+        nonlocal captured_cancel_kwargs
+        captured_cancel_kwargs = kwargs
+        return True
+
+    om._cancel_by_kalshi_id = fake_cancel
+
+    # Exchange order returned without exchange_index in dictionary
+    with patch.object(om, "fetch_resting_orders_sync", return_value=[
+        {"order_id": "oid-untracked", "client_order_id": "cid-orphan", "ticker": "NBA-TEST"}
+    ]):
+        res = await om.reconcile_resting_orders(
+            ticker="NBA-TEST",
+            exchange_index=3
+        )
+        assert res == 1
+        assert captured_cancel_kwargs.get("exchange_index") == 3
+        assert captured_cancel_kwargs.get("ticker") == "NBA-TEST"
 
 
 # ---------------------------------------------------------------------------
