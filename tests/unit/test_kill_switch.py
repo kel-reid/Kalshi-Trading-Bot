@@ -128,7 +128,7 @@ def test_kill_switch_sync_retains_order_when_reconciliation_fails(mock_order_man
         mock_del.assert_not_called()
 
 
-def test_kill_switch_sync_verified_404_pops_order(mock_order_manager):
+def test_kill_switch_sync_404_retains_order_for_sweep(mock_order_manager):
     cid = "client-uuid-5"
     kid = "kalshi-exchange-id-5"
     mock_order_manager.active_orders[cid] = {
@@ -144,8 +144,8 @@ def test_kill_switch_sync_verified_404_pops_order(mock_order_manager):
          patch("execution.kill_switch.get_auth_headers", return_value={"test": "header"}):
         killer.trigger_synchronous()
 
-        # 404 on verified exchange order ID confirms it's closed/filled
-        assert cid not in mock_order_manager.active_orders
+        # 404 on sync DELETE is unverified; tracking must be retained for step 4 sweep retry
+        assert cid in mock_order_manager.active_orders
 
 
 def test_kill_switch_fetch_resting_orders_sync_success():

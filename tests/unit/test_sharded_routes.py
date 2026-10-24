@@ -179,6 +179,22 @@ async def test_order_manager_cancel_order_404_clears_tracking_if_confirmed_close
     assert "client-1" not in om.active_orders
 
 
+@pytest.mark.asyncio
+async def test_cancel_by_kalshi_id_verifies_terminal_status_on_404():
+    om = OrderManager()
+    om._delete_request = MagicMock(return_value=MockResponse({"error": "not found"}, 404))
+
+    # Case A: status confirms order is still resting -> return False
+    om.get_order_status = AsyncMock(return_value={"status": "resting", "remaining_count": 5})
+    res_resting = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_resting is False
+
+    # Case B: status confirms order is canceled -> return True
+    om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0})
+    res_canceled = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_canceled is True
+
+
 # ---------------------------------------------------------------------------
 # 4. Intra-Exchange Balance and Transfer
 # ---------------------------------------------------------------------------
@@ -270,20 +286,37 @@ async def test_market_maker_ensure_shard_collateral_shard3_rebalance_trigger():
         bot = AvellanedaStoikovBot("NBA-GAME-1")
         assert bot.exchange_index == 3
 
-        # Shard 3 has $5.00, Shard 0 has $25.00 -> needs $10.00 transfer
+        # Shard 3 has $5.00 initially (needs $10.00 transfer), then reports $15.00 on verification poll
+        bot.om.get_portfolio_balances = MagicMock(side_effect=[
+            {"total_balance_dollars": 30.0, "shard_balances": {0: 25.0, 3: 5.0}},
+            {"total_balance_dollars": 30.0, "shard_balances": {0: 15.0, 3: 15.0}},
+        ])
+        bot.om.transfer_intra_exchange = MagicMock(return_value=True)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+            assert res is True
+            bot.om.transfer_intra_exchange.assert_called_once_with(
+                source_shard=0,
+                destination_shard=3,
+                amount_dollars=10.0,
+            )
+
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_shard3_settlement_timeout():
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("NBA-GAME-1")
+        # Shard 3 remains underfunded across all verification poll attempts
         bot.om.get_portfolio_balances = MagicMock(return_value={
             "total_balance_dollars": 30.0,
             "shard_balances": {0: 25.0, 3: 5.0}
         })
         bot.om.transfer_intra_exchange = MagicMock(return_value=True)
 
-        res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
-        assert res is True
-        bot.om.transfer_intra_exchange.assert_called_once_with(
-            source_shard=0,
-            destination_shard=3,
-            amount_dollars=10.0,
-        )
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+            assert res is False
 
 
 # ---------------------------------------------------------------------------

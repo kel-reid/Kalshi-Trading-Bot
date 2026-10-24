@@ -78,10 +78,11 @@ class KillSwitch:
                     self.om.active_orders.pop(client_order_id, None)
                 return True
             elif resp.status_code == 404:
-                logger.info(f"Order {ref} ({kalshi_order_id}) returned 404 on exchange delete.")
-                if client_order_id:
-                    self.om.active_orders.pop(client_order_id, None)
-                return True
+                logger.warning(
+                    f"Order {ref} ({kalshi_order_id}) returned 404 on shard {exchange_index}. "
+                    f"Not confirmed cancelled; retaining for sweep retry."
+                )
+                return False
             else:
                 logger.error(f"Failed to kill {ref}: {resp.status_code} - {resp.text}")
                 return False

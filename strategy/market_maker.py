@@ -328,9 +328,25 @@ class AvellanedaStoikovBot:
             if transfer_ok:
                 self._last_shard_rebalance_time = time.time()
                 logger.info(
-                    f"Successfully funded Shard {target_shard} with ${transfer_amount:.2f} from Shard 0."
+                    f"Accepted transfer of ${transfer_amount:.2f} to Shard {target_shard} from Shard 0; "
+                    f"awaiting settlement..."
                 )
-                return True
+                for attempt in range(6):
+                    await asyncio.sleep(2.0)
+                    balances = await asyncio.to_thread(self.om.get_portfolio_balances)
+                    shard_balances = balances.get("shard_balances", {})
+                    current_shard_balance = float(shard_balances.get(target_shard, 0.0))
+                    if current_shard_balance >= min_required_dollars:
+                        logger.info(
+                            f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
+                            f"(attempt {attempt + 1}/6)."
+                        )
+                        return True
+                logger.error(
+                    f"Shard {target_shard} balance (${current_shard_balance:.2f}) not funded with required "
+                    f"${min_required_dollars:.2f} after transfer acceptance."
+                )
+                return False
             else:
                 logger.error(f"Failed to fund Shard {target_shard} from Shard 0.")
                 return False

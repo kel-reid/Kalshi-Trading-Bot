@@ -581,7 +581,16 @@ class OrderManager:
                         self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
                     return True
                 elif resp.status_code == 404:
-                    logger.info(f"Orphaned order {cancel_path} confirmed cleared on exchange (404).")
+                    status_info = await self.get_order_status(order_id)
+                    remaining = (status_info or {}).get("remaining_count", 0)
+                    ord_status = (status_info or {}).get("status")
+                    if ord_status == "resting" or remaining > 0:
+                        logger.error(
+                            f"Orphaned order {cancel_path} returned 404 on DELETE, but status confirms "
+                            f"it is still RESTING (status={ord_status}, remaining={remaining}). Not confirmed cleared!"
+                        )
+                        return False
+                    logger.info(f"Orphaned order {cancel_path} confirmed cleared on exchange (404, status={ord_status}).")
                     if client_order_id:
                         self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
                     return True
@@ -946,7 +955,7 @@ class OrderManager:
         if resp is not None and resp.status_code in (200, 204):
             logger.info(f"Successfully bulk cancelled orders (exchange_index={exchange_index}, ticker={ticker})")
             return True
-        logger.warning(f"Bulk order cancellation response: {resp.status_code if resp else 'None'}")
+        logger.warning(f"Bulk order cancellation response: {resp.status_code if resp is not None else 'None'}")
         return False
 
     def get_portfolio_balances(self) -> Dict[str, Any]:
@@ -1024,7 +1033,7 @@ class OrderManager:
             return True
         logger.error(
             f"Failed intra-exchange transfer from Shard {source_shard} to Shard {destination_shard}: "
-            f"{resp.status_code if resp else 'No response'} - {resp.text if resp else ''}"
+            f"{resp.status_code if resp is not None else 'No response'} - {resp.text if resp is not None else ''}"
         )
         return False
 
