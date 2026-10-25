@@ -226,10 +226,9 @@ class AvellanedaStoikovBot:
             if momentum_gamma_factor is not None
             else MOMENTUM_GAMMA_FACTOR
         )
-        self.max_gamma_multiplier = (
-            max(1.0, float(max_gamma_multiplier))
-            if max_gamma_multiplier is not None
-            else MAX_GAMMA_MULTIPLIER
+        self.max_gamma_multiplier = max(
+            1.0,
+            float(max_gamma_multiplier) if max_gamma_multiplier is not None else float(MAX_GAMMA_MULTIPLIER),
         )
 
         # Automated inter-shard capital sweep
