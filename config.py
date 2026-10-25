@@ -97,7 +97,7 @@ LOW_PRICE_THRESHOLD_CENTS = _get_int_env("LOW_PRICE_THRESHOLD_CENTS", 25, allow_
 # Increases inventory penalty gamma during multi-possession runs and adverse price drift
 MOMENTUM_SKEW_ENABLED = os.getenv("MOMENTUM_SKEW_ENABLED", "false").lower() in ("true", "1", "yes")
 MOMENTUM_GAMMA_FACTOR = _get_float_env("MOMENTUM_GAMMA_FACTOR", 0.5, allow_zero=True)
-MAX_GAMMA_MULTIPLIER = _get_float_env("MAX_GAMMA_MULTIPLIER", 2.5)
+MAX_GAMMA_MULTIPLIER = max(1.0, _get_float_env("MAX_GAMMA_MULTIPLIER", 2.5))
 
 # Automated Inter-Shard Capital Sweep
 # Automatically sweeps idle capital from Shard 0 (default clearing pool) to active sports shard (Shard 3)

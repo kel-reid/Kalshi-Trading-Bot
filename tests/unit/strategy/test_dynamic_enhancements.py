@@ -130,3 +130,31 @@ async def test_auto_sweep_shard0_idle_capital():
         destination_shard=3,
         amount_dollars=8.50,
     )
+
+
+def test_max_gamma_multiplier_lower_bound_clamping(monkeypatch):
+    """
+    Verify that max_gamma_multiplier enforces a minimum lower bound of 1.0
+    both when passed explicitly and when defaulting to MAX_GAMMA_MULTIPLIER.
+    """
+    # 1. Explicit override < 1.0 clamped to 1.0
+    bot_explicit = AvellanedaStoikovBot(
+        ticker="KXNBAGAME-26OCT25TORMIN-MIN",
+        max_gamma_multiplier=0.5,
+    )
+    assert bot_explicit.max_gamma_multiplier == 1.0
+
+    # 2. Config fallback with environment < 1.0 clamped to 1.0
+    monkeypatch.setattr("strategy.market_maker.MAX_GAMMA_MULTIPLIER", 0.75)
+    bot_fallback = AvellanedaStoikovBot(
+        ticker="KXNBAGAME-26OCT25TORMIN-MIN",
+        max_gamma_multiplier=None,
+    )
+    assert bot_fallback.max_gamma_multiplier == 1.0
+
+    # 3. Valid multiplier >= 1.0 preserved
+    bot_valid = AvellanedaStoikovBot(
+        ticker="KXNBAGAME-26OCT25TORMIN-MIN",
+        max_gamma_multiplier=3.0,
+    )
+    assert bot_valid.max_gamma_multiplier == 3.0
