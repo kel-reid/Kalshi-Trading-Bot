@@ -184,15 +184,35 @@ async def test_cancel_by_kalshi_id_verifies_terminal_status_on_404():
     om = OrderManager()
     om._delete_request = MagicMock(return_value=MockResponse({"error": "not found"}, 404))
 
-    # Case A: status confirms order is still resting -> return False
+    # Case A: status lookup failed (returns None) -> return False (fail closed)
+    om.get_order_status = AsyncMock(return_value=None)
+    res_none = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_none is False
+
+    # Case B: status confirms order is still resting -> return False
     om.get_order_status = AsyncMock(return_value={"status": "resting", "remaining_count": 5})
     res_resting = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
     assert res_resting is False
 
-    # Case B: status confirms order is canceled -> return True
-    om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0})
+    # Case C: unknown / unverified status (e.g. "pending") -> return False
+    om.get_order_status = AsyncMock(return_value={"status": "pending", "remaining_count": 0})
+    res_unknown = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_unknown is False
+
+    # Case D: status is canceled but subpenny remaining_count_fp is non-zero -> return False
+    om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0, "remaining_count_fp": "0.5"})
+    res_fp = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_fp is False
+
+    # Case E: status confirms order is canceled and zero remaining -> return True
+    om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0, "remaining_count_fp": "0.0"})
     res_canceled = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
     assert res_canceled is True
+
+    # Case F: status confirms order is executed and zero remaining -> return True
+    om.get_order_status = AsyncMock(return_value={"status": "executed", "remaining_count": 0})
+    res_executed = await om._cancel_by_kalshi_id("kalshi-123", "client-1", exchange_index=3, ticker="NBA-1")
+    assert res_executed is True
 
 
 # ---------------------------------------------------------------------------
