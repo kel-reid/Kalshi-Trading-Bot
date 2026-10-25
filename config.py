@@ -87,6 +87,23 @@ ORDER_SIZE = int(os.getenv("ORDER_SIZE", "1"))
 ORDER_DOLLARS = max(1.0, _get_float_env("ORDER_DOLLARS", 3.0))
 MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
+
+# Collateral-Constrained Sizing Ceiling on Low-Price Contracts
+# Prevents excessive contract sizing on low-price contracts (< 25c) where short leg requires heavy NO collateral
+MAX_LOW_PRICE_CONTRACTS = _get_int_env("MAX_LOW_PRICE_CONTRACTS", 0, allow_zero=True)
+LOW_PRICE_THRESHOLD_CENTS = _get_int_env("LOW_PRICE_THRESHOLD_CENTS", 25, allow_zero=True)
+
+# Aggressive Momentum Quote Skewing
+# Increases inventory penalty gamma during multi-possession runs and adverse price drift
+MOMENTUM_SKEW_ENABLED = os.getenv("MOMENTUM_SKEW_ENABLED", "false").lower() in ("true", "1", "yes")
+MOMENTUM_GAMMA_FACTOR = _get_float_env("MOMENTUM_GAMMA_FACTOR", 0.5, allow_zero=True)
+MAX_GAMMA_MULTIPLIER = max(1.0, _get_float_env("MAX_GAMMA_MULTIPLIER", 2.5))
+
+# Automated Inter-Shard Capital Sweep
+# Automatically sweeps idle capital from Shard 0 (default clearing pool) to active sports shard (Shard 3)
+AUTO_SWEEP_SHARD0_ENABLED = os.getenv("AUTO_SWEEP_SHARD0_ENABLED", "true").lower() in ("true", "1", "yes")
+SHARD0_RESERVE_DOLLARS = _get_float_env("SHARD0_RESERVE_DOLLARS", 1.0, allow_zero=True)
+
 _raw_target = os.getenv("TARGET_TICKER") or os.getenv("TARGET_PREFERENCE") or ""
 TARGET_TICKER = _raw_target  # Can be injected to force a specific market or league
 TARGET_PREFERENCE = _raw_target
