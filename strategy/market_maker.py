@@ -64,6 +64,13 @@ from config import (
     MAX_DYNAMIC_SPREAD_CENTS,
     VOLATILITY_WINDOW_SECONDS,
     KALSHI_FEE_RATE,
+    MAX_LOW_PRICE_CONTRACTS,
+    LOW_PRICE_THRESHOLD_CENTS,
+    MOMENTUM_SKEW_ENABLED,
+    MOMENTUM_GAMMA_FACTOR,
+    MAX_GAMMA_MULTIPLIER,
+    AUTO_SWEEP_SHARD0_ENABLED,
+    SHARD0_RESERVE_DOLLARS,
 )
 from strategy.dynamic_spread import (
     RollingVolatilityEstimator,
@@ -116,6 +123,13 @@ class AvellanedaStoikovBot:
         max_dynamic_spread_cents: Optional[int] = None,
         volatility_window_seconds: Optional[float] = None,
         kalshi_fee_rate: Optional[float] = None,
+        max_low_price_contracts: Optional[int] = None,
+        low_price_threshold_cents: Optional[int] = None,
+        momentum_skew_enabled: Optional[bool] = None,
+        momentum_gamma_factor: Optional[float] = None,
+        max_gamma_multiplier: Optional[float] = None,
+        auto_sweep_shard0_enabled: Optional[bool] = None,
+        shard0_reserve_dollars: Optional[float] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -187,6 +201,47 @@ class AvellanedaStoikovBot:
         )
         self.volatility_estimator = RollingVolatilityEstimator(
             window_seconds=self.volatility_window_seconds
+        )
+
+        # Collateral-constrained sizing ceiling for low-price contracts
+        self.max_low_price_contracts = (
+            max(0, int(max_low_price_contracts))
+            if max_low_price_contracts is not None
+            else MAX_LOW_PRICE_CONTRACTS
+        )
+        self.low_price_threshold_cents = (
+            max(1, int(low_price_threshold_cents))
+            if low_price_threshold_cents is not None
+            else LOW_PRICE_THRESHOLD_CENTS
+        )
+
+        # Aggressive momentum quote skewing
+        self.momentum_skew_enabled = (
+            bool(momentum_skew_enabled)
+            if momentum_skew_enabled is not None
+            else MOMENTUM_SKEW_ENABLED
+        )
+        self.momentum_gamma_factor = (
+            max(0.0, float(momentum_gamma_factor))
+            if momentum_gamma_factor is not None
+            else MOMENTUM_GAMMA_FACTOR
+        )
+        self.max_gamma_multiplier = (
+            max(1.0, float(max_gamma_multiplier))
+            if max_gamma_multiplier is not None
+            else MAX_GAMMA_MULTIPLIER
+        )
+
+        # Automated inter-shard capital sweep
+        self.auto_sweep_shard0_enabled = (
+            bool(auto_sweep_shard0_enabled)
+            if auto_sweep_shard0_enabled is not None
+            else AUTO_SWEEP_SHARD0_ENABLED
+        )
+        self.shard0_reserve_dollars = (
+            max(0.0, float(shard0_reserve_dollars))
+            if shard0_reserve_dollars is not None
+            else SHARD0_RESERVE_DOLLARS
         )
 
 
@@ -295,29 +350,41 @@ class AvellanedaStoikovBot:
             current_shard_balance = float(shard_balances.get(target_shard, 0.0))
             shard0_balance = float(shard_balances.get(0, 0.0))
 
-            if current_shard_balance >= min_required_dollars:
-                return True
-
             needed_dollars = round(min_required_dollars - current_shard_balance, 2)
-            if needed_dollars <= 0.0:
-                return True
+            available_sweep = round(shard0_balance - self.shard0_reserve_dollars, 2)
 
-            logger.warning(
-                f"Shard {target_shard} balance (${current_shard_balance:.2f}) below required "
-                f"${min_required_dollars:.2f}. Initiating rebalance from Shard 0 (balance: ${shard0_balance:.2f})."
-            )
-
-            # Check if Shard 0 has funds to cover
-            if shard0_balance < needed_dollars:
-                transfer_amount = max(0.0, round(shard0_balance - 1.0, 2))
-                if transfer_amount < 1.0:
-                    logger.error(
-                        f"Cannot transfer to Shard {target_shard}: Shard 0 balance (${shard0_balance:.2f}) "
-                        f"insufficient for minimum transfer ($1.00)."
+            if current_shard_balance >= min_required_dollars:
+                # Target shard already meets minimum required collateral.
+                # If auto-sweep is enabled, sweep idle capital from Shard 0 to active sports shard
+                if self.auto_sweep_shard0_enabled and available_sweep >= 1.0:
+                    logger.info(
+                        f"Shard {target_shard} funded (${current_shard_balance:.2f} >= ${min_required_dollars:.2f}), "
+                        f"but idle capital detected in Shard 0 (${shard0_balance:.2f}). "
+                        f"Initiating automated sweep of ${available_sweep:.2f} to Shard {target_shard}."
                     )
-                    return False
+                    transfer_amount = available_sweep
+                else:
+                    return True
             else:
-                transfer_amount = needed_dollars
+                if needed_dollars <= 0.0:
+                    return True
+
+                logger.warning(
+                    f"Shard {target_shard} balance (${current_shard_balance:.2f}) below required "
+                    f"${min_required_dollars:.2f}. Initiating rebalance from Shard 0 (balance: ${shard0_balance:.2f})."
+                )
+
+                # Check if Shard 0 has funds to cover
+                if shard0_balance < needed_dollars:
+                    transfer_amount = max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2))
+                    if transfer_amount < 1.0:
+                        logger.error(
+                            f"Cannot transfer to Shard {target_shard}: Shard 0 balance (${shard0_balance:.2f}) "
+                            f"insufficient for minimum transfer ($1.00)."
+                        )
+                        return False
+                else:
+                    transfer_amount = needed_dollars
 
             transfer_ok = await asyncio.to_thread(
                 self.om.transfer_intra_exchange,
@@ -331,22 +398,36 @@ class AvellanedaStoikovBot:
                     f"Accepted transfer of ${transfer_amount:.2f} to Shard {target_shard} from Shard 0; "
                     f"awaiting settlement..."
                 )
+                baseline_balance = current_shard_balance
                 for attempt in range(6):
                     await asyncio.sleep(2.0)
                     balances = await asyncio.to_thread(self.om.get_portfolio_balances)
                     shard_balances = balances.get("shard_balances", {})
                     current_shard_balance = float(shard_balances.get(target_shard, 0.0))
-                    if current_shard_balance >= min_required_dollars:
-                        logger.info(
-                            f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
-                            f"(attempt {attempt + 1}/6)."
-                        )
-                        return True
-                logger.error(
-                    f"Shard {target_shard} balance (${current_shard_balance:.2f}) not funded with required "
-                    f"${min_required_dollars:.2f} after transfer acceptance."
-                )
-                return False
+                    if needed_dollars > 0:
+                        if current_shard_balance >= min_required_dollars:
+                            logger.info(
+                                f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
+                                f"(attempt {attempt + 1}/6)."
+                            )
+                            return True
+                    else:
+                        if current_shard_balance > baseline_balance:
+                            logger.info(
+                                f"Confirmed idle capital sweep to Shard {target_shard}: balance=${current_shard_balance:.2f} "
+                                f"(attempt {attempt + 1}/6)."
+                            )
+                            return True
+                        elif current_shard_balance >= min_required_dollars and attempt == 5:
+                            return True
+
+                if needed_dollars > 0:
+                    logger.error(
+                        f"Shard {target_shard} balance (${current_shard_balance:.2f}) not funded with required "
+                        f"${min_required_dollars:.2f} after transfer acceptance."
+                    )
+                    return False
+                return True
             else:
                 logger.error(f"Failed to fund Shard {target_shard} from Shard 0.")
                 return False
@@ -363,6 +444,9 @@ class AvellanedaStoikovBot:
         Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] and enforces
         a hard pre-submission ceiling (self.max_order_contracts) to prevent runaway
         or manipulated contract counts.
+        Additionally enforces a collateral-constrained ceiling (self.max_low_price_contracts)
+        when contract prices fall below low_price_threshold_cents (< 25c) to prevent
+        collateral exhaustion on the short/NO leg.
         Otherwise falls back to fixed order_size (also capped by max_order_contracts).
         """
         if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
@@ -371,7 +455,12 @@ class AvellanedaStoikovBot:
                 # to prevent runaway contract counts on extreme/sub-cent books (e.g. 0.05c -> 2,000 contracts)
                 effective_price = max(1.0, min(99.0, float(mid_price)))
                 raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
-                return min(self.max_order_contracts, raw_count)
+                capped_count = min(self.max_order_contracts, raw_count)
+                # Collateral-constrained ceiling for low-price contracts
+                if self.max_low_price_contracts and self.max_low_price_contracts > 0:
+                    if effective_price <= self.low_price_threshold_cents:
+                        capped_count = min(capped_count, self.max_low_price_contracts)
+                return capped_count
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
         return min(self.max_order_contracts, max(1, fallback))
 
@@ -871,7 +960,28 @@ class AvellanedaStoikovBot:
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
         # q = inventory / quote_size
         normalized_q = (inventory / quote_size) if (self.order_dollars and quote_size > 0) else inventory
-        reservation_price = mid_price - (normalized_q * self.gamma)
+
+        effective_gamma = self.gamma
+        if self.momentum_skew_enabled and abs(normalized_q) > 1.0:
+            excess_q = abs(normalized_q) - 1.0
+            gamma_scale = min(self.max_gamma_multiplier, 1.0 + (self.momentum_gamma_factor * excess_q))
+            effective_gamma = self.gamma * gamma_scale
+
+        # Adverse Momentum / Drift Skew:
+        # If orderbook mid price has drifted adversely against current inventory position,
+        # apply an additional directional shift to reservation price to retreat further from toxic flow.
+        adverse_drift_shift = 0.0
+        if self.momentum_skew_enabled and normalized_q != 0 and len(self._mid_price_history) >= 2:
+            start_price = self._mid_price_history[0][1]
+            drift = mid_price - start_price
+            # If long (q > 0) and price is falling (drift < 0), market is moving against us
+            if normalized_q > 0 and drift < 0:
+                adverse_drift_shift = abs(drift) * 0.5
+            # If short (q < 0) and price is rising (drift > 0), market is moving against us
+            elif normalized_q < 0 and drift > 0:
+                adverse_drift_shift = -abs(drift) * 0.5
+
+        reservation_price = mid_price - (normalized_q * effective_gamma) - adverse_drift_shift
 
         # 5. Determine Quoting Spread (Dynamic Volatility & Fee-Aware Spread vs. Static Fallback)
         if self.dynamic_spread_enabled:
@@ -886,7 +996,7 @@ class AvellanedaStoikovBot:
             effective_spread = calculate_optimal_spread(
                 mid_price_cents=mid_price,
                 realized_volatility_cents=realized_vol,
-                gamma=self.gamma,
+                gamma=effective_gamma,
                 book_depth=book_depth,
                 target_edge_cents=self.target_edge_cents,
                 fee_rate=self.kalshi_fee_rate,

@@ -1031,6 +1031,8 @@ class OrderManager:
         payload = {
             "amount": amount_centicents,
             "client_transfer_id": str(uuid.uuid4()),
+            "source": "event_contract",
+            "destination": "event_contract",
             "source_exchange_shard": int(source_shard),
             "destination_exchange_shard": int(destination_shard),
             "source_subaccount": int(source_subaccount),
