@@ -582,18 +582,34 @@ class OrderManager:
                     return True
                 elif resp.status_code == 404:
                     status_info = await self.get_order_status(order_id)
-                    remaining = (status_info or {}).get("remaining_count", 0)
-                    ord_status = (status_info or {}).get("status")
-                    if ord_status == "resting" or remaining > 0:
+                    if not status_info:
                         logger.error(
-                            f"Orphaned order {cancel_path} returned 404 on DELETE, but status confirms "
-                            f"it is still RESTING (status={ord_status}, remaining={remaining}). Not confirmed cleared!"
+                            f"Orphaned order {cancel_path} returned 404 on DELETE and order status lookup failed. "
+                            f"Cannot verify cancellation; retaining tracking."
                         )
                         return False
-                    logger.info(f"Orphaned order {cancel_path} confirmed cleared on exchange (404, status={ord_status}).")
-                    if client_order_id:
-                        self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
-                    return True
+
+                    ord_status = status_info.get("status")
+                    rem_int = status_info.get("remaining_count", 0)
+                    rem_fp = float(status_info.get("remaining_count_fp", 0.0) or 0.0)
+
+                    is_terminal = ord_status in ("canceled", "cancelled", "executed")
+                    is_zero_remaining = (rem_int == 0 and rem_fp == 0.0)
+
+                    if is_terminal and is_zero_remaining:
+                        logger.info(
+                            f"Orphaned order {cancel_path} confirmed closed on exchange (404, status={ord_status})."
+                        )
+                        if client_order_id:
+                            self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
+                        return True
+
+                    logger.error(
+                        f"Orphaned order {cancel_path} returned 404 on DELETE, but status is non-terminal or unverified "
+                        f"(status={ord_status}, remaining_count={rem_int}, remaining_count_fp={rem_fp}). "
+                        f"Retaining tracking."
+                    )
+                    return False
                 elif resp.status_code == 429:
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
