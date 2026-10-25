@@ -27,6 +27,7 @@ from utils.market_discovery import (
     get_market_details_async,
     get_raw_market_status_async,
     is_market_active_async,
+    get_market_exchange_index,
 )
 from utils.horizon import _get_earliest_market_timestamp
 from utils.sports_router import SportsSeasonRouter
@@ -260,6 +261,99 @@ class AvellanedaStoikovBot:
         self._sync_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
 
+        # Exchange Shard Routing & Hedging Circuit Breaker
+        self.exchange_index: Optional[int] = get_market_exchange_index(self.ticker)
+        self._consecutive_hedge_failures: int = 0
+        self._last_shard_rebalance_time: float = 0.0
+
+    async def ensure_shard_collateral(self, min_required_dollars: float = 15.0) -> bool:
+        """
+        Ensures that the current market's exchange shard has sufficient collateral (min_required_dollars).
+        If the market resides on a non-default shard (e.g. Shard 3 for sports/NBA) and collateral is low,
+        initiates an intra-exchange instance transfer from Shard 0 (main balance).
+        """
+        if getattr(self, "exchange_index", None) is None:
+            self.exchange_index = await asyncio.to_thread(get_market_exchange_index, self.ticker)
+
+        target_shard = getattr(self, "exchange_index", None)
+        if target_shard is None:
+            logger.warning(f"Could not resolve exchange_index for {self.ticker}; cannot verify shard collateral.")
+            return False
+
+        if target_shard == 0:
+            return True
+
+        now = time.time()
+        # Enforce a 10s cooldown between rebalances to prevent transfer spam
+        if now - self._last_shard_rebalance_time < 10.0:
+            logger.debug(f"Shard collateral check for Shard {target_shard} in cooldown.")
+            return True
+
+        try:
+            balances = await asyncio.to_thread(self.om.get_portfolio_balances)
+            shard_balances = balances.get("shard_balances", {})
+            current_shard_balance = float(shard_balances.get(target_shard, 0.0))
+            shard0_balance = float(shard_balances.get(0, 0.0))
+
+            if current_shard_balance >= min_required_dollars:
+                return True
+
+            needed_dollars = round(min_required_dollars - current_shard_balance, 2)
+            if needed_dollars <= 0.0:
+                return True
+
+            logger.warning(
+                f"Shard {target_shard} balance (${current_shard_balance:.2f}) below required "
+                f"${min_required_dollars:.2f}. Initiating rebalance from Shard 0 (balance: ${shard0_balance:.2f})."
+            )
+
+            # Check if Shard 0 has funds to cover
+            if shard0_balance < needed_dollars:
+                transfer_amount = max(0.0, round(shard0_balance - 1.0, 2))
+                if transfer_amount < 1.0:
+                    logger.error(
+                        f"Cannot transfer to Shard {target_shard}: Shard 0 balance (${shard0_balance:.2f}) "
+                        f"insufficient for minimum transfer ($1.00)."
+                    )
+                    return False
+            else:
+                transfer_amount = needed_dollars
+
+            transfer_ok = await asyncio.to_thread(
+                self.om.transfer_intra_exchange,
+                source_shard=0,
+                destination_shard=target_shard,
+                amount_dollars=transfer_amount,
+            )
+            if transfer_ok:
+                self._last_shard_rebalance_time = time.time()
+                logger.info(
+                    f"Accepted transfer of ${transfer_amount:.2f} to Shard {target_shard} from Shard 0; "
+                    f"awaiting settlement..."
+                )
+                for attempt in range(6):
+                    await asyncio.sleep(2.0)
+                    balances = await asyncio.to_thread(self.om.get_portfolio_balances)
+                    shard_balances = balances.get("shard_balances", {})
+                    current_shard_balance = float(shard_balances.get(target_shard, 0.0))
+                    if current_shard_balance >= min_required_dollars:
+                        logger.info(
+                            f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
+                            f"(attempt {attempt + 1}/6)."
+                        )
+                        return True
+                logger.error(
+                    f"Shard {target_shard} balance (${current_shard_balance:.2f}) not funded with required "
+                    f"${min_required_dollars:.2f} after transfer acceptance."
+                )
+                return False
+            else:
+                logger.error(f"Failed to fund Shard {target_shard} from Shard 0.")
+                return False
+        except Exception as e:
+            logger.error(f"Exception ensuring shard collateral for Shard {target_shard}: {e}")
+            return False
+
     def calculate_order_size(self, mid_price: Optional[float]) -> int:
         """
         Calculates the order size (contract count) for the current quoting cycle.
@@ -311,6 +405,11 @@ class AvellanedaStoikovBot:
             self.running = False
             raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
         
+        # 3a. Ensure exchange shard collateral before quoting starts
+        if getattr(self, "exchange_index", None) is None:
+            self.exchange_index = await asyncio.to_thread(get_market_exchange_index, self.ticker)
+        await self.ensure_shard_collateral()
+
         # 3b. Launch the periodic reconciliation background task
         self._sync_task = asyncio.create_task(self.inv_manager._sync_loop())
         self._background_tasks.add(self._sync_task)
@@ -904,36 +1003,95 @@ class AvellanedaStoikovBot:
 
         # Place new BID if needed
         now = time.time()
-        in_error_cooldown = (now - self._last_order_error_time < self._order_error_cooldown)
+        is_hedge = (new_bid is None and new_ask is not None) or (new_ask is None and new_bid is not None)
+        in_error_cooldown = (now - self._last_order_error_time < self._order_error_cooldown) and not is_hedge
 
         if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
-                logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c")
+                logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c (Shard {self.exchange_index})")
+                order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
                 self.current_bid_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="buy", count=target_bid_size, price=new_bid
+                    ticker=self.ticker,
+                    side="yes",
+                    action="buy",
+                    count=target_bid_size,
+                    price=new_bid,
+                    **order_kwargs,
                 )
                 if self.current_bid_id:
                     self.current_bid_price = new_bid
                     self.current_bid_size = target_bid_size
+                    if is_hedge:
+                        self._consecutive_hedge_failures = 0
                 else:
                     self._last_order_error_time = time.time()
                     self.current_bid_price = None
                     self.current_bid_size = None
+                    if is_hedge:
+                        self._consecutive_hedge_failures += 1
+                        logger.warning(
+                            f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                            f"Attempting shard rebalance..."
+                        )
+                        hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
+                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                        if self._consecutive_hedge_failures >= 3:
+                            logger.critical(
+                                f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                            )
+                            from execution.kill_switch import KillSwitch
+                            killer = KillSwitch(self.om, ticker=self.ticker)
+                            await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                            await send_alert(
+                                f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                            )
+                            self._market_inactive = True
 
         # Place new ASK if needed
         if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
-                logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c")
+                logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c (Shard {self.exchange_index})")
+                order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
                 self.current_ask_id = await self.om.place_order(
-                    ticker=self.ticker, side="yes", action="sell", count=target_ask_size, price=new_ask
+                    ticker=self.ticker,
+                    side="yes",
+                    action="sell",
+                    count=target_ask_size,
+                    price=new_ask,
+                    **order_kwargs,
                 )
                 if self.current_ask_id:
                     self.current_ask_price = new_ask
                     self.current_ask_size = target_ask_size
+                    if is_hedge:
+                        self._consecutive_hedge_failures = 0
                 else:
                     self._last_order_error_time = time.time()
                     self.current_ask_price = None
                     self.current_ask_size = None
+                    if is_hedge:
+                        self._consecutive_hedge_failures += 1
+                        logger.warning(
+                            f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                            f"Attempting shard rebalance..."
+                        )
+                        hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
+                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                        if self._consecutive_hedge_failures >= 3:
+                            logger.critical(
+                                f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                            )
+                            from execution.kill_switch import KillSwitch
+                            killer = KillSwitch(self.om, ticker=self.ticker)
+                            await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                            await send_alert(
+                                f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                            )
+                            self._market_inactive = True
 
 
 
@@ -997,12 +1155,16 @@ class AvellanedaStoikovBot:
                 f"@ {price}c for {target_ticker} (current position: {inv}, consecutive failed attempts: {failed_attempts}/{max_retries})"
             )
 
+            order_kwargs = {}
+            if getattr(self, "exchange_index", 0) and target_ticker == self.ticker:
+                order_kwargs["exchange_index"] = self.exchange_index
             order_id = await self.om.place_order(
                 ticker=target_ticker,
                 side="yes",
                 action=action,
                 count=slice_count,
                 price=price,
+                **order_kwargs,
             )
             if not order_id:
                 logger.error(
@@ -1403,6 +1565,8 @@ class AvellanedaStoikovBot:
 
         # 3. Update target ticker and reset state trackers
         self.ticker = new_ticker
+        self.exchange_index = await asyncio.to_thread(get_market_exchange_index, new_ticker)
+        self._consecutive_hedge_failures = 0
         self._starvation_start_time = None
         self._starvation_alert_sent = False
         self._last_empty_ob_log = 0.0
@@ -1419,7 +1583,10 @@ class AvellanedaStoikovBot:
         # Start a new tracking session for the new market ticker
         self.inv_manager.pnl_tracker.reset_market_session(new_ticker)
 
-        logger.info(f"Market rotation complete. Now trading {new_ticker}.")
+        # 4. Ensure collateral on new shard before quoting commences
+        await self.ensure_shard_collateral()
+
+        logger.info(f"Market rotation complete. Now trading {new_ticker} on Shard {self.exchange_index}.")
         await send_alert(f"Market Rotated: Switched target from {old_ticker} to active market {new_ticker}.")
         return True
 

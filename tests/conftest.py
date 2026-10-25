@@ -55,8 +55,19 @@ def mock_request_handler(method, url, *args, **kwargs):
             "markets": [{"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}],
             "market": {"ticker": "MOCK_TICKER", "status": "open", "close_time": "2030-01-01T00:00:00Z"}
         }, 200)
+    elif "intra_exchange_instance_transfer" in url:
+        return MockResponse({"status": "complete", "transfer_id": "mock-transfer-123"}, 201)
     elif "portfolio/balance" in url:
-        return MockResponse({"balance": 10000}, 200)
+        return MockResponse({
+            "balance": 10000,
+            "balance_dollars": 100.0,
+            "balance_breakdown": [
+                {"exchange_index": 0, "balance": 75.0},
+                {"exchange_index": 1, "balance": 0.0},
+                {"exchange_index": 2, "balance": 0.0},
+                {"exchange_index": 3, "balance": 25.0},
+            ]
+        }, 200)
     elif "portfolio/positions" in url:
         return MockResponse({"market_positions": []}, 200)
     return MockResponse({}, 200)

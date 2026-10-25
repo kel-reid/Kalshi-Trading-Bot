@@ -395,6 +395,7 @@ class TestV2PayloadSchema:
         order_manager._delete_request = MagicMock(return_value=resp_404)
         order_manager._update_db_order_status = MagicMock()
         order_manager.rate_limiter.acquire = AsyncMock()
+        order_manager.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0})
 
         result = await order_manager._cancel_by_kalshi_id("kalshi-oid-404", "client-cid-404")
 
