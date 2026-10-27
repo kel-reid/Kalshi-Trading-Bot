@@ -35,19 +35,19 @@ def test_sports_season_router_calendar_priorities():
     dt_sep = datetime.datetime(2026, 9, 15, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_sep, use_live_schedule=False) == ["NFL", "NCAAF", "MLB"]
 
-    # Fall/Winter: October (month 10, Thursday) -> NFL, NCAAF, NBA, MLB
+    # Fall/Winter: October (month 10, Thursday) -> NFL, NBA, NCAAF, MLB
     dt_oct = datetime.datetime(2026, 10, 15, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_oct, use_live_schedule=False) == ["NFL", "NCAAF", "NBA", "MLB"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct, use_live_schedule=False) == ["NFL", "NBA", "NCAAF", "MLB"]
 
-    # Late Fall / Winter: November & December (Sunday & Tuesday) -> NFL, NCAAF, NBA
+    # Late Fall / Winter: November & December (Sunday & Tuesday) -> NFL, NBA, NCAAF
     dt_nov = datetime.datetime(2026, 11, 15, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_nov, use_live_schedule=False) == ["NFL", "NCAAF", "NBA"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_nov, use_live_schedule=False) == ["NFL", "NBA", "NCAAF"]
     dt_dec = datetime.datetime(2026, 12, 15, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_dec, use_live_schedule=False) == ["NFL", "NCAAF", "NBA"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_dec, use_live_schedule=False) == ["NFL", "NBA", "NCAAF"]
 
-    # Mid-Winter: January (month 1, Wednesday) -> NFL, NCAAF, NBA
+    # Mid-Winter: January (month 1, Wednesday) -> NFL, NBA, NCAAF
     dt_jan = datetime.datetime(2026, 1, 14, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_jan, use_live_schedule=False) == ["NFL", "NCAAF", "NBA"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_jan, use_live_schedule=False) == ["NFL", "NBA", "NCAAF"]
 
     # Post-Season: February (month 2) -> NFL, NBA (NCAAF concluded)
     dt_feb = datetime.datetime(2026, 2, 10, 18, 0, tzinfo=datetime.timezone.utc)
@@ -72,7 +72,7 @@ def test_sports_season_router_calendar_priorities():
 
     # Naive datetime (without tzinfo) is properly localized to Eastern Time
     dt_naive = datetime.datetime(2026, 10, 15, 18, 0)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_naive, use_live_schedule=False) == ["NFL", "NCAAF", "NBA", "MLB"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_naive, use_live_schedule=False) == ["NFL", "NBA", "NCAAF", "MLB"]
 
 
 def test_sports_season_router_full_product_suites():
@@ -453,13 +453,13 @@ def test_sports_season_router_day_of_week_football_dynamics():
     assert SportsSeasonRouter.get_in_season_leagues(dt_oct_sat, use_live_schedule=False) == ["NCAAF", "NFL", "NBA", "MLB"]
     # Sunday Oct 4, 2026
     dt_oct_sun = datetime.datetime(2026, 10, 4, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_oct_sun, use_live_schedule=False) == ["NFL", "NCAAF", "NBA", "MLB"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_oct_sun, use_live_schedule=False) == ["NFL", "NBA", "NCAAF", "MLB"]
 
     # 3. November / December / January:
     dt_nov_sat = datetime.datetime(2026, 11, 21, 18, 0, tzinfo=datetime.timezone.utc)
     assert SportsSeasonRouter.get_in_season_leagues(dt_nov_sat, use_live_schedule=False) == ["NCAAF", "NFL", "NBA"]
     dt_nov_sun = datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc)
-    assert SportsSeasonRouter.get_in_season_leagues(dt_nov_sun, use_live_schedule=False) == ["NFL", "NCAAF", "NBA"]
+    assert SportsSeasonRouter.get_in_season_leagues(dt_nov_sun, use_live_schedule=False) == ["NFL", "NBA", "NCAAF"]
 
     # 4. Out-of-season / Concluded (e.g. February): Day of week does not change priority
     dt_feb_sat = datetime.datetime(2026, 2, 14, 18, 0, tzinfo=datetime.timezone.utc)
