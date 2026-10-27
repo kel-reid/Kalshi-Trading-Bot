@@ -65,6 +65,18 @@ def test_sports_season_router_prioritizes_nba_over_cfb_on_weekdays_when_both_hav
         assert leagues == ["NBA", "NCAAF", "NFL", "MLB"]
 
 
+def test_sports_season_router_keeps_nba_ahead_of_cfb_when_cfb_has_more_games():
+    """Verify calendar priority holds on a non-primetime weekday even when NCAAF has more games than NBA."""
+    dt_tue = datetime.datetime(2026, 10, 27, 18, 0, tzinfo=datetime.timezone.utc)
+    mock_counts = {"NBA": 1, "NCAAF": 4, "NFL": 0, "MLB": 0}
+
+    with patch("utils.espn_client.get_daily_slate_counts", return_value=mock_counts):
+        leagues = SportsSeasonRouter.get_in_season_leagues(dt_tue, use_live_schedule=True)
+        assert leagues[0] == "NBA"
+        assert leagues[1] == "NCAAF"
+        assert leagues == ["NBA", "NCAAF", "NFL", "MLB"]
+
+
 def test_sports_season_router_falls_back_to_calendar_matrix_when_espn_fails():
     """Verify SportsSeasonRouter falls back cleanly to calendar matrix if ESPN raises or returns empty."""
     dt_wed = datetime.datetime(2026, 10, 21, 18, 0, tzinfo=datetime.timezone.utc)
