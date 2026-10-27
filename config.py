@@ -90,19 +90,26 @@ MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
 
 # Collateral-Constrained Sizing Ceiling on Low-Price Contracts
 # Prevents excessive contract sizing on low-price contracts (< 25c) where short leg requires heavy NO collateral
-MAX_LOW_PRICE_CONTRACTS = _get_int_env("MAX_LOW_PRICE_CONTRACTS", 0, allow_zero=True)
+MAX_LOW_PRICE_CONTRACTS = _get_int_env("MAX_LOW_PRICE_CONTRACTS", 10, allow_zero=True)
 LOW_PRICE_THRESHOLD_CENTS = _get_int_env("LOW_PRICE_THRESHOLD_CENTS", 25, allow_zero=True)
 
 # Aggressive Momentum Quote Skewing
 # Increases inventory penalty gamma during multi-possession runs and adverse price drift
-MOMENTUM_SKEW_ENABLED = os.getenv("MOMENTUM_SKEW_ENABLED", "false").lower() in ("true", "1", "yes")
+MOMENTUM_SKEW_ENABLED = os.getenv("MOMENTUM_SKEW_ENABLED", "true").lower() in ("true", "1", "yes")
 MOMENTUM_GAMMA_FACTOR = _get_float_env("MOMENTUM_GAMMA_FACTOR", 0.5, allow_zero=True)
 MAX_GAMMA_MULTIPLIER = max(1.0, _get_float_env("MAX_GAMMA_MULTIPLIER", 2.5))
 
-# Automated Inter-Shard Capital Sweep
-# Automatically sweeps idle capital from Shard 0 (default clearing pool) to active sports shard (Shard 3)
+# Quote Replacement Tolerance (Cents)
+# Prevents quote replacement churn and API fee/rate-limit waste when midpoint shift is within tolerance
+QUOTE_REPLACEMENT_TOLERANCE_CENTS = _get_int_env("QUOTE_REPLACEMENT_TOLERANCE_CENTS", 1, allow_zero=True)
+
+# Automated Inter-Shard Capital Sweep (Bidirectional)
+# Automatically sweeps idle capital from Shard 0 to active sports shard (Shard 3)
+# and sweeps surplus capital back from Shard 3 to Shard 0 on rotation, shutdown, or when idle.
 AUTO_SWEEP_SHARD0_ENABLED = os.getenv("AUTO_SWEEP_SHARD0_ENABLED", "true").lower() in ("true", "1", "yes")
+AUTO_SWEEP_REVERSE_ENABLED = os.getenv("AUTO_SWEEP_REVERSE_ENABLED", "true").lower() in ("true", "1", "yes")
 SHARD0_RESERVE_DOLLARS = _get_float_env("SHARD0_RESERVE_DOLLARS", 1.0, allow_zero=True)
+SHARD_RETAIN_DOLLARS = _get_float_env("SHARD_RETAIN_DOLLARS", 10.0, allow_zero=True)
 
 _raw_target = os.getenv("TARGET_TICKER") or os.getenv("TARGET_PREFERENCE") or ""
 TARGET_TICKER = _raw_target  # Can be injected to force a specific market or league
@@ -140,6 +147,13 @@ else:
     EXPIRATION_BUFFER_MINUTES = MIN_TIME_TO_CLOSE_SECONDS // 60
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
+
+# Trading Blackout Safeguards (Late-Game & Binary Danger Zone)
+# Prevents entering toxic inventory traps during late-game blowouts and extreme collar approaches.
+BLACKOUT_ENABLED = os.getenv("BLACKOUT_ENABLED", "true").lower() in ("true", "1", "yes")
+EXPIRATION_BLACKOUT_SECONDS = _get_int_env("EXPIRATION_BLACKOUT_SECONDS", 1800, allow_zero=True)
+BLACKOUT_DANGER_PRICE_LOW = _get_int_env("BLACKOUT_DANGER_PRICE_LOW", 20, allow_zero=True)
+BLACKOUT_DANGER_PRICE_HIGH = _get_int_env("BLACKOUT_DANGER_PRICE_HIGH", 80, allow_zero=True)
 
 # Fee Churn & Session Stop-Loss Safeguards (Cents)
 # Cease quoting, liquidate inventory, and rotate away if fees or net loss on a single market session exceed these thresholds.

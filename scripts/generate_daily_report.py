@@ -302,7 +302,7 @@ def fetch_daily_metrics(
                     COUNT(*) FILTER (WHERE action = 'sell') as sell_orders,
                     COUNT(*) FILTER (WHERE status = 'resting') as resting_orders,
                     COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled_orders,
-                    COUNT(*) FILTER (WHERE status = 'cancelled_or_filled_404') as executed_or_filled_404,
+                    COUNT(*) FILTER (WHERE status IN ('verified_executed', 'cancelled_or_filled_404')) as executed_or_filled_404,
                     COALESCE(SUM(count), 0) as total_contracts_quoted,
                     AVG(price) as avg_price_cents
                 FROM orders
@@ -325,7 +325,7 @@ def fetch_daily_metrics(
                 SELECT client_order_id, action, side, price, count, created_at
                 FROM orders
                 WHERE ticker = %s AND created_at >= %s AND created_at <= %s
-                  AND status = 'cancelled_or_filled_404'
+                  AND status IN ('verified_executed', 'cancelled_or_filled_404')
                 ORDER BY created_at ASC
                 """,
                 (ticker, start_utc, end_utc),
