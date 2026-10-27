@@ -23,7 +23,7 @@ def reset_cache():
 
 def test_sports_season_router_elevates_league_with_live_games_today():
     """Verify SportsSeasonRouter dynamically elevates leagues with live ESPN games today."""
-    # Wednesday Oct 21, 2026: Base calendar is ["NFL", "NCAAF", "NBA", "MLB"]
+    # Wednesday Oct 21, 2026: Base calendar is ["NFL", "NBA", "NCAAF", "MLB"]
     dt_wed = datetime.datetime(2026, 10, 21, 18, 0, tzinfo=datetime.timezone.utc)
 
     # Mock ESPN counts: NBA has 11 games, NFL has 0, NCAAF has 0, MLB has 0
@@ -50,13 +50,28 @@ def test_sports_season_router_maintains_cfb_priority_on_saturday_when_both_have_
         assert leagues == ["NCAAF", "NBA", "NFL", "MLB"]
 
 
+def test_sports_season_router_prioritizes_nba_over_cfb_on_weekdays_when_both_have_games():
+    """Verify on non-primetime weekdays (e.g. Tuesday), NBA takes priority over NCAAF when both have games."""
+    # Tuesday Oct 27, 2026
+    dt_tue = datetime.datetime(2026, 10, 27, 18, 0, tzinfo=datetime.timezone.utc)
+
+    # Tuesday slate: NBA has 4 games, NCAAF has 1 game, NFL has 0, MLB has 0
+    mock_counts = {"NBA": 4, "NCAAF": 1, "NFL": 0, "MLB": 0}
+
+    with patch("utils.espn_client.get_daily_slate_counts", return_value=mock_counts):
+        leagues = SportsSeasonRouter.get_in_season_leagues(dt_tue, use_live_schedule=True)
+        assert leagues[0] == "NBA"
+        assert leagues[1] == "NCAAF"
+        assert leagues == ["NBA", "NCAAF", "NFL", "MLB"]
+
+
 def test_sports_season_router_falls_back_to_calendar_matrix_when_espn_fails():
     """Verify SportsSeasonRouter falls back cleanly to calendar matrix if ESPN raises or returns empty."""
     dt_wed = datetime.datetime(2026, 10, 21, 18, 0, tzinfo=datetime.timezone.utc)
 
     with patch("utils.espn_client.get_daily_slate_counts", side_effect=Exception("ESPN API Timeout")):
         leagues = SportsSeasonRouter.get_in_season_leagues(dt_wed, use_live_schedule=True)
-        assert leagues == ["NFL", "NCAAF", "NBA", "MLB"]
+        assert leagues == ["NFL", "NBA", "NCAAF", "MLB"]
 
 
 def test_discover_active_market_prefers_imminent_game_over_distant_higher_priority_league():
@@ -112,7 +127,7 @@ def test_sports_season_router_preserves_base_order_on_partial_failure():
     with patch("utils.espn_client.get_daily_slate_counts", return_value=mock_partial):
         leagues = SportsSeasonRouter.get_in_season_leagues(dt_wed, use_live_schedule=True)
         # Must preserve original calendar order without demoting NFL
-        assert leagues == ["NFL", "NCAAF", "NBA", "MLB"]
+        assert leagues == ["NFL", "NBA", "NCAAF", "MLB"]
 
 
 def test_select_best_market_avoids_duplicate_probes():

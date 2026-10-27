@@ -57,10 +57,11 @@ During football season (September through January), both the NFL and College Foo
   - *October Example*: `NCAAF` $\rightarrow$ `NFL` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
 - **Sunday, Monday, Thursday (NFL Game Days)**:
   - The NFL holds its primary slate on Sunday (early, afternoon, and Sunday Night Football), Monday Night Football, and Thursday Night Football.
-  - **NFL retains Priority 1**, ahead of NCAAF, NBA, and MLB.
-  - *October Example*: `NFL` $\rightarrow$ `NCAAF` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+  - **NFL retains Priority 1**, followed by NBA, NCAAF, and MLB.
+  - *October Example*: `NFL` $\rightarrow$ `NBA` $\rightarrow$ `NCAAF` $\rightarrow$ `MLB`.
 - **Tuesday & Wednesday (Midweek Lulls)**:
-  - Standard seasonal priority applies; when no active NFL/NCAAF games are live, the waterfall seamlessly cascades to midweek NBA or MLB postseason games.
+  - NBA marquee regular season slates take priority over minor midweek college football games.
+  - *October Example*: `NBA` $\rightarrow$ `NCAAF` $\rightarrow$ `MLB` (or `NFL` $\rightarrow$ `NBA` $\rightarrow$ `NCAAF` $\rightarrow$ `MLB`).
 
 
 ## 3. Routing & Selection Architecture
