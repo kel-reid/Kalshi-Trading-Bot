@@ -14,6 +14,17 @@ import math
 from unittest.mock import patch, AsyncMock, MagicMock
 from strategy.market_maker import AvellanedaStoikovBot
 
+@pytest.fixture(autouse=True)
+def reset_strategy_math_defaults(monkeypatch):
+    """
+    Ensure baseline mathematical tests evaluate pure Avellaneda-Stoikov math
+    without dynamic momentum skew, low-price contract capping, or blackout suppressions
+    (which are tested independently in test_dynamic_enhancements.py and test_blackout_and_bidirectional_sweep.py).
+    """
+    monkeypatch.setattr("strategy.market_maker.MOMENTUM_SKEW_ENABLED", False)
+    monkeypatch.setattr("strategy.market_maker.MAX_LOW_PRICE_CONTRACTS", 0)
+    monkeypatch.setattr("strategy.market_maker.BLACKOUT_ENABLED", False)
+
 @pytest.mark.asyncio
 async def test_neutral_pricing():
     """When inventory is 0, reservation price should equal the mid price."""
