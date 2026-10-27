@@ -72,8 +72,8 @@ class SportsSeasonRouter:
         - Friday & Saturday: College Football (NCAAF) is the primary attraction across the country.
           NCAAF is elevated to Priority #1, followed by NFL, NBA, MLB.
         - Sunday, Monday, Thursday: NFL is live (Sunday main slate, Monday Night Football, Thursday Night Football).
-          NFL retains Priority #1, followed by NCAAF, NBA, MLB.
-        - Tuesday & Wednesday: Midweek football lull; standard seasonal priority applies.
+          NFL retains Priority #1, followed by NBA, NCAAF, MLB.
+        - Tuesday & Wednesday: Midweek football lull; NBA marquee regular season slates take priority over minor CFB games.
 
         Monthly Calendar Overview:
         - Sep: NFL/NCAAF kickoff, MLB pennant chase (NBA excluded)
@@ -104,9 +104,9 @@ class SportsSeasonRouter:
         if month == 9:
             base = ["NCAAF", "NFL", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "MLB"]
         elif month == 10:
-            base = ["NCAAF", "NFL", "NBA", "MLB"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA", "MLB"]
+            base = ["NCAAF", "NFL", "NBA", "MLB"] if is_cfb_primetime else ["NFL", "NBA", "NCAAF", "MLB"]
         elif month in (11, 12, 1):
-            base = ["NCAAF", "NFL", "NBA"] if is_cfb_primetime else ["NFL", "NCAAF", "NBA"]
+            base = ["NCAAF", "NFL", "NBA"] if is_cfb_primetime else ["NFL", "NBA", "NCAAF"]
         elif month == 2:
             base = ["NFL", "NBA"]
         elif month in (3, 4, 5, 6):

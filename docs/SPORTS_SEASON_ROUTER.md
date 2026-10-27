@@ -28,11 +28,11 @@ Low-liquidity leagues and off-market sports are permanently excluded from automa
 
 ## 2. Annual Calendar Priority Matrix
 
-The router inspects the current US Eastern Time (ET) date and month to determine active league priorities:
+The router inspects the current US Eastern Time (ET) date and month to determine active league priorities *(Note: Table shows the non-primetime default; on Friday and Saturday, NCAAF is elevated to Priority 1)*:
 
 | Month | Active Sports Phase | Priority 1 | Priority 2 | Priority 3 | Priority 4 | Behavior if Dormant |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Jan** | NFL Playoffs / CFP National Championship / NBA Midseason | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | — | Idle & Retry Discovery |
+| **Jan** | NFL Playoffs / CFP National Championship / NBA Midseason | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | — | Idle & Retry Discovery |
 | **Feb** | Super Bowl / NBA Post-All-Star | **NFL Super Bowl Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | — | — | Idle & Retry Discovery |
 | **Mar** | NBA Stretch Run / MLB Opening | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **MLB Opening Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | — | — | Idle & Retry Discovery |
 | **Apr** | NBA Playoffs / MLB Opening Month | **NBA Playoffs Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **MLB Complete Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | — | — | Idle & Retry Discovery |
@@ -41,9 +41,9 @@ The router inspects the current US Eastern Time (ET) date and month to determine
 | **Jul** | **Summer Lull:** MLB Midseason / All-Star | **MLB Complete Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | — | — | — | Idle & Retry Discovery |
 | **Aug** | MLB Pennant Races *(NFL/NCAAF Preseason Excluded)* | **MLB Complete Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | — | — | — | Idle & Retry Discovery |
 | **Sep** | NFL & College Football Kickoff / MLB Final Month | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **MLB Complete Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | — | Idle & Retry Discovery |
-| **Oct** | **Quadruple Overlap:** NFL, NCAAF, NBA Tip-Off, MLB World Series | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **MLB Postseason Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | Idle & Retry Discovery |
-| **Nov** | NFL Midseason / NCAAF Rivalry Month / NBA Reg Season | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | — | Idle & Retry Discovery |
-| **Dec** | NFL Playoff Push / NCAAF Bowl Season & CFP / NBA Christmas | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | — | Idle & Retry Discovery |
+| **Oct** | **Quadruple Overlap:** NFL, NCAAF, NBA Tip-Off, MLB World Series | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | **MLB Postseason Suite:**<br>• *Lines:* `KXMLBGAME`, `KXMLBSPREAD`, `KXMLBTOTAL`<br>• *Props:* `KXMLBKS`, `KXMLBHR`, `KXMLBHIT`, `KXMLBTB` | Idle & Retry Discovery |
+| **Nov** | NFL Midseason / NCAAF Rivalry Month / NBA Reg Season | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | — | Idle & Retry Discovery |
+| **Dec** | NFL Playoff Push / NCAAF Bowl Season & CFP / NBA Christmas | **NFL Complete Suite:**<br>• *Lines:* `KXNFLGAME`, `KXNFLSPREAD`, `KXNFLTOTAL`<br>• *Props:* `KXNFLTD`, `KXNFLPASSYDS`, `KXNFLRSHYDS`, `KXNFLRECYDS`, `KXNFLPASSTDS` | **NBA Complete Suite:**<br>• *Lines:* `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`<br>• *Props:* `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBAPRA` | **NCAAF Game Lines:**<br>• *Lines:* `KXNCAAFGAME`, `KXNCAAFSPREAD`, `KXNCAAFTOTAL` | — | Idle & Retry Discovery |
 
 
 
@@ -57,10 +57,11 @@ During football season (September through January), both the NFL and College Foo
   - *October Example*: `NCAAF` $\rightarrow$ `NFL` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
 - **Sunday, Monday, Thursday (NFL Game Days)**:
   - The NFL holds its primary slate on Sunday (early, afternoon, and Sunday Night Football), Monday Night Football, and Thursday Night Football.
-  - **NFL retains Priority 1**, ahead of NCAAF, NBA, and MLB.
-  - *October Example*: `NFL` $\rightarrow$ `NCAAF` $\rightarrow$ `NBA` $\rightarrow$ `MLB`.
+  - **NFL retains Priority 1**, followed by NBA, NCAAF, and MLB.
+  - *October Example*: `NFL` $\rightarrow$ `NBA` $\rightarrow$ `NCAAF` $\rightarrow$ `MLB`.
 - **Tuesday & Wednesday (Midweek Lulls)**:
-  - Standard seasonal priority applies; when no active NFL/NCAAF games are live, the waterfall seamlessly cascades to midweek NBA or MLB postseason games.
+  - NBA marquee regular season slates take priority over minor midweek college football games.
+  - *October Example*: `NFL` $\rightarrow$ `NBA` $\rightarrow$ `NCAAF` $\rightarrow$ `MLB`.
 
 
 ## 3. Routing & Selection Architecture
