@@ -464,3 +464,159 @@ async def test_quote_replacement_tolerance_updates_when_diff_exceeds_tolerance()
 
     bot.om.cancel_order.assert_called_once_with("bid_1")
     assert bot.om.place_order.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. CODERABBIT REVIEW REFINEMENT TESTS
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_expiration_blackout_unwind_quote_size_clamped_to_inventory():
+    """
+    In the expiration blackout unwind path, quote size must be clamped to abs(inventory)
+    to prevent overshooting and opening a new risk position on the opposite side.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-EXPIRING",
+        order_size=10,  # quote_size would normally be 10
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=15)
+
+    # Open inventory is only 2 contracts (less than order_size 10)
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=2)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+    bot._update_quotes = AsyncMock()
+
+    await bot._tick()
+
+    assert bot._current_quote_size == 2
+    bot._update_quotes.assert_called_once()
+    assert bot._update_quotes.call_args[0][0] is None
+    assert bot._update_quotes.call_args[0][1] is not None
+
+
+@pytest.mark.asyncio
+async def test_danger_zone_blackout_allows_exit_leg():
+    """
+    Danger-zone blackout should only suppress quotes that add risk.
+    When short at 18c (<= 20c), the BID is the exit/covering leg and must NOT be suppressed.
+    When long at 85c (>= 80c), the ASK is the exit/liquidating leg and must NOT be suppressed.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-DANGER",
+        order_size=1,
+        blackout_enabled=True,
+        blackout_danger_price_low=20.0,
+        blackout_danger_price_high=80.0,
+    )
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._update_quotes = AsyncMock()
+
+    # 1. Short inventory (-2) at 18c (mid <= 20c): BID must be permitted to cover
+    bot.inv_manager.get_position = MagicMock(return_value=-2)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(17, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(19, 10))
+    await bot._tick()
+    call_args_short = bot._update_quotes.call_args[0]
+    assert call_args_short[0] is not None  # BID allowed for short
+
+    # 2. Long inventory (+2) at 85c (mid >= 80c): ASK must be permitted to liquidate
+    bot._update_quotes.reset_mock()
+    bot._mid_price_history.clear()
+    bot._fast_market_until = 0.0
+    bot.inv_manager.get_position = MagicMock(return_value=2)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(84, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(86, 10))
+    await bot._tick()
+    call_args_long = bot._update_quotes.call_args[0]
+    assert call_args_long[1] is not None  # ASK allowed for long
+
+
+@pytest.mark.asyncio
+async def test_quote_replacement_tolerance_zero_unchanged_price_skips():
+    """
+    When quote_replacement_tolerance_cents is 0, an unchanged price (delta == 0)
+    must NOT trigger an order cancellation and replacement.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-TOLERANCE",
+        order_size=5,
+        quote_replacement_tolerance_cents=0,
+    )
+
+    bot.current_bid_id = "bid_1"
+    bot.current_bid_price = 45
+    bot.current_bid_size = 5
+    bot.current_ask_id = "ask_1"
+    bot.current_ask_price = 55
+    bot.current_ask_size = 5
+
+    bot.om.cancel_order = AsyncMock()
+    bot.om.place_order = AsyncMock()
+
+    # Prices are identical (45, 55) -> delta == 0 -> should skip update even with tolerance=0
+    await bot._update_quotes(45, 55)
+
+    bot.om.cancel_order.assert_not_called()
+    bot.om.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rotate_market_same_shard_skips_sweep():
+    """
+    When rotating to a market that resides on the same shard (e.g. Shard 3 to Shard 3),
+    rotate_market must skip sweep_shard_to_shard0 to prevent wasteful capital churn.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-A",
+        auto_sweep_reverse_enabled=True,
+    )
+    bot.exchange_index = 3
+
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.ob_manager.unsubscribe = AsyncMock()
+    bot.ob_manager.subscribe = AsyncMock()
+    bot.om.record_pnl_snapshot_async = AsyncMock()
+    bot.sweep_shard_to_shard0 = AsyncMock(return_value=True)
+    bot.ensure_shard_collateral = AsyncMock(return_value=True)
+    bot._refresh_market_metadata = AsyncMock()
+
+    # Both old market and new market map to Shard 3
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        await bot.rotate_market("KXTEST-B")
+
+    bot.sweep_shard_to_shard0.assert_not_called()
+    assert bot.exchange_index == 3
+
+
+@pytest.mark.asyncio
+async def test_stop_skips_sweep_if_quotes_not_cancelled():
+    """
+    In bot.stop(), if quotes_cancelled is False, reverse sweep must NOT run
+    to avoid pulling collateral away from unconfirmed resting orders.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-SWEEP",
+        auto_sweep_reverse_enabled=True,
+    )
+    bot.exchange_index = 3
+
+    bot._cancel_all_quotes = AsyncMock(return_value=False)
+    bot._escalate_to_kill_switch = AsyncMock(return_value=False)
+    bot.sweep_shard_to_shard0 = AsyncMock(return_value=True)
+    bot.om.record_pnl_snapshot_async = AsyncMock()
+
+    await bot.stop()
+
+    bot.sweep_shard_to_shard0.assert_not_called()
+
