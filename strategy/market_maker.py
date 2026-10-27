@@ -1024,6 +1024,8 @@ class AvellanedaStoikovBot:
                         f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
                         f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                     )
+                    # Never exceed the open position when unwinding
+                    self._current_quote_size = max(1, min(quote_size, int(abs(inventory))))
                     await self._update_quotes(optimal_bid, optimal_ask)
                     return
             else:
@@ -1234,7 +1236,7 @@ class AvellanedaStoikovBot:
         # In live binary sporting events, when mid_price <= blackout_danger_price_low (e.g. 20c),
         # the probability of settling to $0 is extreme. Suppress BUY YES quotes to prevent
         # accumulating inventory into a blowout wipeout.
-        if self.blackout_enabled and mid_price <= self.blackout_danger_price_low:
+        if self.blackout_enabled and mid_price <= self.blackout_danger_price_low and inventory >= 0:
             if optimal_bid is not None:
                 logger.info(
                     f"[DANGER-ZONE BLACKOUT] Mid {mid_price:.1f}c <= {self.blackout_danger_price_low}c. "
@@ -1248,7 +1250,7 @@ class AvellanedaStoikovBot:
 
         # Similarly, when mid_price >= blackout_danger_price_high (e.g. 80c),
         # suppress SELL YES quotes to prevent adverse short/NO accumulation.
-        if self.blackout_enabled and mid_price >= self.blackout_danger_price_high:
+        if self.blackout_enabled and mid_price >= self.blackout_danger_price_high and inventory <= 0:
             if optimal_ask is not None:
                 logger.info(
                     f"[DANGER-ZONE BLACKOUT] Mid {mid_price:.1f}c >= {self.blackout_danger_price_high}c. "
@@ -1301,7 +1303,8 @@ class AvellanedaStoikovBot:
         elif new_bid is not None and self.current_bid_price is None:
             bid_price_changed = True
         elif new_bid is not None and self.current_bid_price is not None:
-            bid_price_changed = abs(new_bid - self.current_bid_price) >= self.quote_replacement_tolerance_cents
+            bid_delta = abs(new_bid - self.current_bid_price)
+            bid_price_changed = bid_delta > 0 and bid_delta >= self.quote_replacement_tolerance_cents
 
         ask_price_changed = False
         if new_ask is None and self.current_ask_price is not None:
@@ -1309,7 +1312,8 @@ class AvellanedaStoikovBot:
         elif new_ask is not None and self.current_ask_price is None:
             ask_price_changed = True
         elif new_ask is not None and self.current_ask_price is not None:
-            ask_price_changed = abs(new_ask - self.current_ask_price) >= self.quote_replacement_tolerance_cents
+            ask_delta = abs(new_ask - self.current_ask_price)
+            ask_price_changed = ask_delta > 0 and ask_delta >= self.quote_replacement_tolerance_cents
 
         bid_needs_update = bid_price_changed or (new_bid is not None and target_bid_size != self.current_bid_size)
         ask_needs_update = ask_price_changed or (new_ask is not None and target_ask_size != self.current_ask_size)
@@ -1914,7 +1918,12 @@ class AvellanedaStoikovBot:
 
         # 1c. Sweep excess collateral from old trading shard back to Shard 0 if applicable
         old_exchange_index = getattr(self, "exchange_index", None)
-        if self.auto_sweep_reverse_enabled and old_exchange_index != 0 and old_exchange_index is not None:
+        new_exchange_index = await asyncio.to_thread(get_market_exchange_index, new_ticker)
+        if (
+            self.auto_sweep_reverse_enabled
+            and old_exchange_index not in (0, None)
+            and new_exchange_index != old_exchange_index
+        ):
             await self.sweep_shard_to_shard0(source_shard=old_exchange_index)
 
         # 2. Swap orderbook subscription
@@ -1923,7 +1932,7 @@ class AvellanedaStoikovBot:
 
         # 3. Update target ticker and reset state trackers
         self.ticker = new_ticker
-        self.exchange_index = await asyncio.to_thread(get_market_exchange_index, new_ticker)
+        self.exchange_index = new_exchange_index
         self._consecutive_hedge_failures = 0
         self._starvation_start_time = None
         self._starvation_alert_sent = False
@@ -2110,7 +2119,7 @@ class AvellanedaStoikovBot:
             logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
 
         # 2b. Sweep remaining funds back to Shard 0 on shutdown
-        if self.auto_sweep_reverse_enabled:
+        if self.auto_sweep_reverse_enabled and quotes_cancelled:
             try:
                 await self.sweep_shard_to_shard0(retain_dollars=0.0)
             except Exception as e:
