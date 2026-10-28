@@ -475,12 +475,12 @@ async def test_market_maker_ensure_shard_collateral_dynamic_floor_low_bankroll()
         bot = AvellanedaStoikovBot("KXNBAGAME-LOW-FUNDS")
         bot.shard0_reserve_dollars = 0.0
 
-        # Total account has $14.38 ($12.97 on Shard 3, $1.39 on Shard 0)
-        # min_required_dollars is $15.00, but effective_min should scale to $14.38
+        # Total account has $14.36 ($12.97 on Shard 3, $1.39 on Shard 0)
+        # min_required_dollars is $15.00, but effective_min should scale to $14.36
         bot.om.get_portfolio_balances = MagicMock(side_effect=[
-            {"total_balance_dollars": 14.38, "shard_balances": {0: 1.39, 3: 12.97}},
-            {"total_balance_dollars": 14.38, "shard_balances": {0: 0.0, 3: 14.36}},
-            {"total_balance_dollars": 14.38, "shard_balances": {0: 0.0, 3: 14.36}},
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 1.39, 3: 12.97}},
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 0.0, 3: 14.36}},
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 0.0, 3: 14.36}},
         ])
         bot.om.transfer_intra_exchange = MagicMock(return_value=True)
 
@@ -488,7 +488,7 @@ async def test_market_maker_ensure_shard_collateral_dynamic_floor_low_bankroll()
             res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
 
             assert res is True
-            # Needed is 14.38 - 12.97 = 1.41. Shard 0 has 1.39, so transfers $1.39
+            # Needed is 14.36 - 12.97 = 1.39. Shard 0 has 1.39, so transfers $1.39
             bot.om.transfer_intra_exchange.assert_called_once_with(
                 source_shard=0,
                 destination_shard=3,
@@ -547,7 +547,8 @@ async def test_market_maker_standard_quote_failure_triggers_background_rebalance
         bot = AvellanedaStoikovBot("KXNBAGAME-REBAL-TRIGGER")
         bot.om.place_order = AsyncMock(return_value=None)
         bot.ensure_shard_collateral = AsyncMock(return_value=True)
-        bot._last_shard_rebalance_time = 0.0  # Cooldown elapsed
+        bot._last_shard_rebalance_time = 0.0
+        bot._last_shard_rebalance_dispatch_time = 0.0  # Cooldown elapsed
 
         with patch("asyncio.create_task") as mock_create_task:
             # Place standard quote (not hedge: new_bid and new_ask both provided)

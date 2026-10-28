@@ -166,13 +166,13 @@ SPORT_EXPIRATION_BUFFERS_MINUTES = {
 def get_expiration_buffer_seconds(ticker: Optional[str] = None) -> int:
     """
     Returns the appropriate expiration cutoff buffer in seconds based on market ticker.
-    Matches sport prefixes (e.g. KXNBA -> 15m, KXMLB -> 30m, KXNFL -> 40m, KXNCAAF -> 45m),
+    Matches sport prefixes (e.g. KXNBA -> 15m, KXMLB -> 30m, KXNFL -> 40m, KXNCAAF/KXCFB -> 45m),
     falling back to MIN_TIME_TO_CLOSE_SECONDS for non-sports or unspecified tickers.
     """
     if ticker:
-        ticker_upper = ticker.upper()
-        # Check NCAAF first before NFL since KXNCAAF contains NCAAF
-        if "KXNCAAF" in ticker_upper or "_NCAAF" in ticker_upper:
+        ticker_upper = str(ticker).upper()
+        # Check NCAAF/CFB first before NFL since KXNCAAF contains NCAAF
+        if any(p in ticker_upper for p in ("KXNCAAF", "KXCFB", "_NCAAF", "_CFB")):
             return SPORT_EXPIRATION_BUFFERS_MINUTES["NCAAF"] * 60
         for league in ("NBA", "MLB", "NFL"):
             if f"KX{league}" in ticker_upper or f"_{league}" in ticker_upper:
