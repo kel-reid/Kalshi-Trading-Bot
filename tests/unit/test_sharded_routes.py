@@ -631,3 +631,73 @@ async def test_market_maker_standard_quote_failure_triggers_background_rebalance
             # Second failure on the same tick is suppressed by the 60s cooldown
             assert mock_create_task.call_count == 1
 
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_aborts_when_available_funds_below_order_dollars():
+    """Verify ensure_shard_collateral fails when total available funds cannot fund single order_dollars."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-SUB-ORDER-CAPITAL")
+        bot.order_dollars = 3.0
+        bot.shard0_reserve_dollars = 1.0
+
+        # Shard 3 has $1.10, Shard 0 has $0.00 -> available_funds = $1.10 < order_dollars ($3.00)
+        bot.om.get_portfolio_balances = MagicMock(return_value={
+            "total_balance_dollars": 1.10,
+            "shard_balances": {0: 0.00, 3: 1.10}
+        })
+        bot.om.transfer_intra_exchange = MagicMock()
+
+        res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+
+        assert res is False
+        bot.om.transfer_intra_exchange.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_aborts_when_subdollar_deficit_cannot_fund_order_dollars():
+    """Verify subdollar deficit check does not proceed if active shard balance < order_dollars."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-SUBDOLLAR-UNFUNDED")
+        bot.order_dollars = 3.0
+        bot.shard0_reserve_dollars = 0.0
+
+        # Shard 3 has $2.50, Shard 0 has $0.00 -> available_funds = $2.50 < $3.00
+        bot.om.get_portfolio_balances = MagicMock(return_value={
+            "total_balance_dollars": 2.50,
+            "shard_balances": {0: 0.00, 3: 2.50}
+        })
+        bot.om.transfer_intra_exchange = MagicMock()
+
+        res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+
+        assert res is False
+        bot.om.transfer_intra_exchange.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_transfers_and_passes_when_funds_reach_order_dollars():
+    """Verify ensure_shard_collateral transfers from Shard 0 and passes when available funds reach order_dollars."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-FUNDS-REACH-ORDER-CAPITAL")
+        bot.order_dollars = 3.0
+        bot.shard0_reserve_dollars = 0.0
+
+        # Shard 3 has $1.10, Shard 0 has $2.50 -> available_funds = $3.60 >= $3.00
+        # effective_min = min(15.0, 3.60) = $3.60 -> needed = 3.60 - 1.10 = $2.50
+        bot.om.get_portfolio_balances = MagicMock(side_effect=[
+            {"total_balance_dollars": 3.60, "shard_balances": {0: 2.50, 3: 1.10}},
+            {"total_balance_dollars": 3.60, "shard_balances": {0: 0.00, 3: 3.60}},
+            {"total_balance_dollars": 3.60, "shard_balances": {0: 0.00, 3: 3.60}},
+        ])
+        bot.om.transfer_intra_exchange = MagicMock(return_value=True)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+
+            assert res is True
+            bot.om.transfer_intra_exchange.assert_called_once_with(
+                source_shard=0,
+                destination_shard=3,
+                amount_dollars=2.50,
+            )
+
