@@ -406,10 +406,24 @@ class AvellanedaStoikovBot:
             shard0_balance = float(shard_balances.get(0, 0.0))
 
             total_account_balance = float(balances.get("total_balance_dollars", current_shard_balance + shard0_balance))
-            effective_min_dollars = min(min_required_dollars, max(1.0, round(total_account_balance, 2)))
+            available_sweep = max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2))
+            available_funds = round(current_shard_balance + available_sweep, 2)
+
+            order_capital_floor = max(1.0, float(self.order_dollars)) if (self.order_dollars is not None and math.isfinite(self.order_dollars)) else 1.0
+            req_dollars = float(min_required_dollars) if math.isfinite(min_required_dollars) else 15.0
+            min_target_floor = min(req_dollars, order_capital_floor)
+
+            if available_funds < min_target_floor:
+                logger.error(
+                    f"Available funds (${available_funds:.2f}) across Shard {target_shard} (${current_shard_balance:.2f}) "
+                    f"and sweepable Shard 0 (${available_sweep:.2f}) are insufficient to fund minimum order capital "
+                    f"(${min_target_floor:.2f}, ORDER_DOLLARS=${order_capital_floor:.2f}) for {self.ticker}."
+                )
+                return False
+
+            effective_min_dollars = min(req_dollars, max(min_target_floor, available_funds))
 
             needed_dollars = round(effective_min_dollars - current_shard_balance, 2)
-            available_sweep = round(shard0_balance - self.shard0_reserve_dollars, 2)
 
             if current_shard_balance >= effective_min_dollars:
                 # Target shard already meets minimum required collateral.
@@ -449,13 +463,13 @@ class AvellanedaStoikovBot:
                 )
 
                 # Check available transfer amount from Shard 0
-                transfer_amount = min(needed_dollars, max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2)))
+                transfer_amount = min(needed_dollars, available_sweep)
                 if transfer_amount < 1.0:
-                    if needed_dollars < 1.0 and current_shard_balance >= 1.0:
+                    if needed_dollars < 1.0 and current_shard_balance >= min_target_floor:
                         logger.info(
                             f"Transfer amount (${transfer_amount:.2f}) is below minimum transfer ($1.00), "
                             f"and deficit (${needed_dollars:.2f}) is sub-dollar. Target Shard {target_shard} "
-                            f"already holds ${current_shard_balance:.2f}. Proceeding with existing shard collateral."
+                            f"already holds ${current_shard_balance:.2f} (>= ${min_target_floor:.2f}). Proceeding with existing shard collateral."
                         )
                         return True
                     logger.error(
