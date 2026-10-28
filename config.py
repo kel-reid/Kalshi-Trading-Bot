@@ -1,6 +1,7 @@
 import math
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # Automatically load environment variables from a .env file if present
