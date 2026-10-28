@@ -1,6 +1,7 @@
 import math
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # Automatically load environment variables from a .env file if present
@@ -145,6 +146,38 @@ if os.getenv("EXPIRATION_BUFFER_MINUTES"):
 else:
     MIN_TIME_TO_CLOSE_SECONDS = _get_int_env("MIN_TIME_TO_CLOSE_SECONDS", 2700, allow_zero=True)
     EXPIRATION_BUFFER_MINUTES = MIN_TIME_TO_CLOSE_SECONDS // 60
+
+# Sport-Specific Expiration Cutoff Buffers (Minutes)
+# Real-world sports durations differ widely (NBA: ~2h, MLB: ~2.5h, NFL: ~3.25h, NCAAF: ~3.5-4h).
+# Dedicated buffers prevent premature mid-game shutdowns in fast sports (e.g. NBA 4th quarter).
+EXPIRATION_BUFFER_MINUTES_NBA = _get_int_env("EXPIRATION_BUFFER_MINUTES_NBA", 15, allow_zero=True)
+EXPIRATION_BUFFER_MINUTES_MLB = _get_int_env("EXPIRATION_BUFFER_MINUTES_MLB", 30, allow_zero=True)
+EXPIRATION_BUFFER_MINUTES_NFL = _get_int_env("EXPIRATION_BUFFER_MINUTES_NFL", 40, allow_zero=True)
+EXPIRATION_BUFFER_MINUTES_NCAAF = _get_int_env("EXPIRATION_BUFFER_MINUTES_NCAAF", 45, allow_zero=True)
+
+SPORT_EXPIRATION_BUFFERS_MINUTES = {
+    "NBA": EXPIRATION_BUFFER_MINUTES_NBA,
+    "MLB": EXPIRATION_BUFFER_MINUTES_MLB,
+    "NFL": EXPIRATION_BUFFER_MINUTES_NFL,
+    "NCAAF": EXPIRATION_BUFFER_MINUTES_NCAAF,
+}
+
+
+def get_expiration_buffer_seconds(ticker: Optional[str] = None) -> int:
+    """
+    Returns the appropriate expiration cutoff buffer in seconds based on market ticker.
+    Matches sport prefixes (e.g. KXNBA -> 15m, KXMLB -> 30m, KXNFL -> 40m, KXNCAAF/KXCFB -> 45m),
+    falling back to MIN_TIME_TO_CLOSE_SECONDS for non-sports or unspecified tickers.
+    """
+    if ticker:
+        ticker_upper = str(ticker).upper()
+        # Check NCAAF/CFB first before NFL since KXNCAAF contains NCAAF
+        if any(p in ticker_upper for p in ("KXNCAAF", "KXCFB", "_NCAAF", "_CFB")):
+            return SPORT_EXPIRATION_BUFFERS_MINUTES["NCAAF"] * 60
+        for league in ("NBA", "MLB", "NFL"):
+            if f"KX{league}" in ticker_upper or f"_{league}" in ticker_upper:
+                return SPORT_EXPIRATION_BUFFERS_MINUTES[league] * 60
+    return MIN_TIME_TO_CLOSE_SECONDS
 
 MAX_EXPIRATION_DAYS = _get_float_env("MAX_EXPIRATION_DAYS", 8.0) # Rolling window (days) for automated sports discovery
 

@@ -425,3 +425,136 @@ async def test_market_maker_hedge_failure_uses_dynamic_collateral_floor():
         await bot._update_quotes(new_bid=None, new_ask=60)
 
         bot.ensure_shard_collateral.assert_awaited_once_with(min_required_dollars=35.0)
+
+
+def test_order_manager_get_portfolio_balances_retries_429_with_backoff():
+    """Verify get_portfolio_balances rate-limits and retries with backoff on HTTP 429."""
+    om = OrderManager()
+    om.rate_limiter = MagicMock()
+
+    resp_429 = MockResponse({"error": "rate limited"}, 429)
+    resp_200 = MockResponse({
+        "balance_dollars": 14.38,
+        "balance_breakdown": [
+            {"exchange_index": 0, "balance": 1.39},
+            {"exchange_index": 3, "balance": 12.97},
+        ]
+    }, 200)
+
+    with patch("requests.get", side_effect=[resp_429, resp_200]) as mock_get:
+        with patch("time.sleep") as mock_sleep:
+            res = om.get_portfolio_balances()
+
+            assert res["total_balance_dollars"] == 14.38
+            assert res["shard_balances"][3] == 12.97
+            assert mock_get.call_count == 2
+            assert om.rate_limiter.acquire_sync.call_count == 2
+            mock_sleep.assert_called_once_with(1.0)  # Base delay on attempt 1
+
+
+def test_order_manager_transfer_intra_exchange_rate_limited():
+    """Verify transfer_intra_exchange invokes rate limiter before dispatching transfer."""
+    om = OrderManager()
+    om.rate_limiter = MagicMock()
+    om._post_request = MagicMock(return_value=MockResponse({"status": "complete"}, 201))
+
+    success = om.transfer_intra_exchange(
+        source_shard=0,
+        destination_shard=3,
+        amount_dollars=5.0,
+    )
+
+    assert success is True
+    om.rate_limiter.acquire_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_dynamic_floor_low_bankroll():
+    """Verify ensure_shard_collateral scales floor to account balance when bankroll < $15."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-LOW-FUNDS")
+        bot.shard0_reserve_dollars = 0.0
+
+        # Total account has $14.36 ($12.97 on Shard 3, $1.39 on Shard 0)
+        # min_required_dollars is $15.00, but effective_min should scale to $14.36
+        bot.om.get_portfolio_balances = MagicMock(side_effect=[
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 1.39, 3: 12.97}},
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 0.0, 3: 14.36}},
+            {"total_balance_dollars": 14.36, "shard_balances": {0: 0.0, 3: 14.36}},
+        ])
+        bot.om.transfer_intra_exchange = MagicMock(return_value=True)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+
+            assert res is True
+            # Needed is 14.36 - 12.97 = 1.39. Shard 0 has 1.39, so transfers $1.39
+            bot.om.transfer_intra_exchange.assert_called_once_with(
+                source_shard=0,
+                destination_shard=3,
+                amount_dollars=1.39,
+            )
+
+
+@pytest.mark.asyncio
+async def test_market_maker_ensure_shard_collateral_proceeds_when_shard0_below_min_transfer():
+    """Verify ensure_shard_collateral proceeds when Shard 0 < $1.00 but active shard has collateral."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-LOW-SHARD0")
+        bot.shard0_reserve_dollars = 0.0
+
+        # Shard 3 has $12.97, Shard 0 has $0.50 (cannot transfer < $1.00)
+        bot.om.get_portfolio_balances = MagicMock(return_value={
+            "total_balance_dollars": 13.47,
+            "shard_balances": {0: 0.50, 3: 12.97}
+        })
+        bot.om.transfer_intra_exchange = MagicMock()
+
+        res = await bot.ensure_shard_collateral(min_required_dollars=15.0)
+
+        assert res is True
+        # No transfer attempted because Shard 0 has < $1.00
+        bot.om.transfer_intra_exchange.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_market_maker_startup_gating_aborts_on_uncollateralized_shard():
+    """Verify that bot startup aborts with RuntimeError when shard collateral fails across all 3 retries."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-STARTUP-GATE")
+        bot.om.sync_and_recover_state = AsyncMock()
+        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.is_connected = True
+        bot.inv_manager.hydrate = AsyncMock(return_value=True)
+        bot.ensure_shard_collateral = AsyncMock(return_value=False)
+        bot._refresh_market_metadata = AsyncMock()
+
+        with patch("strategy.market_maker.start_metrics_server"):
+            with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    with pytest.raises(RuntimeError, match="Startup failed: Insufficient verified shard collateral"):
+                        await bot.start()
+
+                    assert bot.ensure_shard_collateral.await_count == 3
+                    assert bot.running is False
+                    mock_alert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_maker_standard_quote_failure_triggers_background_rebalance():
+    """Verify standard BID order placement failure triggers shard rebalance after 60s cooldown."""
+    with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
+        bot = AvellanedaStoikovBot("KXNBAGAME-REBAL-TRIGGER")
+        bot.om.place_order = AsyncMock(return_value=None)
+        bot.ensure_shard_collateral = AsyncMock(return_value=True)
+        bot._last_shard_rebalance_time = 0.0
+        bot._last_shard_rebalance_dispatch_time = 0.0  # Cooldown elapsed
+
+        with patch("asyncio.create_task") as mock_create_task:
+            # Place standard quote (not hedge: new_bid and new_ask both provided)
+            await bot._update_quotes(new_bid=40, new_ask=60)
+
+            # Background task must be launched for ensure_shard_collateral on first order failure
+            # Second failure on the same tick is suppressed by the 60s cooldown
+            assert mock_create_task.call_count == 1
+

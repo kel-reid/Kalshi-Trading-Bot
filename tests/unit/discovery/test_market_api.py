@@ -433,3 +433,25 @@ def test_legacy_patch_import_attributes_compatibility():
     finally:
         if saved_md is not None:
             sys.modules["utils.market_discovery"] = saved_md
+
+
+def test_fetch_eligible_markets_handles_non_string_ticker():
+    """Verify fetch_eligible_markets gracefully handles markets with non-string tickers (e.g. int 42 or None)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    future_time = (now + datetime.timedelta(hours=2)).isoformat()
+    mock_markets = [
+        {"ticker": 42, "status": "active", "close_time": future_time},
+        {"ticker": None, "status": "active", "close_time": future_time},
+        {"ticker": "KXNBAGAME-VALID", "status": "active", "close_time": future_time},
+    ]
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"markets": mock_markets}
+        mock_get.return_value = mock_resp
+
+        eligible = fetch_eligible_markets()
+        assert len(eligible) == 3
+        assert eligible[0]["ticker"] == 42
+        assert eligible[1]["ticker"] is None
+        assert eligible[2]["ticker"] == "KXNBAGAME-VALID"
