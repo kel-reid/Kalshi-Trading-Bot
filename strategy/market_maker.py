@@ -406,10 +406,11 @@ class AvellanedaStoikovBot:
             shard0_balance = float(shard_balances.get(0, 0.0))
 
             total_account_balance = float(balances.get("total_balance_dollars", current_shard_balance + shard0_balance))
-            effective_min_dollars = min(min_required_dollars, max(1.0, round(total_account_balance, 2)))
+            available_sweep = max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2))
+            available_funds = round(current_shard_balance + available_sweep, 2)
+            effective_min_dollars = min(min_required_dollars, max(1.0, available_funds))
 
             needed_dollars = round(effective_min_dollars - current_shard_balance, 2)
-            available_sweep = round(shard0_balance - self.shard0_reserve_dollars, 2)
 
             if current_shard_balance >= effective_min_dollars:
                 # Target shard already meets minimum required collateral.
@@ -449,7 +450,7 @@ class AvellanedaStoikovBot:
                 )
 
                 # Check available transfer amount from Shard 0
-                transfer_amount = min(needed_dollars, max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2)))
+                transfer_amount = min(needed_dollars, available_sweep)
                 if transfer_amount < 1.0:
                     if needed_dollars < 1.0 and current_shard_balance >= 1.0:
                         logger.info(
