@@ -374,6 +374,7 @@ class AvellanedaStoikovBot:
         self.exchange_index: Optional[int] = get_market_exchange_index(self.ticker)
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
+        self._last_shard_rebalance_dispatch_time: float = 0.0
 
     async def ensure_shard_collateral(self, min_required_dollars: float = 15.0) -> bool:
         """
@@ -404,26 +405,29 @@ class AvellanedaStoikovBot:
             current_shard_balance = float(shard_balances.get(target_shard, 0.0))
             shard0_balance = float(shard_balances.get(0, 0.0))
 
-            needed_dollars = round(min_required_dollars - current_shard_balance, 2)
+            total_account_balance = float(balances.get("total_balance_dollars", current_shard_balance + shard0_balance))
+            effective_min_dollars = min(min_required_dollars, max(1.0, round(total_account_balance, 2)))
+
+            needed_dollars = round(effective_min_dollars - current_shard_balance, 2)
             available_sweep = round(shard0_balance - self.shard0_reserve_dollars, 2)
 
-            if current_shard_balance >= min_required_dollars:
+            if current_shard_balance >= effective_min_dollars:
                 # Target shard already meets minimum required collateral.
                 # If auto-sweep is enabled, sweep idle capital from Shard 0 to active sports shard
                 if self.auto_sweep_shard0_enabled and available_sweep >= 1.0:
                     logger.info(
-                        f"Shard {target_shard} funded (${current_shard_balance:.2f} >= ${min_required_dollars:.2f}), "
+                        f"Shard {target_shard} funded (${current_shard_balance:.2f} >= ${effective_min_dollars:.2f}), "
                         f"but idle capital detected in Shard 0 (${shard0_balance:.2f}). "
                         f"Initiating automated sweep of ${available_sweep:.2f} to Shard {target_shard}."
                     )
                     transfer_amount = available_sweep
                 elif self.auto_sweep_reverse_enabled and target_shard != 0:
-                    # Check if target shard has excessive surplus above min_required + retain
-                    surplus = round(current_shard_balance - (min_required_dollars + self.shard_retain_dollars), 2)
+                    # Check if target shard has excessive surplus above effective_min + retain
+                    surplus = round(current_shard_balance - (effective_min_dollars + self.shard_retain_dollars), 2)
                     if surplus >= 1.0:
                         logger.info(
                             f"Surplus capital detected in Shard {target_shard} (${current_shard_balance:.2f} > "
-                            f"${min_required_dollars:.2f} + ${self.shard_retain_dollars:.2f}). "
+                            f"${effective_min_dollars:.2f} + ${self.shard_retain_dollars:.2f}). "
                             f"Initiating automated reverse sweep of ${surplus:.2f} to Shard 0."
                         )
                         await asyncio.to_thread(
@@ -441,20 +445,25 @@ class AvellanedaStoikovBot:
 
                 logger.warning(
                     f"Shard {target_shard} balance (${current_shard_balance:.2f}) below required "
-                    f"${min_required_dollars:.2f}. Initiating rebalance from Shard 0 (balance: ${shard0_balance:.2f})."
+                    f"${effective_min_dollars:.2f}. Initiating rebalance from Shard 0 (balance: ${shard0_balance:.2f})."
                 )
 
-                # Check if Shard 0 has funds to cover
-                if shard0_balance < needed_dollars:
-                    transfer_amount = max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2))
-                    if transfer_amount < 1.0:
-                        logger.error(
-                            f"Cannot transfer to Shard {target_shard}: Shard 0 balance (${shard0_balance:.2f}) "
-                            f"insufficient for minimum transfer ($1.00)."
+                # Check available transfer amount from Shard 0
+                transfer_amount = min(needed_dollars, max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2)))
+                if transfer_amount < 1.0:
+                    if needed_dollars < 1.0 and current_shard_balance >= 1.0:
+                        logger.info(
+                            f"Transfer amount (${transfer_amount:.2f}) is below minimum transfer ($1.00), "
+                            f"and deficit (${needed_dollars:.2f}) is sub-dollar. Target Shard {target_shard} "
+                            f"already holds ${current_shard_balance:.2f}. Proceeding with existing shard collateral."
                         )
-                        return False
-                else:
-                    transfer_amount = needed_dollars
+                        return True
+                    logger.error(
+                        f"Cannot transfer to Shard {target_shard}: transfer amount (${transfer_amount:.2f}) "
+                        f"insufficient for minimum transfer ($1.00) and Shard {target_shard} balance (${current_shard_balance:.2f}) "
+                        f"is below required ${effective_min_dollars:.2f} (needed: ${needed_dollars:.2f})."
+                    )
+                    return False
 
             transfer_ok = await asyncio.to_thread(
                 self.om.transfer_intra_exchange,
@@ -475,7 +484,7 @@ class AvellanedaStoikovBot:
                     shard_balances = balances.get("shard_balances", {})
                     current_shard_balance = float(shard_balances.get(target_shard, 0.0))
                     if needed_dollars > 0:
-                        if current_shard_balance >= min_required_dollars:
+                        if current_shard_balance >= effective_min_dollars:
                             logger.info(
                                 f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
                                 f"(attempt {attempt + 1}/6)."
@@ -488,13 +497,13 @@ class AvellanedaStoikovBot:
                                 f"(attempt {attempt + 1}/6)."
                             )
                             return True
-                        elif current_shard_balance >= min_required_dollars and attempt == 5:
+                        elif current_shard_balance >= effective_min_dollars and attempt == 5:
                             return True
 
                 if needed_dollars > 0:
                     logger.error(
                         f"Shard {target_shard} balance (${current_shard_balance:.2f}) not funded with required "
-                        f"${min_required_dollars:.2f} after transfer acceptance."
+                        f"${effective_min_dollars:.2f} after transfer acceptance."
                     )
                     return False
                 return True
@@ -628,7 +637,24 @@ class AvellanedaStoikovBot:
         # 3a. Ensure exchange shard collateral before quoting starts
         if getattr(self, "exchange_index", None) is None:
             self.exchange_index = await asyncio.to_thread(get_market_exchange_index, self.ticker)
-        await self.ensure_shard_collateral()
+
+        collateral_ok = False
+        for attempt in range(3):
+            if await self.ensure_shard_collateral():
+                collateral_ok = True
+                break
+            logger.warning(
+                f"Shard collateral verification attempt {attempt + 1}/3 failed for {self.ticker}. "
+                f"Retrying in 3.0s..."
+            )
+            await asyncio.sleep(3.0)
+
+        if not collateral_ok:
+            logger.critical(f"Failed to ensure exchange shard collateral for {self.ticker}. Aborting startup.")
+            await send_alert(f"Startup Aborted: Failed to secure shard collateral for {self.ticker}.")
+            self.running = False
+            raise RuntimeError(f"Startup failed: Insufficient verified shard collateral for {self.ticker}.")
+
         await self._refresh_market_metadata()
 
         # 3b. Launch the periodic reconciliation background task
@@ -1405,6 +1431,15 @@ class AvellanedaStoikovBot:
                                 f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
                             )
                             self._market_inactive = True
+                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                        logger.warning(
+                            f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                            f"Triggering background shard collateral rebalance..."
+                        )
+                        self._last_shard_rebalance_dispatch_time = now
+                        rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                        self._background_tasks.add(rebal_task)
+                        rebal_task.add_done_callback(self._background_tasks.discard)
 
         # Place new ASK if needed
         if ask_needs_update and not in_error_cooldown:
@@ -1449,6 +1484,15 @@ class AvellanedaStoikovBot:
                                 f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
                             )
                             self._market_inactive = True
+                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                        logger.warning(
+                            f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                            f"Triggering background shard collateral rebalance..."
+                        )
+                        self._last_shard_rebalance_dispatch_time = now
+                        rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                        self._background_tasks.add(rebal_task)
+                        rebal_task.add_done_callback(self._background_tasks.discard)
 
 
 

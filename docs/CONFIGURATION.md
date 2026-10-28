@@ -37,7 +37,11 @@ The bot reads its settings from environment variables. Locally, it also loads a 
 | `PRICE_VELOCITY_WINDOW_SECONDS` | `float` | `20.0` | Rolling window used to measure that move. |
 | `PRICE_VELOCITY_QUIESCE_SECONDS` | `float` | `30.0` | How long quotes stay pulled after the breaker trips. |
 | `MAX_EXPIRATION_DAYS` | `float` | `8.0` | Only markets expiring within this many days are eligible, to avoid locking up capital. |
-| `EXPIRATION_BUFFER_MINUTES` | `integer` | `90` | Minutes before expiry when the bot stops quoting, liquidates and rotates. |
+| `EXPIRATION_BUFFER_MINUTES` | `integer` | `45` | Default minutes before expiry when the bot stops quoting, liquidates and rotates (used if no sport-specific buffer matches). |
+| `EXPIRATION_BUFFER_MINUTES_NBA` | `integer` | `15` | Minutes before expiry for NBA games (`KXNBAGAME`, `KXNBA`). Shorter duration accounts for ~2-hour games and preserves quoting through 4th quarter. |
+| `EXPIRATION_BUFFER_MINUTES_MLB` | `integer` | `30` | Minutes before expiry for MLB baseball games (`KXMLBGAME`, `KXMLB`). |
+| `EXPIRATION_BUFFER_MINUTES_NFL` | `integer` | `40` | Minutes before expiry for NFL games (`KXNFLGAME`, `KXNFL`). |
+| `EXPIRATION_BUFFER_MINUTES_NCAAF` | `integer` | `45` | Minutes before expiry for College Football games (`KXCFBGAME`, `KXNCAAFGAME`, `KXCFB`). |
 
 ## Database
 

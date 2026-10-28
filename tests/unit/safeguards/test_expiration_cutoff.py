@@ -136,3 +136,108 @@ class TestExpirationCutoffSafeguard:
         # Clean reload back to environment state
         importlib.reload(config)
 
+    def test_sport_specific_expiration_buffers_resolution(self):
+        """Validates that get_expiration_buffer_seconds returns appropriate sport-specific cutoffs."""
+        import importlib
+        import os
+        import config
+
+        defaults = {
+            "EXPIRATION_BUFFER_MINUTES_NBA": "15",
+            "EXPIRATION_BUFFER_MINUTES_MLB": "30",
+            "EXPIRATION_BUFFER_MINUTES_NFL": "40",
+            "EXPIRATION_BUFFER_MINUTES_NCAAF": "45",
+        }
+        with patch.dict(os.environ, defaults):
+            importlib.reload(config)
+            from config import get_expiration_buffer_seconds
+
+            # NBA: 15 minutes = 900 seconds
+            assert get_expiration_buffer_seconds("KXNBAGAME-26OCT27BKNBOS-BKN") == 900
+            assert get_expiration_buffer_seconds("KXNBA-TEST") == 900
+
+            # MLB: 30 minutes = 1800 seconds
+            assert get_expiration_buffer_seconds("KXMLBGAME-26OCT27NYYBAL-NYY") == 1800
+            assert get_expiration_buffer_seconds("KXMLB-TEST") == 1800
+
+            # NFL: 40 minutes = 2400 seconds
+            assert get_expiration_buffer_seconds("KXNFLGAME-26OCT27KCBUF-KC") == 2400
+            assert get_expiration_buffer_seconds("KXNFL-TEST") == 2400
+
+            # College Football: 45 minutes = 2700 seconds
+            assert get_expiration_buffer_seconds("KXCFBGAME-26OCT27USCSTAN-USC") == 2700
+            assert get_expiration_buffer_seconds("KXCFB-TEST") == 2700
+            assert get_expiration_buffer_seconds("KXNCAAFGAME-TEST") == 2700
+            assert get_expiration_buffer_seconds("CUSTOM_CFB_TEST") == 2700
+            assert get_expiration_buffer_seconds("CUSTOM_NCAAF_TEST") == 2700
+
+            # Fallback / Default: 45 minutes = 2700 seconds
+            assert get_expiration_buffer_seconds("UNKNOWN-TICKER") == 2700
+            assert get_expiration_buffer_seconds(None) == 2700
+
+        # Regression: When default fallback is set below 45m (e.g. 5m = 300s),
+        # KXCFBGAME must still resolve to 45m (2700s) and not fall back to 300s.
+        with patch.dict(os.environ, {"EXPIRATION_BUFFER_MINUTES": "5", **defaults}):
+            importlib.reload(config)
+            from config import get_expiration_buffer_seconds
+            assert config.MIN_TIME_TO_CLOSE_SECONDS == 300
+            assert get_expiration_buffer_seconds("KXCFBGAME-TEST") == 2700
+            assert get_expiration_buffer_seconds("KXCFB-GAME") == 2700
+            assert get_expiration_buffer_seconds("UNKNOWN-TICKER") == 300
+
+        # Clean reload back to environment state
+        importlib.reload(config)
+
+    def test_nba_market_remains_active_at_20_minutes_to_close(self):
+        """NBA market with 20 minutes remaining is active under the 15m NBA buffer."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        twenty_mins_left = (now + datetime.timedelta(minutes=20)).isoformat()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "market": {
+                "ticker": "KXNBAGAME-26OCT27BKNBOS-BKN",
+                "status": "active",
+                "close_time": twenty_mins_left,
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            status = check_market_status("KXNBAGAME-26OCT27BKNBOS-BKN")
+            assert status == "active"
+            assert is_market_active("KXNBAGAME-26OCT27BKNBOS-BKN") is True
+
+    def test_nfl_market_marked_closed_at_35_minutes_to_close(self):
+        """NFL market with 35 minutes remaining is marked closed under the 40m NFL buffer."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        thirty_five_mins_left = (now + datetime.timedelta(minutes=35)).isoformat()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "market": {
+                "ticker": "KXNFLGAME-26OCT27KCBUF-KC",
+                "status": "active",
+                "close_time": thirty_five_mins_left,
+            }
+        }
+        with patch("requests.get", return_value=mock_resp):
+            status = check_market_status("KXNFLGAME-26OCT27KCBUF-KC")
+            assert status == "closed"
+            assert is_market_active("KXNFLGAME-26OCT27KCBUF-KC") is False
+
+    def test_sport_buffer_env_overrides(self):
+        """Validates that environment variables override sport-specific expiration buffers."""
+        import importlib
+        import os
+        import config
+
+        with patch.dict(os.environ, {"EXPIRATION_BUFFER_MINUTES_NBA": "20"}, clear=False):
+            importlib.reload(config)
+            assert config.EXPIRATION_BUFFER_MINUTES_NBA == 20
+            assert config.get_expiration_buffer_seconds("KXNBAGAME-TEST") == 1200
+
+        # Clean reload back to environment state
+        importlib.reload(config)
+
+

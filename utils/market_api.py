@@ -154,8 +154,9 @@ def fetch_eligible_markets(
             if close_time_str:
                 if close_dt is None:
                     continue
-                from config import MIN_TIME_TO_CLOSE_SECONDS
-                if (close_dt - now_utc).total_seconds() <= MIN_TIME_TO_CLOSE_SECONDS:
+                from config import get_expiration_buffer_seconds
+                cutoff_sec = get_expiration_buffer_seconds(str(m.get("ticker") or ""))
+                if (close_dt - now_utc).total_seconds() <= cutoff_sec:
                     continue
             if not _is_within_horizon(m, max_expiration_days, now_utc):
                 continue
@@ -297,12 +298,13 @@ def check_market_status(ticker: str) -> Optional[str]:
                 md = sys.modules.get("utils.market_discovery")
                 dt_module = getattr(md, "datetime", datetime) if md else datetime
                 now_utc = dt_module.datetime.now(datetime.timezone.utc)
-                from config import MIN_TIME_TO_CLOSE_SECONDS
+                from config import get_expiration_buffer_seconds
+                cutoff_sec = get_expiration_buffer_seconds(ticker)
                 remaining_sec = (close_dt - now_utc).total_seconds()
-                if remaining_sec <= MIN_TIME_TO_CLOSE_SECONDS:
+                if remaining_sec <= cutoff_sec:
                     logger.info(
                         f"Market {ticker} is within expiration cutoff "
-                        f"({remaining_sec:.0f}s <= {MIN_TIME_TO_CLOSE_SECONDS}s, close_time: {close_time_str}); "
+                        f"({remaining_sec:.0f}s <= {cutoff_sec}s, close_time: {close_time_str}); "
                         f"treating as closed."
                     )
                     return "closed"
