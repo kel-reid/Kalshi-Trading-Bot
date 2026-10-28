@@ -116,6 +116,7 @@ MarketMaker - INFO - >> Placing new ASK: 4 YES @ 27c
 | Document | What's in it |
 | :--- | :--- |
 | [How It Works](docs/HOW_IT_WORKS.md) | Startup, the per-second quoting loop and each safeguard |
+| [Quantitative Trading Guide](docs/QUANTITATIVE_TRADING_GUIDE.md) | Deep-dive on market making math, LOB dynamics, adverse selection, binary options, and system invariants |
 | [Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md) | Why each design choice was made |
 | [Configuration](docs/CONFIGURATION.md) | Every parameter and its default |
 | [Setup & Operations Guide](docs/SETUP_GUIDE.md) | Provisioning, deploying and operating the bot |
