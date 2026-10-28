@@ -18,6 +18,7 @@ import certifi
 import psycopg2
 from psycopg2 import pool
 import datetime
+import time
 from typing import Dict, Any, List, Optional, Union
 from utils.rate_limiter import RateLimiter
 from utils.metrics import measure_latency, ORDERS_PLACED_TOTAL, ORDER_ERRORS_TOTAL
@@ -984,31 +985,52 @@ class OrderManager:
         }
         """
         sign_path = "/trade-api/v2/portfolio/balance"
-        headers = get_auth_headers(method="GET", sign_path=sign_path)
-        try:
-            resp = requests.get(
-                BASE_URL + sign_path,
-                headers=headers,
-                timeout=10,
-                verify=certifi.where()
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                shards: Dict[int, float] = {}
-                for b in data.get("balance_breakdown", []):
-                    idx = b.get("exchange_index")
-                    if idx is not None:
-                        shards[int(idx)] = float(b.get("balance", 0.0))
-                total_dollars = float(data.get("balance_dollars") or (data.get("balance", 0) / 100.0))
-                return {
-                    "total_balance_dollars": total_dollars,
-                    "shard_balances": shards
-                }
-            logger.error(f"Failed to fetch portfolio balances: {resp.status_code} - {resp.text}")
-            return {"total_balance_dollars": 0.0, "shard_balances": {}}
-        except Exception as e:
-            logger.error(f"Exception fetching portfolio balances: {e}")
-            return {"total_balance_dollars": 0.0, "shard_balances": {}}
+        max_retries = 3
+        base_delay = 1.0
+
+        for attempt in range(max_retries + 1):
+            self.rate_limiter.acquire_sync()
+            headers = get_auth_headers(method="GET", sign_path=sign_path)
+            try:
+                resp = requests.get(
+                    BASE_URL + sign_path,
+                    headers=headers,
+                    timeout=10,
+                    verify=certifi.where()
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    shards: Dict[int, float] = {}
+                    for b in data.get("balance_breakdown", []):
+                        idx = b.get("exchange_index")
+                        if idx is not None:
+                            shards[int(idx)] = float(b.get("balance", 0.0))
+                    total_dollars = float(data.get("balance_dollars") or (data.get("balance", 0) / 100.0))
+                    return {
+                        "total_balance_dollars": total_dollars,
+                        "shard_balances": shards
+                    }
+                elif resp.status_code == 429:
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Rate limited (429) fetching portfolio balances. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})"
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(
+                            f"Failed to fetch portfolio balances after {max_retries} retries due to 429 rate limit."
+                        )
+                        return {"total_balance_dollars": 0.0, "shard_balances": {}}
+                else:
+                    logger.error(f"Failed to fetch portfolio balances: {resp.status_code} - {resp.text}")
+                    return {"total_balance_dollars": 0.0, "shard_balances": {}}
+            except Exception as e:
+                logger.error(f"Exception fetching portfolio balances: {e}")
+                return {"total_balance_dollars": 0.0, "shard_balances": {}}
+
+        return {"total_balance_dollars": 0.0, "shard_balances": {}}
 
     def transfer_intra_exchange(
         self,
@@ -1026,6 +1048,8 @@ class OrderManager:
         if amount_centicents <= 0:
             logger.warning(f"Invalid transfer amount: {amount_dollars} (centicents: {amount_centicents})")
             return False
+
+        self.rate_limiter.acquire_sync()
             
         sign_path = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
         payload = {

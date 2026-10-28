@@ -94,3 +94,11 @@ graph TD
    - **Post-Fill Pause**: Pauses quoting for 3.0 seconds following execution fills to allow resting orderbook depth to recover.
    - **Pre-Settlement Liquidation**: Ceases quoting and liquidates open inventory in rate-limited slices 90 minutes before contract expiration.
    - **Session Stop-Loss & Fee Churn**: Enforces strict loss limits ($3.00) and fee caps ($2.50) before triggering auto-liquidation and market rotation.
+
+---
+
+## Further Reading
+
+- [Quantitative Trading & Market Making Guide](../QUANTITATIVE_TRADING_GUIDE.md): Mathematical derivations (Avellaneda-Stoikov HJB equations, fee curves, reservation pricing), microstructure dynamics, adverse selection defenses, and financial accounting invariants.
+- [How It Works](../HOW_IT_WORKS.md): High-level breakdown of the tick quoting loop and shutdown sequence.
+- [Architecture Decisions](../ARCHITECTURE_DECISIONS.md): Engineering decisions behind concurrency, state reconciliation, and operational risk.
