@@ -374,6 +374,7 @@ class AvellanedaStoikovBot:
         self.exchange_index: Optional[int] = get_market_exchange_index(self.ticker)
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
+        self._last_shard_rebalance_dispatch_time: float = 0.0
 
     async def ensure_shard_collateral(self, min_required_dollars: float = 15.0) -> bool:
         """
@@ -450,16 +451,17 @@ class AvellanedaStoikovBot:
                 # Check available transfer amount from Shard 0
                 transfer_amount = min(needed_dollars, max(0.0, round(shard0_balance - self.shard0_reserve_dollars, 2)))
                 if transfer_amount < 1.0:
-                    if current_shard_balance >= 1.0:
+                    if needed_dollars < 1.0 and current_shard_balance >= 1.0:
                         logger.info(
                             f"Transfer amount (${transfer_amount:.2f}) is below minimum transfer ($1.00), "
-                            f"but target Shard {target_shard} already holds ${current_shard_balance:.2f}. "
-                            f"Proceeding with existing shard collateral."
+                            f"and deficit (${needed_dollars:.2f}) is sub-dollar. Target Shard {target_shard} "
+                            f"already holds ${current_shard_balance:.2f}. Proceeding with existing shard collateral."
                         )
                         return True
                     logger.error(
                         f"Cannot transfer to Shard {target_shard}: transfer amount (${transfer_amount:.2f}) "
-                        f"insufficient for minimum transfer ($1.00) and Shard {target_shard} balance (${current_shard_balance:.2f}) < $1.00."
+                        f"insufficient for minimum transfer ($1.00) and Shard {target_shard} balance (${current_shard_balance:.2f}) "
+                        f"is below required ${effective_min_dollars:.2f} (needed: ${needed_dollars:.2f})."
                     )
                     return False
 
@@ -482,7 +484,7 @@ class AvellanedaStoikovBot:
                     shard_balances = balances.get("shard_balances", {})
                     current_shard_balance = float(shard_balances.get(target_shard, 0.0))
                     if needed_dollars > 0:
-                        if current_shard_balance >= effective_min_dollars or current_shard_balance > baseline_balance:
+                        if current_shard_balance >= effective_min_dollars:
                             logger.info(
                                 f"Confirmed Shard {target_shard} funded: balance=${current_shard_balance:.2f} "
                                 f"(attempt {attempt + 1}/6)."
@@ -1429,12 +1431,12 @@ class AvellanedaStoikovBot:
                                 f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
                             )
                             self._market_inactive = True
-                    elif now - self._last_shard_rebalance_time >= 60.0:
+                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
                         logger.warning(
                             f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
                             f"Triggering background shard collateral rebalance..."
                         )
-                        self._last_shard_rebalance_time = now
+                        self._last_shard_rebalance_dispatch_time = now
                         rebal_task = asyncio.create_task(self.ensure_shard_collateral())
                         self._background_tasks.add(rebal_task)
                         rebal_task.add_done_callback(self._background_tasks.discard)
@@ -1482,12 +1484,12 @@ class AvellanedaStoikovBot:
                                 f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
                             )
                             self._market_inactive = True
-                    elif now - self._last_shard_rebalance_time >= 60.0:
+                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
                         logger.warning(
                             f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
                             f"Triggering background shard collateral rebalance..."
                         )
-                        self._last_shard_rebalance_time = now
+                        self._last_shard_rebalance_dispatch_time = now
                         rebal_task = asyncio.create_task(self.ensure_shard_collateral())
                         self._background_tasks.add(rebal_task)
                         rebal_task.add_done_callback(self._background_tasks.discard)

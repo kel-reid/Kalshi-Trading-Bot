@@ -155,7 +155,7 @@ def fetch_eligible_markets(
                 if close_dt is None:
                     continue
                 from config import get_expiration_buffer_seconds
-                cutoff_sec = get_expiration_buffer_seconds(m.get("ticker"))
+                cutoff_sec = get_expiration_buffer_seconds(str(m.get("ticker") or ""))
                 if (close_dt - now_utc).total_seconds() <= cutoff_sec:
                     continue
             if not _is_within_horizon(m, max_expiration_days, now_utc):
