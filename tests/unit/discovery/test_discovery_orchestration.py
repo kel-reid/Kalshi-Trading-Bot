@@ -84,6 +84,22 @@ def test_discover_exclude_tickers():
         assert result == "KXNFL-SECOND"
 
 
+def test_discover_exclude_tickers_matches_event_prefix():
+    """Verify that excluding an event prefix (e.g. KXNBAGAME-26OCT28PHIIND) excludes all team markets of that event."""
+    with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
+        mock_fetch.return_value = [
+            {"ticker": "KXNBAGAME-26OCT28PHIIND-PHI", "status": "open"},
+            {"ticker": "KXNBAGAME-26OCT28PHIIND-IND", "status": "open"},
+            {"ticker": "KXNBAGAME-26OCT28NYKCHI-NYK", "status": "open"},
+        ]
+        result = discover_active_market(
+            target_preference="NBA",
+            exclude_tickers=["KXNBAGAME-26OCT28PHIIND-PHI", "KXNBAGAME-26OCT28PHIIND"]
+        )
+        # Both PHI and IND must be excluded, selecting NYK from the other game
+        assert result == "KXNBAGAME-26OCT28NYKCHI-NYK"
+
+
 def test_discover_matches_title_and_subtitle():
     """Verify that keywords match against market title even if ticker doesn't contain the keyword."""
     mock_markets = [
