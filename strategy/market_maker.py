@@ -14,7 +14,7 @@ import os
 import datetime
 from collections import deque
 from decimal import Decimal, InvalidOperation
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 from data.websocket_client import KalshiWebsocketClient
 from data.orderbook_manager import OrderbookManager
@@ -376,6 +376,25 @@ class AvellanedaStoikovBot:
         self._last_shard_rebalance_time: float = 0.0
         self._last_shard_rebalance_dispatch_time: float = 0.0
 
+    def _is_inventory_flat(self, ticker: Optional[str] = None) -> bool:
+        """Returns True if position is effectively flat (< 0.5 contracts), preventing sub-contract chatter."""
+        target_ticker = ticker or self.ticker
+        pos = self.inv_manager.get_position(target_ticker)
+        return abs(pos) < 0.5
+
+    def _get_rotation_exclude_tickers(self, exclude_event: bool = False) -> List[str]:
+        """
+        Builds the list of tickers to exclude during market rotation.
+        If exclude_event is True and ticker has a multi-segment event prefix (e.g. KXNBAGAME-26OCT28PHIIND-PHI),
+        also excludes the event prefix (KXNBAGAME-26OCT28PHIIND) to prevent rotating into opposing teams or
+        game lines of the same expiring/closed event.
+        """
+        exclude = [self.ticker]
+        if exclude_event and self.ticker and self.ticker.count("-") >= 2:
+            event_prefix = self.ticker.rsplit("-", 1)[0]
+            exclude.append(event_prefix)
+        return exclude
+
     async def ensure_shard_collateral(self, min_required_dollars: float = 15.0) -> bool:
         """
         Ensures that the current market's exchange shard has sufficient collateral (min_required_dollars).
@@ -720,7 +739,7 @@ class AvellanedaStoikovBot:
 
             if now - self._last_inactive_retry >= self._inactive_retry_interval:
                 self._last_inactive_retry = now
-                if self.inv_manager.get_position(self.ticker) != 0:
+                if not self._is_inventory_flat():
                     logger.warning(f"Retrying liquidation for inactive market {self.ticker}...")
                     if not await self.liquidate_inventory(self.ticker):
                         hydrated = False
@@ -733,7 +752,7 @@ class AvellanedaStoikovBot:
                                 f"⚠️ Inactive market liquidation could not be confirmed for {self.ticker}; "
                                 "position state is unknown after inventory hydration failed."
                             )
-                        elif self.inv_manager.get_position(self.ticker) != 0:
+                        elif not self._is_inventory_flat():
                             await send_alert(
                                 f"⚠️ Inactive market liquidation retry failed for {self.ticker} "
                                 f"(position={self.inv_manager.get_position(self.ticker)})."
@@ -743,7 +762,7 @@ class AvellanedaStoikovBot:
                     logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
                     replacement = await discover_active_market_async(
                         target_preference=self.target_preference,
-                        exclude_tickers=[self.ticker],
+                        exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
                         min_mid_price=self.min_mid_price,
                         max_mid_price=self.max_mid_price,
                     )
@@ -772,7 +791,7 @@ class AvellanedaStoikovBot:
                 if self.auto_rotate:
                     replacement = await discover_active_market_async(
                         target_preference=self.target_preference,
-                        exclude_tickers=[self.ticker],
+                        exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
                         min_mid_price=self.min_mid_price,
                         max_mid_price=self.max_mid_price,
                     )
@@ -786,26 +805,26 @@ class AvellanedaStoikovBot:
                             logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                     else:
                         logger.error(f"No replacement market found for {self.ticker}.")
-                        if inventory != 0:
+                        if not self._is_inventory_flat():
                             if not await self.liquidate_inventory(self.ticker):
                                 hydrated = False
                                 try:
                                     hydrated = await self.inv_manager.hydrate(is_startup=False)
                                 except Exception as e_hyd:
                                     logger.error(f"Failed to hydrate inventory during cutoff for {self.ticker}: {e_hyd}")
-                                if not hydrated or self.inv_manager.get_position(self.ticker) != 0:
+                                if not hydrated or not self._is_inventory_flat():
                                     await send_alert(f"⚠️ Safeguard liquidation for {self.ticker} is unconfirmed.")
                         self._market_inactive = True
                         self._last_inactive_retry = now
                 else:
-                    if inventory != 0:
+                    if not self._is_inventory_flat():
                         if not await self.liquidate_inventory(self.ticker):
                             hydrated = False
                             try:
                                 hydrated = await self.inv_manager.hydrate(is_startup=False)
                             except Exception as e_hyd:
                                 logger.error(f"Failed to hydrate inventory during cutoff for {self.ticker}: {e_hyd}")
-                            if not hydrated or self.inv_manager.get_position(self.ticker) != 0:
+                            if not hydrated or not self._is_inventory_flat():
                                 await send_alert(f"⚠️ Safeguard liquidation for {self.ticker} is unconfirmed.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
@@ -816,13 +835,13 @@ class AvellanedaStoikovBot:
             else:
                 logger.warning(f"Unable to confirm market status for {self.ticker}; retaining current market.")
 
-        # Periodic active slate and event-horizon re-evaluation (only when inventory is 0 and dwell time elapsed)
+        # Periodic active slate and event-horizon re-evaluation (only when inventory is flat and dwell time elapsed)
         if now - self._last_slate_check >= self._slate_check_interval:
             self._last_slate_check = now
             if (
                 self.auto_rotate
                 and not self._market_inactive
-                and inventory == 0
+                and self._is_inventory_flat()
                 and (now - self._market_attached_time >= self._min_market_dwell_time)
             ):
                 if await self._maybe_recheck_slate(now):
@@ -861,7 +880,7 @@ class AvellanedaStoikovBot:
                         )
                         replacement = await discover_active_market_async(
                             target_preference=self.target_preference,
-                            exclude_tickers=[self.ticker],
+                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=False),
                             min_mid_price=self.min_mid_price,
                             max_mid_price=self.max_mid_price,
                         )
@@ -878,7 +897,7 @@ class AvellanedaStoikovBot:
                             self._market_inactive = True
                             self._last_inactive_retry = now
                             await self._cancel_all_quotes()
-                            if inventory != 0:
+                            if not self._is_inventory_flat():
                                 if not await self.liquidate_inventory(self.ticker):
                                     await send_alert(f"⚠️ Safeguard liquidation failed for starved market {self.ticker}; open position remains unhedged.")
                             self._maybe_schedule_pnl_snapshot(now, inventory)
@@ -979,7 +998,7 @@ class AvellanedaStoikovBot:
             if self.auto_rotate:
                 replacement = await discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker],
+                    exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
                     min_mid_price=self.min_mid_price,
                     max_mid_price=self.max_mid_price,
                 )
@@ -992,13 +1011,13 @@ class AvellanedaStoikovBot:
                         self._last_inactive_retry = now
                 else:
                     logger.error(f"No replacement market found after {reason} on {self.ticker}.")
-                    if inventory != 0:
+                    if not self._is_inventory_flat():
                         if not await self.liquidate_inventory(self.ticker):
                             await send_alert(f"⚠️ Safeguard liquidation failed after {reason} on {self.ticker}; open position remains unhedged.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
             else:
-                if inventory != 0:
+                if not self._is_inventory_flat():
                     if not await self.liquidate_inventory(self.ticker):
                         await send_alert(f"⚠️ Safeguard liquidation failed after {reason} on {self.ticker}; open position remains unhedged.")
                 self._market_inactive = True
@@ -1022,13 +1041,13 @@ class AvellanedaStoikovBot:
                 except Exception as e_metric:
                     logger.debug(f"Safeguard metric update failed: {e_metric}")
 
-                if inventory == 0:
-                    logger.info(f"[EXPIRATION BLACKOUT] Inventory is flat. Withdrawing quotes and rotating away from {self.ticker}.")
+                if self._is_inventory_flat():
+                    logger.info(f"[EXPIRATION BLACKOUT] Inventory is flat ({inventory}). Withdrawing quotes and rotating away from {self.ticker}.")
                     await self._cancel_all_quotes()
                     if self.auto_rotate:
                         replacement = await discover_active_market_async(
                             target_preference=self.target_preference,
-                            exclude_tickers=[self.ticker],
+                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
                             min_mid_price=self.min_mid_price,
                             max_mid_price=self.max_mid_price,
                         )
@@ -1065,7 +1084,8 @@ class AvellanedaStoikovBot:
                         f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                     )
                     # Never exceed the open position when unwinding
-                    self._current_quote_size = max(1, min(quote_size, int(abs(inventory))))
+                    unwind_target = int(round(abs(inventory)))
+                    self._current_quote_size = max(1, min(quote_size, unwind_target))
                     await self._update_quotes(optimal_bid, optimal_ask)
                     return
             else:
@@ -1115,7 +1135,7 @@ class AvellanedaStoikovBot:
             if self.auto_rotate:
                 replacement = await discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker],
+                    exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=False),
                     min_mid_price=self.min_mid_price,
                     max_mid_price=self.max_mid_price,
                 )
@@ -1129,13 +1149,13 @@ class AvellanedaStoikovBot:
                         logger.warning(f"Rotation to {replacement} aborted; will retry in {self._inactive_retry_interval}s.")
                 else:
                     logger.error(f"No replacement market found for collar-breached market {self.ticker}.")
-                    if inventory != 0:
+                    if not self._is_inventory_flat():
                         if not await self.liquidate_inventory(self.ticker):
                             await send_alert(f"⚠️ Safeguard liquidation failed for collar-breached market {self.ticker}; open position remains unhedged.")
                     self._market_inactive = True
                     self._last_inactive_retry = now
             else:
-                if inventory != 0:
+                if not self._is_inventory_flat():
                     if not await self.liquidate_inventory(self.ticker):
                         await send_alert(f"⚠️ Safeguard liquidation failed for collar-breached market {self.ticker}; open position remains unhedged.")
                 self._market_inactive = True
@@ -1519,8 +1539,8 @@ class AvellanedaStoikovBot:
         """
         target_ticker = ticker or self.ticker
         current_inv = self.inv_manager.get_position(target_ticker)
-        if current_inv == 0:
-            logger.info(f"Inventory for {target_ticker} is already flat (0). No liquidation needed.")
+        if abs(current_inv) < 0.5:
+            logger.info(f"Inventory for {target_ticker} is already flat ({current_inv}). No liquidation needed.")
             return True
 
         logger.warning(
@@ -1540,8 +1560,8 @@ class AvellanedaStoikovBot:
         total_slices = 0
         while failed_attempts < max_retries:
             inv = self.inv_manager.get_position(target_ticker)
-            if inv == 0:
-                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is 0.")
+            if abs(inv) < 0.5:
+                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is flat ({inv}).")
                 return True
 
             best_bid = self.ob_manager.get_best_bid(target_ticker)
@@ -1554,7 +1574,10 @@ class AvellanedaStoikovBot:
                 )
                 return False
 
-            slice_count = min(abs(inv), self.max_order_contracts)
+            slice_count = min(int(round(abs(inv))), self.max_order_contracts)
+            if slice_count <= 0:
+                logger.info(f"Residual inventory ({inv}) for {target_ticker} is sub-contract; liquidation complete.")
+                return True
             if inv > 0:
                 action = "sell"
                 # Cross spread to sell YES: floor the bid so the limit order never sits above it
@@ -1905,7 +1928,7 @@ class AvellanedaStoikovBot:
 
         # 1b. Liquidate any open inventory on old_ticker before unsubscribing
         old_inv = self.inv_manager.get_position(old_ticker)
-        if old_inv != 0:
+        if abs(old_inv) >= 0.5:
             if not allow_liquidation:
                 logger.warning(
                     f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation "
@@ -1926,9 +1949,9 @@ class AvellanedaStoikovBot:
                     logger.error(f"Failed to hydrate inventory during rotation from {old_ticker}: {e_hyd}")
 
                 remaining_inv = self.inv_manager.get_position(old_ticker)
-                if hydration_succeeded and remaining_inv == 0:
+                if hydration_succeeded and abs(remaining_inv) < 0.5:
                     logger.info(
-                        f"Inventory for {old_ticker} reconciled to 0 following exchange hydration; proceeding with rotation."
+                        f"Inventory for {old_ticker} reconciled to flat ({remaining_inv}) following exchange hydration; proceeding with rotation."
                     )
                 else:
                     raw_status = await get_raw_market_status_async(old_ticker)
@@ -2067,7 +2090,7 @@ class AvellanedaStoikovBot:
             replacement = await asyncio.wait_for(
                 discover_active_market_async(
                     target_preference=self.target_preference,
-                    exclude_tickers=[self.ticker],
+                    exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=False),
                     min_mid_price=self.min_mid_price,
                     max_mid_price=self.max_mid_price,
                 ),
@@ -2116,7 +2139,7 @@ class AvellanedaStoikovBot:
         # Check inventory again immediately before rotating!
         # If a fill occurred while awaiting discovery REST calls, abort rotation to avoid adverse liquidation
         latest_inv = self.inv_manager.get_position(self.ticker)
-        if latest_inv != 0:
+        if not self._is_inventory_flat():
             logger.warning(
                 f"[SLATE ROTATION] Aborting rotation to {replacement}: position changed to {latest_inv} "
                 f"during discovery evaluation for {self.ticker}."
@@ -2148,7 +2171,7 @@ class AvellanedaStoikovBot:
             quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
 
         # 1b. Liquidate any open inventory on shutdown
-        if self.inv_manager.get_position(self.ticker) != 0:
+        if not self._is_inventory_flat():
             logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
             if not await self.liquidate_inventory(self.ticker):
                 logger.error(f"Failed to fully liquidate inventory on {self.ticker} during shutdown.")
