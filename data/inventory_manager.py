@@ -543,6 +543,13 @@ class InventoryManager:
     def get_position(self, ticker: str) -> int:
         """Returns the net inventory position for a given ticker (+ for YES, - for NO)."""
         return self.positions.get(ticker, 0)
+
+    def is_flat(self, ticker: str) -> bool:
+        """
+        Returns True if net position is effectively flat (< 0.5 contracts),
+        accounting for fractional REST reporting artifacts or sub-contract residuals.
+        """
+        return abs(self.get_position(ticker)) < 0.5
         
     def get_balance(self) -> int:
         """Returns current available cash balance in cents."""
