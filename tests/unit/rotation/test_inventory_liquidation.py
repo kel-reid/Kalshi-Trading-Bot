@@ -151,6 +151,26 @@ async def test_liquidate_inventory_flat_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_liquidate_inventory_fractional_subcontract_is_noop():
+    """Verify liquidate_inventory returns True immediately when position is fractional sub-contract (e.g. 0.02 or -0.02)."""
+    bot = AvellanedaStoikovBot(ticker="FRACTIONAL-TICKER")
+    bot._cancel_all_quotes = AsyncMock()
+    bot.om.place_order = AsyncMock()
+    bot.inv_manager.get_position = MagicMock(return_value=0.02)
+
+    success = await bot.liquidate_inventory(ticker="FRACTIONAL-TICKER")
+
+    assert success is True
+    bot.om.place_order.assert_not_called()
+    bot._cancel_all_quotes.assert_not_called()
+
+    bot.inv_manager.get_position = MagicMock(return_value=-0.02)
+    success_neg = await bot.liquidate_inventory(ticker="FRACTIONAL-TICKER")
+    assert success_neg is True
+    bot.om.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_liquidate_inventory_returns_false_when_retries_exhausted():
     """Verify liquidate_inventory returns False if position cannot be flattened after max_retries."""
     bot = AvellanedaStoikovBot(ticker="STUBBORN-TICKER")
