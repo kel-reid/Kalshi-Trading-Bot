@@ -178,6 +178,120 @@ async def test_expiration_blackout_short_inventory_unwinds_only():
     assert optimal_bid > 0
 
 
+@pytest.mark.asyncio
+async def test_expiration_blackout_fractional_inventory_treated_as_flat_and_rotates():
+    """
+    When time to close <= expiration_blackout_seconds and inventory is sub-contract (e.g. +0.02 or -0.02),
+    bot treats inventory as effectively flat, cancels quotes without placing unwind orders, and rotates.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-EXPIRING",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        auto_rotate=True,
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=10)
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    # Residual +0.02 contracts from floating-point REST reporting
+    bot.inv_manager.get_position = MagicMock(return_value=0.02)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.rotate_market = AsyncMock(return_value=True)
+    bot._update_quotes = AsyncMock()
+
+    with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="KXTEST-NEW")):
+        await bot._tick()
+
+    bot._cancel_all_quotes.assert_called_once()
+    bot.rotate_market.assert_called_once_with("KXTEST-NEW")
+    bot._update_quotes.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expiration_blackout_fractional_inventory_unwind_sizing_clamped():
+    """
+    When in expiration blackout with non-trivial fractional position (e.g. +1.02 contracts),
+    unwind quote sizing clamps to int(round(abs(inventory))) = 1, preventing over-unwinding or polarity flip.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-EXPIRING",
+        gamma=0.5,
+        min_spread=4,
+        order_size=5,  # Default quote size would be 5
+        auto_rotate=True,
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=15)
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=1.02)  # Position 1.02
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+    bot._update_quotes = AsyncMock()
+
+    await bot._tick()
+
+    assert bot._in_expiration_blackout is True
+    bot._update_quotes.assert_called_once()
+    # Quote size must be clamped to 1 (not 5, and not 0)
+    assert bot._current_quote_size == 1
+
+
+@pytest.mark.asyncio
+async def test_expiration_blackout_excludes_game_event_prefix_during_rotation():
+    """
+    When rotating away from a blackout market on a game (e.g. KXNBAGAME-26OCT28PHIIND-PHI),
+    discovery is invoked with both the specific market ticker and its event prefix (KXNBAGAME-26OCT28PHIIND)
+    so the bot does not rotate into the opposing team of the exact same expiring game.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXNBAGAME-26OCT28PHIIND-PHI",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        auto_rotate=True,
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=10)
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=0.0)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.rotate_market = AsyncMock(return_value=True)
+
+    with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="KXNBAGAME-26OCT28NYKCHI-NYK")) as mock_discover:
+        await bot._tick()
+
+        mock_discover.assert_called_once()
+        exclude_tickers = mock_discover.call_args[1].get("exclude_tickers") or mock_discover.call_args[0][1]
+        assert "KXNBAGAME-26OCT28PHIIND-PHI" in exclude_tickers
+        assert "KXNBAGAME-26OCT28PHIIND" in exclude_tickers
+
+
 # ---------------------------------------------------------------------------
 # 2. DANGER-ZONE BLACKOUT SAFEGUARD
 # ---------------------------------------------------------------------------

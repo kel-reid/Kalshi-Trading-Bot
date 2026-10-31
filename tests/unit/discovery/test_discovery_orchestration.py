@@ -84,6 +84,22 @@ def test_discover_exclude_tickers():
         assert result == "KXNFL-SECOND"
 
 
+def test_discover_exclude_tickers_matches_event_prefix():
+    """Verify that excluding an event prefix (e.g. KXNBAGAME-26OCT28PHIIND) excludes all team markets of that event."""
+    with patch("utils.market_discovery.fetch_eligible_markets") as mock_fetch:
+        mock_fetch.return_value = [
+            {"ticker": "KXNBAGAME-26OCT28PHIIND-PHI", "status": "open"},
+            {"ticker": "KXNBAGAME-26OCT28PHIIND-IND", "status": "open"},
+            {"ticker": "KXNBAGAME-26OCT28NYKCHI-NYK", "status": "open"},
+        ]
+        result = discover_active_market(
+            target_preference="NBA",
+            exclude_tickers=["KXNBAGAME-26OCT28PHIIND-PHI", "KXNBAGAME-26OCT28PHIIND"]
+        )
+        # Both PHI and IND must be excluded, selecting NYK from the other game
+        assert result == "KXNBAGAME-26OCT28NYKCHI-NYK"
+
+
 def test_discover_matches_title_and_subtitle():
     """Verify that keywords match against market title even if ticker doesn't contain the keyword."""
     mock_markets = [
@@ -203,6 +219,44 @@ def test_targeted_series_fetch_fallback_when_events_misses_series():
             max_expiration_days=8.0,
         )
         assert selected == "KXNFLGAME-26SEP20-NEBUF"
+
+
+def test_targeted_series_fallback_respects_excluded_event_prefix():
+    """
+    Verify the targeted series fallback does not re-add sibling markets of an excluded event prefix
+    (which would rotate the bot straight back into the expiring/blackout game).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    near_term_close = (now + datetime.timedelta(days=1)).isoformat()
+
+    excluded_global = [
+        {"ticker": "KXNBAGAME-26OCT28PHIIND-PHI", "status": "open"},
+    ]
+    targeted_nba_games = [
+        {
+            "ticker": "KXNBAGAME-26OCT28PHIIND-IND",
+            "series_ticker": "KXNBAGAME",
+            "status": "open",
+            "close_time": near_term_close,
+            "volume_fp": "35000.00",
+        },
+    ]
+
+    def mock_fetch(limit=1000, series_ticker=None, max_expiration_days=None):
+        if series_ticker == "KXNBAGAME":
+            return targeted_nba_games
+        return excluded_global
+
+    with patch("utils.market_discovery.fetch_eligible_markets", side_effect=mock_fetch), \
+         patch("utils.market_discovery.check_orderbook_has_quotes", return_value=True), \
+         patch("utils.market_discovery.SportsSeasonRouter.get_in_season_leagues", return_value=["NBA"]):
+        selected = discover_active_market(
+            target_preference="NBA",
+            exclude_tickers=["KXNBAGAME-26OCT28PHIIND-PHI", "KXNBAGAME-26OCT28PHIIND"],
+            preflight_check=True,
+            max_expiration_days=8.0,
+        )
+        assert selected != "KXNBAGAME-26OCT28PHIIND-IND"
 
 
 def test_targeted_series_fallback_deduplication_and_budget_bounding():

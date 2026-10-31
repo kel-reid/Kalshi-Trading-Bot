@@ -139,7 +139,15 @@ def discover_active_market(
 
     # 1. Fetch eligible markets ONCE and filter in memory to protect REST rate limits
     eligible = fetch_eligible_markets()
-    tradeable_markets = [m for m in eligible if m.get("ticker") not in exclude]
+
+    def _is_excluded(market: Dict[str, Any]) -> bool:
+        ticker = market.get("ticker")
+        return ticker in exclude or any(
+            ex and str(ticker or "").startswith(f"{ex}-")
+            for ex in exclude
+        )
+
+    tradeable_markets = [m for m in eligible if not _is_excluded(m)]
 
     target_leagues: Optional[List[str]] = None
 
@@ -274,7 +282,7 @@ def discover_active_market(
                 known_tickers = {m.get("ticker") for m in tradeable_markets}
                 new_items = [
                     m for m in targeted
-                    if m.get("ticker") not in exclude
+                    if not _is_excluded(m)
                     and m.get("ticker") not in known_tickers
                     and _is_within_horizon(m, max_expiration_days, now_utc)
                 ]
