@@ -1084,7 +1084,7 @@ class AvellanedaStoikovBot:
                         f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                     )
                     # Never exceed the open position when unwinding
-                    unwind_target = int(round(abs(inventory)))
+                    unwind_target = int(abs(inventory))
                     self._current_quote_size = max(1, min(quote_size, unwind_target))
                     await self._update_quotes(optimal_bid, optimal_ask)
                     return
@@ -1574,10 +1574,13 @@ class AvellanedaStoikovBot:
                 )
                 return False
 
-            slice_count = min(int(round(abs(inv))), self.max_order_contracts)
+            slice_count = min(int(abs(inv)), self.max_order_contracts)
             if slice_count <= 0:
-                logger.info(f"Residual inventory ({inv}) for {target_ticker} is sub-contract; liquidation complete.")
-                return True
+                logger.error(
+                    f"Residual inventory ({inv}) for {target_ticker} cannot be closed with whole-contract "
+                    f"orders; liquidation incomplete."
+                )
+                return False
             if inv > 0:
                 action = "sell"
                 # Cross spread to sell YES: floor the bid so the limit order never sits above it
