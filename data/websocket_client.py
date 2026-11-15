@@ -27,6 +27,11 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
+class FatalIngestionError(RuntimeError):
+    """The caller must stop trading and reconcile missed fills before restarting."""
+
+
 class KalshiWebsocketClient:
     def __init__(self):
         if ENVIRONMENT == "prod":
@@ -39,7 +44,14 @@ class KalshiWebsocketClient:
         self.active_subscriptions = []
         self.subscription_requests = []
         self.is_connected = False
+        self.connection_generation = 0
         self._msg_id = 1
+        self._ingestion_failure = None
+
+    async def fail_ingestion(self, cause):
+        self._ingestion_failure = cause
+        if self.ws_connection is not None:
+            await self.ws_connection.close()
         
     def add_message_handler(self, handler: Callable[[Dict[str, Any]], Awaitable[None]]):
         """Register a handler for incoming websocket messages."""
@@ -56,6 +68,8 @@ class KalshiWebsocketClient:
         
         while True:
             try:
+                if self._ingestion_failure is not None:
+                    raise FatalIngestionError("fill ingestion failed") from self._ingestion_failure
                 # Generate fresh auth headers for each connection attempt to prevent signature timeouts
                 headers = get_auth_headers("GET", "/trade-api/ws/v2")
                 
@@ -69,6 +83,7 @@ class KalshiWebsocketClient:
                 ) as websocket:
                     self.ws_connection = websocket
                     self.is_connected = True
+                    self.connection_generation += 1
                     reconnect_delay = 1 # Reset backoff on successful connection
                     logger.info("Connected successfully.")
                     
@@ -88,10 +103,25 @@ class KalshiWebsocketClient:
                         try:
                             data = json.loads(message)
                             for handler in self.message_handlers:
-                                asyncio.create_task(handler(data))
+                                if data.get("type") == "fill":
+                                    try:
+                                        await handler(data)
+                                    except FatalIngestionError:
+                                        raise
+                                    except Exception as exc:
+                                        raise FatalIngestionError("fill handler failed") from exc
+                                else:
+                                    asyncio.create_task(handler(data))
+                        except FatalIngestionError:
+                            raise
                         except Exception as e:
                             logger.error(f"Error handling message: {e}")
+                    if self._ingestion_failure is not None:
+                        raise FatalIngestionError("fill ingestion failed") from self._ingestion_failure
                             
+            except FatalIngestionError as exc:
+                self._ingestion_failure = exc
+                raise
             except websockets.exceptions.ConnectionClosed as e:
                 self.is_connected = False
                 logger.warning(f"Connection closed. Reconnecting in {reconnect_delay} seconds... ({e})")
@@ -102,6 +132,9 @@ class KalshiWebsocketClient:
                 logger.error(f"WebSocket error: {e}. Reconnecting in {reconnect_delay} seconds...")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+            finally:
+                self.is_connected = False
+                self.ws_connection = None
 
     async def send_message(self, message: dict):
         """Send a JSON payload over the socket."""
