@@ -17,6 +17,7 @@ async def test_bot_rotate_market():
     bot.ob_manager.subscribe = AsyncMock()
 
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
         rotated = await bot.rotate_market("NEW-TICKER")
@@ -158,15 +159,18 @@ async def test_rotate_market_liquidates_open_inventory_before_switching():
     bot.ob_manager.unsubscribe = AsyncMock(side_effect=lambda *a, **k: call_order.append("unsubscribe"))
     bot.ob_manager.subscribe = AsyncMock()
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    positions = {"OLD-TICKER": 10}
+    bot.inv_manager._fetch_ticker_positions = MagicMock(side_effect=lambda t: {0: positions[t]})
 
     async def _liquidate(**kwargs):
         call_order.append("liquidate")
+        positions["OLD-TICKER"] = 0
         return True
 
     bot.liquidate_inventory = AsyncMock(side_effect=_liquidate)
 
     # Old ticker has 10 contracts open; new ticker is 0
-    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: 10 if t == "OLD-TICKER" else 0)
+    bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.get(t, 0))
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock):
         rotated = await bot.rotate_market("NEW-TICKER")
@@ -191,6 +195,7 @@ async def test_rotate_market_aborts_when_liquidation_fails():
     bot.inv_manager.hydrate = AsyncMock(return_value=True)
 
     bot.inv_manager.get_position = MagicMock(side_effect=lambda t: 10 if t == "OLD-TICKER" else 0)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: 10})
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert, \
          patch("strategy.market_maker.get_raw_market_status_async", new_callable=AsyncMock) as mock_status:
@@ -199,19 +204,18 @@ async def test_rotate_market_aborts_when_liquidation_fails():
 
     assert rotated is False
     bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
-    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
-    mock_status.assert_awaited_once_with("OLD-TICKER")
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
     bot.ob_manager.unsubscribe.assert_not_awaited()
     bot.ob_manager.subscribe.assert_not_awaited()
     assert bot.ticker == "OLD-TICKER"
     mock_alert.assert_awaited_once()
     assert "Rotation aborted" in mock_alert.await_args[0][0]
-    assert "market status: open" in mock_alert.await_args[0][0]
+    assert "incomplete or unconfirmed" in mock_alert.await_args[0][0]
 
 
 @pytest.mark.asyncio
 async def test_rotate_market_succeeds_when_hydrate_reconciles_position_to_zero():
-    """Verify that rotate_market proceeds if liquidation returns False but REST hydration confirms position is 0."""
+    """A flat REST snapshot cannot override an unconfirmed liquidation outcome."""
     bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
     bot._cancel_all_quotes = AsyncMock(return_value=True)
     bot.ob_manager.unsubscribe = AsyncMock()
@@ -227,16 +231,17 @@ async def test_rotate_market_succeeds_when_hydrate_reconciles_position_to_zero()
 
     bot.inv_manager.hydrate = AsyncMock(side_effect=_mock_hydrate)
     bot.inv_manager.get_position = MagicMock(side_effect=lambda t: positions.get(t, 0))
+    bot.inv_manager._fetch_ticker_positions = MagicMock(side_effect=[{0: 10}, {}])
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
         rotated = await bot.rotate_market("NEW-TICKER")
 
-    assert rotated is True
+    assert rotated is False
     bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
-    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
-    bot.ob_manager.unsubscribe.assert_awaited_once_with(["OLD-TICKER"])
-    bot.ob_manager.subscribe.assert_awaited_once_with(["NEW-TICKER"])
-    assert bot.ticker == "NEW-TICKER"
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    assert bot.ticker == "OLD-TICKER"
 
 
 @pytest.mark.asyncio
@@ -258,6 +263,7 @@ async def test_rotate_market_aborts_when_hydration_fails_even_if_local_position_
         return 10 if call_counts["count"] == 1 else 0
 
     bot.inv_manager.get_position = MagicMock(side_effect=_get_pos)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(side_effect=[{0: 10}, None])
 
     with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert, \
          patch("strategy.market_maker.get_raw_market_status_async", new_callable=AsyncMock) as mock_status:
@@ -265,6 +271,8 @@ async def test_rotate_market_aborts_when_hydration_fails_even_if_local_position_
         rotated = await bot.rotate_market("NEW-TICKER")
 
     assert rotated is False
+    bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
     bot.ob_manager.unsubscribe.assert_not_awaited()
     assert bot.ticker == "OLD-TICKER"
 
@@ -273,8 +281,7 @@ async def test_rotate_market_aborts_when_hydration_fails_even_if_local_position_
 @pytest.mark.asyncio
 async def test_rotate_market_succeeds_when_market_is_closed_or_settled():
     """
-    Verify that when liquidation fails on a closed/settled market (empty orderbook),
-    rotate_market proceeds with rotation rather than deadlocking.
+    A closed market with remaining inventory must not be rotated away from.
     """
     bot = AvellanedaStoikovBot(ticker="OLD-TICKER", gamma=0.5, min_spread=4, order_size=1)
     bot._cancel_all_quotes = AsyncMock(return_value=True)
@@ -283,6 +290,7 @@ async def test_rotate_market_succeeds_when_market_is_closed_or_settled():
     bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
     bot.liquidate_inventory = AsyncMock(return_value=False)
     bot.inv_manager.hydrate = AsyncMock(return_value=False)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: 11.68})
 
     bot.inv_manager.get_position = MagicMock(side_effect=lambda t: 11.68 if t == "OLD-TICKER" else 0)
 
@@ -291,19 +299,12 @@ async def test_rotate_market_succeeds_when_market_is_closed_or_settled():
         mock_status.return_value = "closed"
         rotated = await bot.rotate_market("NEW-TICKER")
 
-    assert rotated is True
+    assert rotated is False
     bot.liquidate_inventory.assert_awaited_once_with(ticker="OLD-TICKER")
-    bot.inv_manager.hydrate.assert_awaited_once_with(is_startup=False)
-    mock_status.assert_awaited_once_with("OLD-TICKER")
-    bot.ob_manager.unsubscribe.assert_awaited_once_with(["OLD-TICKER"])
-    bot.ob_manager.subscribe.assert_awaited_once_with(["NEW-TICKER"])
-    assert bot.ticker == "NEW-TICKER"
-
-    # Verify both the closed market notification and the rotation complete notification were sent
-    assert mock_alert.call_count == 2
-    alert_msgs = [call[0][0] for call in mock_alert.call_args_list]
-    assert any("closed with remaining position 11.68" in m for m in alert_msgs)
-    assert any("Market Rotated: Switched target" in m for m in alert_msgs)
+    bot.ob_manager.unsubscribe.assert_not_awaited()
+    bot.ob_manager.subscribe.assert_not_awaited()
+    assert bot.ticker == "OLD-TICKER"
+    assert any("Rotation aborted" in call.args[0] for call in mock_alert.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -318,6 +319,7 @@ async def test_rotate_market_aborts_without_liquidation_when_disallowed():
 
     # Old ticker has 5 contracts (e.g. filled during cancellation)
     bot.inv_manager.get_position = MagicMock(return_value=5)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: 5})
 
     rotated = await bot.rotate_market("NEW-TICKER", allow_liquidation=False)
 

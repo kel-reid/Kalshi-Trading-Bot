@@ -9,6 +9,7 @@ Validates:
 5. Order placement failure backoff and cooldown.
 """
 
+import asyncio
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from strategy.market_maker import AvellanedaStoikovBot
@@ -19,6 +20,12 @@ from utils.metrics import (
     BOT_PNL_CENTS,
     BOT_INVENTORY_NET_POSITION,
 )
+
+
+def setup_healthy_feed(bot):
+    bot.ws_client.is_connected = True
+    bot._fill_connection_generation = bot.ws_client.connection_generation
+    bot._ws_task = asyncio.create_task(asyncio.Event().wait())
 
 
 class TestBaselineTelemetryLifecycle:
@@ -317,9 +324,16 @@ class TestSessionRiskSafeguards:
         """When bot.stop() is called with open inventory, it executes liquidation."""
         ticker = "KXSTOP-LIQ"
         bot = AvellanedaStoikovBot(ticker=ticker)
+        setup_healthy_feed(bot)
         bot._cancel_all_quotes = AsyncMock(return_value=True)
-        bot.liquidate_inventory = AsyncMock(return_value=True)
         bot.inv_manager.get_position = MagicMock(return_value=7)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(side_effect=[{0: 7}, {}, {}, {}])
+
+        async def liquidate(ticker):
+            bot.inv_manager.get_position.return_value = 0
+            return True
+
+        bot.liquidate_inventory = AsyncMock(side_effect=liquidate)
 
         stopped = await bot.stop()
 

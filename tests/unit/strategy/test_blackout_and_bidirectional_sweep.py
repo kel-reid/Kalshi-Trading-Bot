@@ -6,17 +6,50 @@ Unit Tests for Weekend Recommendations:
 4. Quote Replacement Tolerance (Suppress micro-cent churn on unchanged sizes)
 """
 
+import asyncio
 import datetime
 import time
+from decimal import Decimal
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from strategy.market_maker import AvellanedaStoikovBot
+
+
+def setup_healthy_feed(bot):
+    bot.ws_client.is_connected = True
+    bot._fill_connection_generation = bot.ws_client.connection_generation
+    bot._ws_task = asyncio.create_task(asyncio.Event().wait())
 
 
 # ---------------------------------------------------------------------------
 # 1. EXPIRATION BLACKOUT SAFEGUARD
 # ---------------------------------------------------------------------------
+
+def _mock_blackout_liquidation(bot, position, filled=True):
+    position = Decimal(str(position))
+    bot.inv_manager._fetch_ticker_positions = MagicMock(
+        side_effect=[{0: position}, {}] if filled else None,
+        return_value={0: position},
+    )
+    bot.om.reconcile_resting_orders = AsyncMock(return_value={"cancelled": [], "orphans": []})
+    bot.om.place_order = AsyncMock(return_value="liquidation-order")
+    bot.om.get_order_status = AsyncMock(return_value={
+        "status": "executed" if filled else "canceled",
+        "fill_count_fp": str(abs(position) if filled else 0),
+    })
+    bot._update_quotes = AsyncMock()
+
+
+def _assert_blackout_liquidation_order(bot, action, count, price):
+    expected = call(
+        ticker=bot.ticker, side="yes", action=action, count=Decimal(str(count)),
+        price=price, reduce_only=True, time_in_force="immediate_or_cancel", exchange_index=0,
+    )
+    assert bot.om.place_order.await_args_list
+    assert all(args == expected for args in bot.om.place_order.await_args_list)
+    bot._update_quotes.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_expiration_blackout_flat_inventory_rotates():
@@ -42,6 +75,7 @@ async def test_expiration_blackout_flat_inventory_rotates():
 
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
@@ -80,6 +114,7 @@ async def test_expiration_blackout_flat_inventory_no_autorotate_freezes():
 
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
@@ -99,8 +134,7 @@ async def test_expiration_blackout_flat_inventory_no_autorotate_freezes():
 @pytest.mark.asyncio
 async def test_expiration_blackout_long_inventory_unwinds_only():
     """
-    When in expiration blackout with long inventory (>0),
-    bot suppresses BUY YES quotes (optimal_bid=None) and only quotes SELL YES (optimal_ask) to unwind.
+    Long inventory is unwound with a reduce-only IOC sell, not resting quotes.
     """
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-EXPIRING",
@@ -122,26 +156,21 @@ async def test_expiration_blackout_long_inventory_unwinds_only():
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
-    bot._update_quotes = AsyncMock()
+    _mock_blackout_liquidation(bot, 5)
 
-    await bot._tick()
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
 
     assert bot._in_expiration_blackout is True
-    bot._update_quotes.assert_called_once()
-    call_args = bot._update_quotes.call_args[0]
-    optimal_bid, optimal_ask = call_args[0], call_args[1]
-
-    # Bid must be suppressed (None); Ask must be present to liquidate
-    assert optimal_bid is None
-    assert optimal_ask is not None
-    assert optimal_ask > 0
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "sell", 5, 49)
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_expiration_blackout_short_inventory_unwinds_only():
     """
-    When in expiration blackout with short inventory (<0),
-    bot suppresses SELL YES quotes (optimal_ask=None) and only quotes BUY YES (optimal_bid) to cover.
+    Short inventory is covered with a reduce-only IOC buy, not resting quotes.
     """
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-EXPIRING",
@@ -163,26 +192,21 @@ async def test_expiration_blackout_short_inventory_unwinds_only():
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
-    bot._update_quotes = AsyncMock()
+    _mock_blackout_liquidation(bot, -5)
 
-    await bot._tick()
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
 
     assert bot._in_expiration_blackout is True
-    bot._update_quotes.assert_called_once()
-    call_args = bot._update_quotes.call_args[0]
-    optimal_bid, optimal_ask = call_args[0], call_args[1]
-
-    # Ask must be suppressed (None); Bid must be present to cover
-    assert optimal_ask is None
-    assert optimal_bid is not None
-    assert optimal_bid > 0
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "buy", 5, 51)
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_expiration_blackout_fractional_inventory_treated_as_flat_and_rotates():
     """
-    When time to close <= expiration_blackout_seconds and inventory is sub-contract (e.g. +0.02 or -0.02),
-    bot treats inventory as effectively flat, cancels quotes without placing unwind orders, and rotates.
+    An unfilled fractional position is not flat and must not trigger rotation.
     """
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-EXPIRING",
@@ -200,28 +224,28 @@ async def test_expiration_blackout_fractional_inventory_treated_as_flat_and_rota
     bot._market_close_time = now_utc + datetime.timedelta(minutes=10)
 
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
-    # Residual +0.02 contracts from floating-point REST reporting
     bot.inv_manager.get_position = MagicMock(return_value=0.02)
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
-    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    _mock_blackout_liquidation(bot, 0.02, filled=False)
     bot.rotate_market = AsyncMock(return_value=True)
-    bot._update_quotes = AsyncMock()
 
-    with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="KXTEST-NEW")):
+    with patch("strategy.market_maker.discover_active_market_async", new=AsyncMock(return_value="KXTEST-NEW")) as discover, \
+            patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
         await bot._tick()
 
-    bot._cancel_all_quotes.assert_called_once()
-    bot.rotate_market.assert_called_once_with("KXTEST-NEW")
-    bot._update_quotes.assert_not_called()
+    assert bot.om.place_order.await_count == 3
+    _assert_blackout_liquidation_order(bot, "sell", "0.02", 49)
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 6
+    discover.assert_not_awaited()
+    bot.rotate_market.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_expiration_blackout_fractional_inventory_unwind_sizing_clamped():
     """
-    When in expiration blackout with non-trivial fractional position (e.g. +1.02 contracts),
-    unwind quote sizing clamps to int(round(abs(inventory))) = 1, preventing over-unwinding or polarity flip.
+    A fractional position is closed exactly, rather than rounded to whole contracts.
     """
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-EXPIRING",
@@ -243,14 +267,15 @@ async def test_expiration_blackout_fractional_inventory_unwind_sizing_clamped():
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
-    bot._update_quotes = AsyncMock()
+    _mock_blackout_liquidation(bot, 1.02)
 
-    await bot._tick()
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
 
     assert bot._in_expiration_blackout is True
-    bot._update_quotes.assert_called_once()
-    # Quote size must be clamped to 1 (not 5, and not 0)
-    assert bot._current_quote_size == 1
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "sell", "1.02", 49)
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -277,6 +302,7 @@ async def test_expiration_blackout_excludes_game_event_prefix_during_rotation():
 
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
     bot.inv_manager.get_position = MagicMock(return_value=0.0)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
@@ -501,9 +527,11 @@ async def test_stop_sweeps_all_funds_to_shard0():
         ticker="KXTEST-SWEEP",
         auto_sweep_reverse_enabled=True,
     )
+    setup_healthy_feed(bot)
     bot.exchange_index = 3
 
     bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
     bot.sweep_shard_to_shard0 = AsyncMock(return_value=True)
     bot.om.record_pnl_snapshot_async = AsyncMock()
 
@@ -587,8 +615,7 @@ async def test_quote_replacement_tolerance_updates_when_diff_exceeds_tolerance()
 @pytest.mark.asyncio
 async def test_expiration_blackout_unwind_quote_size_clamped_to_inventory():
     """
-    In the expiration blackout unwind path, quote size must be clamped to abs(inventory)
-    to prevent overshooting and opening a new risk position on the opposite side.
+    The reduce-only IOC is sized to the actual position, not the larger quote size.
     """
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-EXPIRING",
@@ -608,14 +635,14 @@ async def test_expiration_blackout_unwind_quote_size_clamped_to_inventory():
     bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
 
-    bot._update_quotes = AsyncMock()
+    _mock_blackout_liquidation(bot, 2)
 
-    await bot._tick()
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
 
-    assert bot._current_quote_size == 2
-    bot._update_quotes.assert_called_once()
-    assert bot._update_quotes.call_args[0][0] is None
-    assert bot._update_quotes.call_args[0][1] is not None
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "sell", 2, 49)
+    assert bot.inv_manager._fetch_ticker_positions.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -698,6 +725,8 @@ async def test_rotate_market_same_shard_skips_sweep():
     bot.exchange_index = 3
 
     bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value={"cancelled": [], "orphans": []})
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
     bot.ob_manager.unsubscribe = AsyncMock()
     bot.ob_manager.subscribe = AsyncMock()
     bot.om.record_pnl_snapshot_async = AsyncMock()
@@ -707,7 +736,7 @@ async def test_rotate_market_same_shard_skips_sweep():
 
     # Both old market and new market map to Shard 3
     with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
-        await bot.rotate_market("KXTEST-B")
+        assert await bot.rotate_market("KXTEST-B") is True
 
     bot.sweep_shard_to_shard0.assert_not_called()
     assert bot.exchange_index == 3
@@ -723,6 +752,7 @@ async def test_stop_skips_sweep_if_quotes_not_cancelled():
         ticker="KXTEST-SWEEP",
         auto_sweep_reverse_enabled=True,
     )
+    setup_healthy_feed(bot)
     bot.exchange_index = 3
 
     bot._cancel_all_quotes = AsyncMock(return_value=False)
