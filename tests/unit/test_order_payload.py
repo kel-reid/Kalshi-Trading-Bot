@@ -9,6 +9,7 @@ conform to the Kalshi V2 API schema requirements, specifically:
 """
 
 import asyncio
+from decimal import Decimal
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from execution.order_manager import OrderManager
@@ -46,6 +47,96 @@ def order_capture(order_manager):
 
 class TestV2PayloadSchema:
     """Verify that order payloads match the Kalshi V2 API's expected types."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("count,expected", [
+        (Decimal("0.01"), "0.01"),
+        (Decimal("2.50"), "2.50"),
+        (Decimal("2.5000"), "2.50"),
+        (Decimal("1E+2"), "100"),
+        (1.25, "1.25"),
+        (3, "3"),
+    ])
+    async def test_fractional_reduce_only_ioc(self, order_capture, count, expected):
+        om, captured = order_capture
+        om._update_db_order_status = MagicMock()
+        cid = await om.place_order("T", "yes", "sell", count, 50, 3,
+                                   reduce_only=True, time_in_force="immediate_or_cancel")
+        assert cid is not None
+        assert captured["payload"]["count"] == expected
+        assert captured["payload"]["reduce_only"] is True
+        assert captured["payload"]["time_in_force"] == "immediate_or_cancel"
+        assert captured["payload"]["exchange_index"] == 3
+        assert Decimal(str(om._update_db_order_status.call_args.kwargs["order_details"]["count"])) == Decimal(str(count))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("count", [0, -1, 0.001, 1.001, 0.1 + 0.2, float("nan"), float("inf"),
+                                      Decimal("NaN"), Decimal("-Infinity"), True, "1.25", None])
+    async def test_invalid_count_rejected_before_post(self, order_manager, count):
+        order_manager._post_request = MagicMock()
+        with pytest.raises(ValueError):
+            await order_manager.place_order("T", "yes", "sell", count, 50,
+                                            reduce_only=True, time_in_force="immediate_or_cancel")
+        order_manager._post_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reduce_only,time_in_force", [
+        (True, "good_till_canceled"), (True, "fill_or_kill"),
+        (False, "GTT"), (False, None), (1, "immediate_or_cancel"),
+    ])
+    async def test_invalid_order_options_rejected_before_post(self, order_manager, reduce_only, time_in_force):
+        order_manager._post_request = MagicMock()
+        with pytest.raises(ValueError):
+            await order_manager.place_order("T", "yes", "sell", 1, 50,
+                                            reduce_only=reduce_only, time_in_force=time_in_force)
+        order_manager._post_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_order_omits_reduce_only(self, order_capture):
+        om, captured = order_capture
+        await om.place_order("T", "yes", "buy", 5, 50)
+        assert captured["payload"]["count"] == "5"
+        assert captured["payload"]["time_in_force"] == "good_till_canceled"
+        assert "reduce_only" not in captured["payload"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("time_in_force", ["fill_or_kill", "immediate_or_cancel"])
+    async def test_time_in_force_without_reduce_only(self, order_capture, time_in_force):
+        om, captured = order_capture
+        cid = await om.place_order("T", "no", "buy", 1, 50, time_in_force=time_in_force)
+        assert captured["payload"]["time_in_force"] == time_in_force
+        assert "reduce_only" not in captured["payload"]
+        assert cid not in om.active_orders
+        assert om._ioc_order_ids[cid] == "test-id-123"
+
+    @pytest.mark.asyncio
+    async def test_fractional_count_database_migration_and_insert(self, order_capture):
+        om, _ = order_capture
+        conn = om.db_pool.getconn.return_value
+        cursor = conn.cursor.return_value.__enter__.return_value
+        queries = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("ALTER TABLE orders ALTER COLUMN count TYPE NUMERIC" in query for query in queries)
+        cursor.fetchone.return_value = None
+        cursor.execute.reset_mock()
+        await om.place_order("T", "yes", "sell", 1.25, 50,
+                             exchange_index=0, reduce_only=True, time_in_force="immediate_or_cancel")
+        insert = next(call for call in cursor.execute.call_args_list if "INSERT INTO orders" in call.args[0])
+        assert insert.args[1][6] == Decimal("1.25")
+
+    @pytest.mark.asyncio
+    async def test_ioc_is_not_tracked_as_resting_and_can_be_queried(self, order_capture):
+        om, _ = order_capture
+        om._update_db_order_status = MagicMock()
+        cid = await om.place_order("T", "yes", "sell", Decimal("0.25"), 50,
+                                   exchange_index=0, reduce_only=True, time_in_force="immediate_or_cancel")
+        assert cid not in om.active_orders
+        assert om._update_db_order_status.call_args.args[1] == "ioc_completed"
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"order": {"status": "executed"}}
+        with patch("execution.order_manager.requests.get", return_value=response) as get, \
+             patch("execution.order_manager.get_auth_headers", return_value={}):
+            assert await om.get_order_status(cid) == {"status": "executed"}
+        assert "/test-id-123" in get.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_count_field_is_string(self, order_capture):
@@ -504,6 +595,5 @@ class TestV2PayloadSchema:
         limiter.acquire_sync()
         limiter.acquire_sync()
         assert limiter._tokens < 1.0
-
 
 

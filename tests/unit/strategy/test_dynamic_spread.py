@@ -242,8 +242,9 @@ class TestMarketMakerDynamicSpreadIntegration:
 
         # Mock rotation dependencies
         bot.inv_manager.get_position = MagicMock(return_value=0)
-        bot._cancel_all_quotes = AsyncMock()
-        bot.om.reconcile_resting_orders = AsyncMock()
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.om.reconcile_resting_orders = AsyncMock(return_value={"cancelled": [], "orphans": []})
         bot.om.record_pnl_snapshot_async = AsyncMock()
         bot.ob_manager.unsubscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()

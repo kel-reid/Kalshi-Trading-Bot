@@ -2,7 +2,7 @@
 Emergency Safety Kill Switch
 
 This module provides emergency procedures to immediately cancel all resting orders 
-and cease market making. It supports both asynchronous cancellation in the event 
+and cease market-making. It supports both asynchronous cancellation in the event
 of software crashes and synchronous cancellation for manual developer triggers (like Ctrl+C).
 """
 
@@ -28,8 +28,7 @@ if not logger.handlers:
 
 class KillSwitch:
     """
-    A unified kill switch layer for the market making application.
-    Capable of cancelling known active orders instantly to drop exposure.
+    A unified kill switch layer Capable of cancelling known active orders instantly to drop exposure.
     """
     def __init__(self, order_manager: OrderManager, ticker: Optional[str] = None):
         self.om = order_manager
@@ -53,7 +52,7 @@ class KillSwitch:
         exchange_index: Optional[int] = None,
         ticker: Optional[str] = None,
     ):
-        """Helper to synchronously send DELETE request for an order with shard routing."""
+        """Helper to synchronously send a DELETE request for an order with shard routing."""
         ref = client_order_id or kalshi_order_id
         logger.warning(f"Canceling {ref} (Kalshi ID: {kalshi_order_id}, shard: {exchange_index})...")
         sign_path = f"/trade-api/v2/portfolio/events/orders/{kalshi_order_id}"
@@ -221,7 +220,7 @@ class KillSwitch:
             else:
                 unverified_cids.append(cid)
 
-        # 2. Concurrently fetch exchange resting orders in background thread
+        # 2. Concurrently fetch exchange resting orders in a background thread
         fetch_task = asyncio.create_task(
             asyncio.to_thread(self._fetch_resting_orders_sync, ticker=target_ticker)
         )
