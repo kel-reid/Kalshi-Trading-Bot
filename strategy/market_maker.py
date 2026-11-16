@@ -320,6 +320,7 @@ class AvellanedaStoikovBot:
         self.inv_manager = InventoryManager(self.ws_client)
         self.om = OrderManager()
         self.inv_manager.fill_store = FillStore(self.om.db_pool)
+        self.fill_store = self.inv_manager.fill_store
         
         self.running = False
         
