@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+import threading
 from decimal import Decimal, InvalidOperation
 
 from psycopg2.extras import Json
@@ -136,8 +138,24 @@ def _json_dumps(value):
 class FillStore:
     """Uses a caller-owned psycopg2 threaded pool; failures return False and are logged."""
 
-    def __init__(self, db_pool):
+    def __init__(self, db_pool, timeout_ms: int = 5000):
         self.db_pool = db_pool
+        try:
+            self.timeout_ms = int(os.environ.get("FILL_STORE_TIMEOUT_MS", str(timeout_ms)))
+        except (ValueError, TypeError):
+            self.timeout_ms = timeout_ms
+        self._active_connections = set()
+        self._connections_lock = threading.Lock()
+
+    def cancel_in_flight(self):
+        """Cancel any in-flight database transactions across threads."""
+        with self._connections_lock:
+            conns = list(self._active_connections)
+        for conn in conns:
+            try:
+                conn.cancel()
+            except Exception:
+                logger.exception("Failed to cancel in-flight database connection")
 
     def _transaction(self, operation):
         conn = None
@@ -147,7 +165,12 @@ class FillStore:
             conn = self.db_pool.getconn()
             if conn.autocommit:
                 raise RuntimeError("fill persistence requires a transactional connection")
+            with self._connections_lock:
+                self._active_connections.add(conn)
             with conn.cursor() as cursor:
+                if self.timeout_ms:
+                    cursor.execute(f"SET LOCAL statement_timeout = {int(self.timeout_ms)}")
+                    cursor.execute(f"SET LOCAL lock_timeout = {int(self.timeout_ms)}")
                 operation(cursor)
             conn.commit()
             return True
@@ -161,6 +184,8 @@ class FillStore:
             return False
         finally:
             if conn is not None:
+                with self._connections_lock:
+                    self._active_connections.discard(conn)
                 try:
                     self.db_pool.putconn(conn)
                 except Exception:
