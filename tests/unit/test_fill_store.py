@@ -261,12 +261,33 @@ def test_cancel_in_flight_invokes_conn_cancel(store):
         db._active_connections.clear()
 
 
-def test_cancel_in_flight_force_invokes_conn_close(store):
+def test_cancel_in_flight_force_shuts_down_socket(store):
+    import socket
+    s1, s2 = socket.socketpair()
+    try:
+        db, cursor, conn, pool = store
+        conn.fileno = MagicMock(return_value=s1.fileno())
+        with db._connections_lock:
+            db._active_connections.add(conn)
+        db.cancel_in_flight(force=True)
+        conn.cancel.assert_not_called()
+        conn.close.assert_not_called()
+        # Socket shutdown causes s2.recv to immediately return EOF
+        assert s2.recv(1024) == b""
+        with db._connections_lock:
+            db._active_connections.clear()
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_cancel_in_flight_force_fallback_to_close_when_no_fileno(store):
     db, cursor, conn, pool = store
+    conn.fileno = MagicMock(return_value=None)
     with db._connections_lock:
         db._active_connections.add(conn)
     db.cancel_in_flight(force=True)
-    conn.cancel.assert_called_once()
+    conn.cancel.assert_not_called()
     conn.close.assert_called_once()
     with db._connections_lock:
         db._active_connections.clear()
