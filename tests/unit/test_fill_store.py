@@ -218,3 +218,27 @@ def test_identity_namespaces_and_cross_field_distinct_fills(store):
     assert cursor.rows[0][1]["fill_id"] == "different"
     assert cursor.rows[1][1]["trade_id"] == "second"
     assert cursor.rows[1][1]["fill_id"] == "same"
+
+
+def test_trade_only_replay_matches_same_field_precedence(store):
+    db, cursor, _, _ = store
+    fill1 = {"trade_id": "same", "fill_id": "different", "market_ticker": "T", "count_fp": "1.0"}
+    fill2 = {"trade_id": "second", "fill_id": "same", "market_ticker": "T", "count_fp": "1.0"}
+    assert db.record(fill1, "rest")
+    assert db.record(fill2, "rest")
+    assert len(cursor.rows) == 2
+
+    # Replay with trade_id="same" and no fill_id should match fill1 on same-field precedence
+    # rather than failing with multiple matches against fill2's fill_id alias.
+    replay = {"trade_id": "same", "market_ticker": "T", "count_fp": "1.0"}
+    assert db.record(replay, "websocket")
+    assert len(cursor.rows) == 2
+    row1 = cursor.rows[0]
+    row2 = cursor.rows[1]
+    assert row1[1]["trade_id"] == "same"
+    assert row1[1]["fill_id"] == "different"
+    assert len(row1[2]) == 2
+    assert row2[1]["trade_id"] == "second"
+    assert row2[1]["fill_id"] == "same"
+    assert len(row2[2]) == 1
+

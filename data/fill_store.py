@@ -186,28 +186,43 @@ class FillStore:
             keys = {"identity:" + value for value in (values["fill_id"], values["trade_id"]) if value}
             for key in sorted(keys):
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
-            conditions = []
-            params = []
-            if values["fill_id"] is not None:
-                conditions.append("fill_id = %s")
-                params.append(values["fill_id"])
-            if values["trade_id"] is not None:
-                conditions.append("trade_id = %s")
-                params.append(values["trade_id"])
-            if values["fill_id"] is not None:
-                conditions.append("(trade_id = %s AND fill_id IS NULL)")
-                params.append(values["fill_id"])
-            if values["fill_id"] is None and values["trade_id"] is not None:
-                conditions.append("fill_id = %s")
-                params.append(values["trade_id"])
 
             columns_sql = ", ".join(_COLUMNS)
-            where_sql = " OR ".join(conditions)
-            cursor.execute(
-                f"SELECT id, {columns_sql} FROM kalshi_fills WHERE ({where_sql}) FOR UPDATE",  # noqa: S608
-                tuple(params),
-            )
-            rows = cursor.fetchall()
+            same_field_conditions = []
+            same_field_params = []
+            if values["fill_id"] is not None:
+                same_field_conditions.append("fill_id = %s")
+                same_field_params.append(values["fill_id"])
+            if values["trade_id"] is not None:
+                same_field_conditions.append("trade_id = %s")
+                same_field_params.append(values["trade_id"])
+
+            rows = []
+            if same_field_conditions:
+                where_sql = " OR ".join(same_field_conditions)
+                cursor.execute(
+                    f"SELECT id, {columns_sql} FROM kalshi_fills WHERE ({where_sql}) FOR UPDATE",  # noqa: S608
+                    tuple(same_field_params),
+                )
+                rows = cursor.fetchall()
+
+            if not rows:
+                alias_conditions = []
+                alias_params = []
+                if values["fill_id"] is not None:
+                    alias_conditions.append("(trade_id = %s AND fill_id IS NULL)")
+                    alias_params.append(values["fill_id"])
+                if values["fill_id"] is None and values["trade_id"] is not None:
+                    alias_conditions.append("fill_id = %s")
+                    alias_params.append(values["trade_id"])
+                if alias_conditions:
+                    alias_where_sql = " OR ".join(alias_conditions)
+                    cursor.execute(
+                        f"SELECT id, {columns_sql} FROM kalshi_fills WHERE ({alias_where_sql}) FOR UPDATE",  # noqa: S608
+                        tuple(alias_params),
+                    )
+                    rows = cursor.fetchall()
+
             if len(rows) > 1:
                 raise ValueError("fill identifiers refer to different existing rows")
             audit = Json([event], dumps=_json_dumps)
