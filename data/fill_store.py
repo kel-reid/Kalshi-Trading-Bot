@@ -148,23 +148,35 @@ class FillStore:
         self._connections_lock = threading.Lock()
 
     def cancel_in_flight(self, force: bool = False):
-        """Cancel any in-flight database transactions across threads.
+        """Cancel any active in-flight database transactions across threads.
 
-        If force is True, also forcefully closes the connection socket to unblock
-        threads hung in client-side socket reads when PostgreSQL is unresponsive.
+        If force is True, directly issues an OS-level socket shutdown on the
+        underlying file descriptor (conn.fileno()) to interrupt blocked reads
+        without waiting for psycopg2's connection mutex.
+        If force is False, issues conn.cancel() to signal PostgreSQL.
         """
         with self._connections_lock:
             conns = list(self._active_connections)
         for conn in conns:
-            try:
-                conn.cancel()
-            except Exception:
-                logger.exception("Failed to cancel in-flight database connection")
             if force:
                 try:
-                    conn.close()
+                    fileno = conn.fileno() if callable(getattr(conn, "fileno", None)) else None
+                    if isinstance(fileno, int) and fileno >= 0:
+                        import socket
+                        sock = socket.socket(fileno=fileno)
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        finally:
+                            sock.detach()
+                    elif hasattr(conn, "close"):
+                        conn.close()
                 except Exception:
-                    logger.exception("Failed to forcefully close in-flight database connection")
+                    logger.exception("Failed to forcefully interrupt connection socket")
+            else:
+                try:
+                    conn.cancel()
+                except Exception:
+                    logger.exception("Failed to cancel in-flight database connection")
 
     def _transaction(self, operation):
         conn = None
