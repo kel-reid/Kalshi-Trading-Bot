@@ -147,8 +147,12 @@ class FillStore:
         self._active_connections = set()
         self._connections_lock = threading.Lock()
 
-    def cancel_in_flight(self):
-        """Cancel any in-flight database transactions across threads."""
+    def cancel_in_flight(self, force: bool = False):
+        """Cancel any in-flight database transactions across threads.
+
+        If force is True, also forcefully closes the connection socket to unblock
+        threads hung in client-side socket reads when PostgreSQL is unresponsive.
+        """
         with self._connections_lock:
             conns = list(self._active_connections)
         for conn in conns:
@@ -156,6 +160,11 @@ class FillStore:
                 conn.cancel()
             except Exception:
                 logger.exception("Failed to cancel in-flight database connection")
+            if force:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.exception("Failed to forcefully close in-flight database connection")
 
     def _transaction(self, operation):
         conn = None

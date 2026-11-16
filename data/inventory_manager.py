@@ -409,10 +409,13 @@ class InventoryManager:
                     await self._spool_call(self._fill_spool.acknowledge, row_id)
                 else:
                     logger.error("WebSocket fill persistence failed; retained in spool")
-                    try:
-                        await asyncio.to_thread(self.fill_store.initialize)
-                    except Exception:
-                        logger.exception("Fill database initialization failed")
+                    if not self._fill_stopping:
+                        try:
+                            await asyncio.to_thread(self.fill_store.initialize)
+                        except Exception:
+                            logger.exception("Fill database initialization failed")
+                if self._fill_stopping:
+                    break
                 cursor = row_id
         except Exception as exc:
             self._fill_failure = exc
