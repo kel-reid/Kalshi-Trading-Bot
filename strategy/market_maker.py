@@ -384,6 +384,10 @@ class AvellanedaStoikovBot:
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
         self._last_shard_rebalance_dispatch_time: float = 0.0
+        self.fill_store = getattr(self.inv_manager, "fill_store", None)
+        self.fill_sync = getattr(self.inv_manager, "fill_sync", None)
+        self._deferred_cleanup_task: Optional[asyncio.Task] = None
+        self._fill_drain_timeout: Optional[float] = None
 
     def request_stop(self) -> None:
         """Signal that the bot is stopping gracefully, coordinating shutdown across tasks."""
@@ -2254,7 +2258,6 @@ class AvellanedaStoikovBot:
 
         try:
             clean = await self._stop_before_ingestion_close(feed_healthy)
-            return clean
         finally:
             if not clean:
                 self._ingestion_failed = True
@@ -2269,18 +2272,51 @@ class AvellanedaStoikovBot:
                 await asyncio.gather(self._ws_task, return_exceptions=True)
             ingestion_drained = False
             try:
-                ingestion_drained = await self.inv_manager.close_fill_ingestion(clean=clean)
+                kwargs = {"clean": clean}
+                drain_timeout = getattr(self, "_fill_drain_timeout", None)
+                if drain_timeout is not None:
+                    kwargs["timeout"] = drain_timeout
+                ingestion_drained = bool(await self.inv_manager.close_fill_ingestion(**kwargs))
             except Exception as e:
                 logger.error(f"Error closing fill ingestion: {e}")
-            finally:
-                if (
-                    ingestion_drained
-                    or getattr(self.inv_manager, "_fill_worker", None) is None
-                    or self.inv_manager._fill_worker.done()
-                ):
-                    self.om.close()
-                else:
-                    logger.warning("Deferring OrderManager database pool closure because fill worker is still active.")
+
+            clean = bool(clean and ingestion_drained)
+            if not ingestion_drained:
+                self._ingestion_failed = True
+
+            worker = getattr(self.inv_manager, "_fill_worker", None)
+            if ingestion_drained or worker is None or worker.done():
+                self.om.close()
+            else:
+                logger.warning("Deferring OrderManager database pool closure because fill worker is still active.")
+                self._schedule_deferred_cleanup()
+
+        return clean
+
+    def _schedule_deferred_cleanup(self) -> asyncio.Task:
+        """Schedule background cleanup of spool and DB pool after undrained fill worker finishes."""
+        async def _deferred_cleanup():
+            worker = getattr(self.inv_manager, "_fill_worker", None)
+            if worker is not None and not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except Exception as exc:
+                    logger.error(f"Fill worker failed during deferred drain: {exc}")
+            try:
+                if hasattr(self.inv_manager, "close_spool_deferred"):
+                    await self.inv_manager.close_spool_deferred()
+            except Exception as exc:
+                logger.error(f"Error closing fill spool in deferred cleanup: {exc}")
+            try:
+                self.om.close()
+            except Exception as exc:
+                logger.error(f"Error closing OrderManager in deferred cleanup: {exc}")
+
+        task = asyncio.create_task(_deferred_cleanup())
+        self._deferred_cleanup_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _stop_before_ingestion_close(self, feed_healthy) -> bool:
         self.running = False

@@ -77,7 +77,7 @@ async def test_shutdown_stops_ws_before_ingestion_and_pool():
     bot._cancel_all_quotes = AsyncMock(return_value=True)
     bot._verified_ticker_positions = AsyncMock(return_value={})
     bot.om.record_pnl_snapshot_async = AsyncMock()
-    bot.inv_manager.close_fill_ingestion = AsyncMock(side_effect=lambda **kwargs: order.append("ingestion"))
+    bot.inv_manager.close_fill_ingestion = AsyncMock(side_effect=lambda **kwargs: order.append("ingestion") or True)
     bot.om.close = MagicMock(side_effect=lambda: order.append("pool"))
     assert await bot.stop()
     assert order == ["websocket", "ingestion", "pool"]
@@ -365,3 +365,71 @@ async def test_ingestion_failure_blocks_local_inventory_liquidation():
     res = await bot.stop()
     assert res is False
     bot.liquidate_inventory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drain_timeout_defers_cleanup_until_blocked_record_finishes(tmp_path, monkeypatch):
+    import threading
+
+    spool_path = str(tmp_path / "spool.sqlite3")
+    monkeypatch.setenv("FILL_SPOOL_PATH", spool_path)
+
+    bot = AvellanedaStoikovBot(ticker="TEST")
+    bot._fill_drain_timeout = 0.05
+    bot.ws_client.is_connected = True
+    bot._fill_connection_generation = bot.ws_client.connection_generation
+    bot.ws_client.subscribe = AsyncMock()
+
+    record_entered = threading.Event()
+    record_release = threading.Event()
+
+    mock_store = MagicMock()
+    mock_store.initialize.return_value = True
+
+    def blocking_record(fill, source):
+        record_entered.set()
+        record_release.wait(timeout=3.0)
+        return True
+
+    mock_store.record.side_effect = blocking_record
+    bot.fill_store = mock_store
+    bot.inv_manager.fill_store = mock_store
+
+    await bot.inv_manager.subscribe()
+
+    await bot.inv_manager._handle_message({
+        "type": "fill",
+        "msg": {"trade_id": "t1", "action": "buy", "side": "yes", "count": 1, "yes_price": 50, "market_ticker": "TEST"}
+    })
+
+    await asyncio.to_thread(record_entered.wait, 2.0)
+    assert record_entered.is_set()
+
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot._verified_ticker_positions = AsyncMock(return_value={})
+    bot.om.record_pnl_snapshot_async = AsyncMock()
+    bot.om.close = MagicMock()
+
+    # stop() should time out waiting for fill worker drain
+    clean = await bot.stop()
+
+    # 1. stop() must return False due to undrained worker
+    assert clean is False
+    assert bot._ingestion_failed is True
+
+    # 2. Pool and spool remain open while worker is blocked
+    bot.om.close.assert_not_called()
+    assert bot.inv_manager._fill_spool is not None
+    assert bot._deferred_cleanup_task is not None
+    assert not bot._deferred_cleanup_task.done()
+
+    # 3. Release worker thread
+    record_release.set()
+
+    # Await deferred cleanup
+    await asyncio.wait_for(bot._deferred_cleanup_task, timeout=2.0)
+
+    # 4. Spool and pool are now cleanly closed
+    bot.om.close.assert_called_once()
+    assert bot.inv_manager._fill_spool is None
+
