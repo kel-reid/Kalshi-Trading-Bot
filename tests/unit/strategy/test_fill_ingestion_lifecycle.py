@@ -376,9 +376,19 @@ async def test_shutdown_drain_timeout_defers_cleanup_until_blocked_record_finish
 
     bot = AvellanedaStoikovBot(ticker="TEST")
     bot._fill_drain_timeout = 0.05
+    bot._fill_cancel_grace_timeout = 0.5
     bot.ws_client.is_connected = True
     bot._fill_connection_generation = bot.ws_client.connection_generation
     bot.ws_client.subscribe = AsyncMock()
+
+    # Provide an active _ws_task so feed_healthy() is True and shutdown begins clean
+    ws_started = asyncio.Event()
+    async def websocket_loop():
+        ws_started.set()
+        await asyncio.Event().wait()
+
+    bot._ws_task = asyncio.create_task(websocket_loop())
+    await ws_started.wait()
 
     record_entered = threading.Event()
     record_release = threading.Event()
@@ -392,6 +402,8 @@ async def test_shutdown_drain_timeout_defers_cleanup_until_blocked_record_finish
         return True
 
     mock_store.record.side_effect = blocking_record
+    # When cancel_in_flight is triggered, unblock the record thread cooperatively
+    mock_store.cancel_in_flight = MagicMock(side_effect=lambda: record_release.set())
     bot.fill_store = mock_store
     bot.inv_manager.fill_store = mock_store
 
@@ -410,26 +422,24 @@ async def test_shutdown_drain_timeout_defers_cleanup_until_blocked_record_finish
     bot.om.record_pnl_snapshot_async = AsyncMock()
     bot.om.close = MagicMock()
 
-    # stop() should time out waiting for fill worker drain
+    # Preconditions: feed is healthy, ingestion has not failed, ws task running
+    assert bot._ingestion_failed is False
+    assert not bot._ws_task.done()
+
+    # stop() starts clean, times out on drain, invokes cancel_in_flight, coordinates cleanup before return
     clean = await bot.stop()
 
-    # 1. stop() must return False due to undrained worker
+    # 1. stop() must return False specifically due to undrained worker
     assert clean is False
     assert bot._ingestion_failed is True
 
-    # 2. Pool and spool remain open while worker is blocked
-    bot.om.close.assert_not_called()
-    assert bot.inv_manager._fill_spool is not None
-    assert bot._deferred_cleanup_task is not None
-    assert not bot._deferred_cleanup_task.done()
+    # 2. cancel_in_flight was invoked to interrupt the blocked database thread
+    mock_store.cancel_in_flight.assert_called_once()
+    assert record_release.is_set()
 
-    # 3. Release worker thread
-    record_release.set()
-
-    # Await deferred cleanup
-    await asyncio.wait_for(bot._deferred_cleanup_task, timeout=2.0)
-
-    # 4. Spool and pool are now cleanly closed
+    # 3. Spool and pool are cleanly closed before stop() returns, and worker thread completed
     bot.om.close.assert_called_once()
     assert bot.inv_manager._fill_spool is None
+    assert bot.inv_manager._fill_worker.done()
+    assert bot._ws_task.done()
 

@@ -242,3 +242,21 @@ def test_trade_only_replay_matches_same_field_precedence(store):
     assert row2[1]["fill_id"] == "same"
     assert len(row2[2]) == 1
 
+
+def test_transaction_sets_statement_and_lock_timeout(store):
+    db, cursor, conn, pool = store
+    assert db.initialize()
+    assert any("SET LOCAL statement_timeout = 5000" in s for s in cursor.statements)
+    assert any("SET LOCAL lock_timeout = 5000" in s for s in cursor.statements)
+
+
+def test_cancel_in_flight_invokes_conn_cancel(store):
+    db, cursor, conn, pool = store
+    with db._connections_lock:
+        db._active_connections.add(conn)
+    db.cancel_in_flight()
+    conn.cancel.assert_called_once()
+    with db._connections_lock:
+        db._active_connections.clear()
+
+
