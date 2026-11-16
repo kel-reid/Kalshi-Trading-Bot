@@ -441,6 +441,14 @@ class InventoryManager:
                 logger.warning("Retaining active spool file descriptor due to undrained worker.")
         return drained and clean
 
+    async def close_spool_deferred(self):
+        """Close spool after deferred worker finish."""
+        if self._fill_spool is not None:
+            try:
+                await self._spool_call(self._fill_spool.close)
+            finally:
+                self._fill_spool = None
+
     async def _handle_message(self, message: Dict[str, Any]):
         msg_type = message.get("type")
         
