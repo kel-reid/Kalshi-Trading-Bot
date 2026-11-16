@@ -389,6 +389,8 @@ class AvellanedaStoikovBot:
         self._deferred_cleanup_task: Optional[asyncio.Task] = None
         self._fill_drain_timeout: Optional[float] = None
         self._fill_cancel_grace_timeout: float = 1.0
+        self._fill_cancel_timeout: float = 0.5
+        self._fill_force_grace_timeout: float = 1.0
 
     def request_stop(self) -> None:
         """Signal that the bot is stopping gracefully, coordinating shutdown across tasks."""
@@ -2352,23 +2354,30 @@ class AvellanedaStoikovBot:
             if not ingestion_drained and worker is not None and not worker.done():
                 logger.warning("Fill worker undrained during shutdown; cancelling in-flight operations and coordinating cleanup.")
                 fill_store = getattr(self, "fill_store", None) or getattr(self.inv_manager, "fill_store", None)
-                if fill_store is not None and hasattr(fill_store, "cancel_in_flight"):
-                    try:
-                        fill_store.cancel_in_flight(force=False)
-                    except Exception as e:
-                        logger.error(f"Error cancelling in-flight fill store operations: {e}")
+
+                async def _cancel_store(force: bool):
+                    if fill_store is not None and hasattr(fill_store, "cancel_in_flight"):
+                        cancel_timeout = getattr(self, "_fill_cancel_timeout", 0.5)
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(fill_store.cancel_in_flight, force=force),
+                                timeout=cancel_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(f"In-flight fill cancellation timed out after {cancel_timeout}s (force={force})")
+                        except Exception as cancel_err:
+                            logger.error(f"Error cancelling in-flight fill store operations (force={force}): {cancel_err}")
+
+                await _cancel_store(force=False)
                 grace_timeout = getattr(self, "_fill_cancel_grace_timeout", 1.0)
                 try:
                     await asyncio.wait_for(asyncio.shield(worker), timeout=grace_timeout)
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.warning(f"Fill worker did not finish within cancellation grace period: {e}")
-                    if fill_store is not None and hasattr(fill_store, "cancel_in_flight"):
-                        try:
-                            fill_store.cancel_in_flight(force=True)
-                        except Exception as close_err:
-                            logger.error(f"Error forcing fill store connection closure: {close_err}")
+                    await _cancel_store(force=True)
+                    force_timeout = getattr(self, "_fill_force_grace_timeout", 1.0)
                     try:
-                        await asyncio.wait_for(asyncio.shield(worker), timeout=1.0)
+                        await asyncio.wait_for(asyncio.shield(worker), timeout=force_timeout)
                     except Exception as force_err:
                         logger.error(f"Fill worker failed to stop after forced closure: {force_err}")
 
