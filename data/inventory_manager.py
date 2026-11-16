@@ -63,6 +63,7 @@ class InventoryManager:
         self.positions: Dict[str, int] = {}
         self.pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
         self._fill_count: int = 0
+        self._pending_fills: int = 0
         self._last_fill_time: float = 0.0
         self._last_fill_times: Dict[str, float] = {}
         
@@ -280,15 +281,22 @@ class InventoryManager:
         """Run hydration asynchronously to avoid blocking the event loop."""
         logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
         start_fill_count = self._fill_count
+        start_pending_fills = self._pending_fills
         bal = await asyncio.to_thread(self._fetch_balance)
         market_positions = await asyncio.to_thread(self._fetch_positions)
 
         # Concurrency guard: if a fill arrived while REST requests were in-flight,
+        # or if fill ingestion was pending when hydration started or finished,
         # the REST snapshot is stale and would overwrite real-time positions.
-        if self._fill_count != start_fill_count:
+        if (
+            self._fill_count != start_fill_count
+            or self._pending_fills > 0
+            or start_pending_fills > 0
+        ):
             logger.info(
-                f"Skipping {'startup' if is_startup else 'periodic'} REST inventory reconciliation: {self._fill_count - start_fill_count} "
-                f"fill(s) received during REST fetch window. Real-time WebSocket state is authoritative."
+                f"Skipping {'startup' if is_startup else 'periodic'} REST inventory reconciliation: fill ingestion "
+                f"in-flight ({self._fill_count - start_fill_count} committed, pending={self._pending_fills}). "
+                f"Real-time WebSocket state is authoritative."
             )
             return False
 
@@ -411,17 +419,27 @@ class InventoryManager:
             logger.exception("Fatal fill spool failure")
             await self.ws_client.fail_ingestion(exc)
 
-    async def close_fill_ingestion(self, clean=False):
+    async def close_fill_ingestion(self, clean=False, timeout: float = 5.0):
         """Stop replay and release the spool after WebSocket ingestion has stopped."""
         self._fill_stopping = True
         self._fill_wakeup.set()
+        drained = True
         if self._fill_worker is not None:
-            await self._fill_worker
+            try:
+                await asyncio.wait_for(asyncio.shield(self._fill_worker), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.error("Timed out waiting for fill worker to drain; spool remains dirty.")
+                drained = False
+                clean = False
         if self._fill_spool is not None:
-            if clean and self._fill_failure is None and self.ws_client.__dict__.get("_ingestion_failure") is None:
+            if clean and drained and self._fill_failure is None and self.ws_client.__dict__.get("_ingestion_failure") is None:
                 await self._spool_call(self._fill_spool.clear_dirty)
-            await self._spool_call(self._fill_spool.close)
-            self._fill_spool = None
+            if drained:
+                await self._spool_call(self._fill_spool.close)
+                self._fill_spool = None
+            else:
+                logger.warning("Retaining active spool file descriptor due to undrained worker.")
+        return drained and clean
 
     async def _handle_message(self, message: Dict[str, Any]):
         msg_type = message.get("type")
@@ -430,50 +448,54 @@ class InventoryManager:
             fill = message.get("msg", {})
             if self._fill_failure is not None or self._fill_stopping:
                 raise FatalIngestionError("fill ingestion unavailable")
-            if self.fill_store is not None:
-                if self._fill_spool is None or self._fill_failure or self._fill_stopping:
-                    raise FatalIngestionError("fill spool unavailable")
+            self._pending_fills += 1
+            try:
+                if self.fill_store is not None:
+                    if self._fill_spool is None or self._fill_failure or self._fill_stopping:
+                        raise FatalIngestionError("fill spool unavailable")
+                    try:
+                        await self._spool_call(self._fill_spool.append, fill)
+                    except asyncio.CancelledError as exc:
+                        self._fill_failure = exc
+                        raise
+                    except Exception as exc:
+                        self._fill_failure = exc
+                        raise FatalIngestionError("failed to durably spool fill") from exc
+                    self._fill_wakeup.set()
                 try:
-                    await self._spool_call(self._fill_spool.append, fill)
-                except asyncio.CancelledError as exc:
-                    self._fill_failure = exc
-                    raise
+                    if not isinstance(fill, dict):
+                        raise ValueError("fill payload must be an object")
+                    identities = []
+                    for key in ("fill_id", "trade_id"):
+                        value = fill.get(key)
+                        if value is not None:
+                            if not isinstance(value, str) or not value.strip():
+                                raise ValueError(f"invalid {key}")
+                            identities.append((key, value))
+                    if not any(key == "trade_id" for key, _ in identities):
+                        raise ValueError("WebSocket fill requires trade_id")
+                    content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
+                    existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
+                    if existing:
+                        if any(previous["content"] != content or any(
+                            key in previous["ids"] and previous["ids"][key] != value
+                            for key, value in identities
+                        ) for previous in existing) or any(previous is not existing[0] for previous in existing):
+                            raise ValueError("conflicting fill identity")
+                        existing[0]["ids"].update(identities)
+                        self._seen_fill_ids.update({identity: existing[0] for identity in identities})
+                        return
+                    count_before = self._fill_count
+                    self._handle_fill(fill)
+                    if self._fill_count == count_before:
+                        raise ValueError("invalid inventory fill")
+                    record = {"content": content, "ids": dict(identities)}
+                    self._seen_fill_ids.update({identity: record for identity in identities})
                 except Exception as exc:
                     self._fill_failure = exc
-                    raise FatalIngestionError("failed to durably spool fill") from exc
-                self._fill_wakeup.set()
-            try:
-                if not isinstance(fill, dict):
-                    raise ValueError("fill payload must be an object")
-                identities = []
-                for key in ("fill_id", "trade_id"):
-                    value = fill.get(key)
-                    if value is not None:
-                        if not isinstance(value, str) or not value.strip():
-                            raise ValueError(f"invalid {key}")
-                        identities.append((key, value))
-                if not any(key == "trade_id" for key, _ in identities):
-                    raise ValueError("WebSocket fill requires trade_id")
-                content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
-                existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
-                if existing:
-                    if any(previous["content"] != content or any(
-                        key in previous["ids"] and previous["ids"][key] != value
-                        for key, value in identities
-                    ) for previous in existing) or any(previous is not existing[0] for previous in existing):
-                        raise ValueError("conflicting fill identity")
-                    existing[0]["ids"].update(identities)
-                    self._seen_fill_ids.update({identity: existing[0] for identity in identities})
-                    return
-                count_before = self._fill_count
-                self._handle_fill(fill)
-                if self._fill_count == count_before:
-                    raise ValueError("invalid inventory fill")
-                record = {"content": content, "ids": dict(identities)}
-                self._seen_fill_ids.update({identity: record for identity in identities})
-            except Exception as exc:
-                self._fill_failure = exc
-                raise FatalIngestionError("failed to process inventory fill") from exc
+                    raise FatalIngestionError("failed to process inventory fill") from exc
+            finally:
+                self._pending_fills -= 1
 
     def _handle_fill(self, fill_msg: Dict[str, Any]):
         """

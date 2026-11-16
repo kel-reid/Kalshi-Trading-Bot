@@ -21,12 +21,31 @@ class MemoryCursor:
     def __exit__(self, *args):
         pass
 
+    def _parse_conditions(self, sql, params):
+        if not params:
+            return []
+        where_part = sql.split("WHERE (", 1)[1].rsplit(") FOR UPDATE", 1)[0]
+        cond_strings = [c.strip() for c in where_part.split(" OR ")]
+        return list(zip(cond_strings, params))
+
     def execute(self, sql, params=None):
         self.statements.append(sql)
         if sql.startswith("SELECT id, "):
-            identities = {value for value in params if value is not None}
-            self.matches = [row for row in self.rows if row[1]["fill_id"] in identities or
-                            row[1]["trade_id"] in identities]
+            self.matches = []
+            for row in self.rows:
+                r_fill = row[1]["fill_id"]
+                r_trade = row[1]["trade_id"]
+                matched = False
+                # Replicate the WHERE conditions precisely
+                for cond, p in self._parse_conditions(sql, params):
+                    if cond == "fill_id = %s" and r_fill == p:
+                        matched = True
+                    elif cond == "trade_id = %s" and r_trade == p:
+                        matched = True
+                    elif cond == "(trade_id = %s AND fill_id IS NULL)" and r_trade == p and r_fill is None:
+                        matched = True
+                if matched:
+                    self.matches.append(row)
         elif sql.startswith("INSERT INTO"):
             values = dict(zip(_COLUMNS, params))
             self.rows.append((len(self.rows) + 1, values, json.loads(params[-1].dumps(params[-1].adapted))))
@@ -186,3 +205,16 @@ def test_no_pool_and_database_errors_are_reported(store, caplog):
     conn.rollback.assert_called_once()
     pool.putconn.assert_called_once_with(conn)
     assert "Fill persistence failed" in caplog.text
+
+
+def test_identity_namespaces_and_cross_field_distinct_fills(store):
+    db, cursor, _, _ = store
+    fill1 = {"trade_id": "same", "fill_id": "different", "market_ticker": "T", "count_fp": "1.0"}
+    fill2 = {"trade_id": "second", "fill_id": "same", "market_ticker": "T", "count_fp": "1.0"}
+    assert db.record(fill1, "rest")
+    assert db.record(fill2, "rest")
+    assert len(cursor.rows) == 2
+    assert cursor.rows[0][1]["trade_id"] == "same"
+    assert cursor.rows[0][1]["fill_id"] == "different"
+    assert cursor.rows[1][1]["trade_id"] == "second"
+    assert cursor.rows[1][1]["fill_id"] == "same"

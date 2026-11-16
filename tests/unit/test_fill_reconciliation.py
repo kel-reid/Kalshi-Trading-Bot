@@ -161,6 +161,15 @@ def test_missing_timestamp_fails_explicit_range():
         run(Store(), Session([page([{"fill_id": "a"}])]), "2026-10-31T00:00:00-04:00")
 
 
+def test_ts_only_timestamp_succeeds_explicit_range():
+    # 2026-11-01T04:00:00Z epoch is 1793505600
+    store = Store()
+    ts_fill = {"fill_id": "ts_only", "ts": 1793505600}
+    result = run(store, Session([page([ts_fill]), page()]), "2026-10-31T00:00:00-04:00", "2026-11-02T00:00:00-05:00")
+    assert result.persisted == 1
+    assert store.ids == {"ts_only"}
+
+
 def test_cli_dry_run_does_not_import_store_or_connect(capsys):
     assert main(["--start", "2026-10-31T00:00:00-04:00", "--end", "2026-11-02T00:00:00-05:00"]) == 0
     assert "Dry run" in capsys.readouterr().out
