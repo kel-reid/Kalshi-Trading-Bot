@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from data.fill_store import FillStore
 from data.websocket_client import FatalIngestionError
 from strategy.market_maker import AvellanedaStoikovBot
 
@@ -300,3 +301,67 @@ async def test_cancelled_start_withdraws_orders_and_latches_shutdown():
     bot._cancel_all_quotes.assert_awaited_once()
     assert not await bot.stop()
     bot.inv_manager.close_fill_ingestion.assert_awaited_once_with(clean=False)
+
+
+def test_default_constructor_wires_fill_store():
+    bot = AvellanedaStoikovBot(ticker="TEST")
+    assert isinstance(bot.fill_store, FillStore)
+    assert bot.inv_manager.fill_store is bot.fill_store
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_with_request_stop_is_clean():
+    bot = AvellanedaStoikovBot(ticker="TEST")
+    entered = asyncio.Event()
+
+    async def strategy():
+        entered.set()
+        await asyncio.Event().wait()
+
+    bot._run_strategy = strategy
+    bot.ws_client.is_connected = True
+    bot._fill_connection_generation = bot.ws_client.connection_generation
+    bot.ws_client.connect = asyncio.Event().wait
+    bot.om.sync_and_recover_state = AsyncMock()
+    bot.exchange_index = 0
+    bot.ensure_shard_collateral = AsyncMock(return_value=True)
+    bot._refresh_market_metadata = AsyncMock()
+    bot.inv_manager.subscribe = AsyncMock()
+    bot._subscribe_fills_before_hydration = AsyncMock()
+    bot.inv_manager.hydrate = AsyncMock(return_value=True)
+    bot.ob_manager.subscribe = AsyncMock()
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot._verified_ticker_positions = AsyncMock(return_value={"TEST": 0})
+    bot.om.record_pnl_snapshot_async = AsyncMock()
+    bot.inv_manager.close_fill_ingestion = AsyncMock(return_value=True)
+    bot.om.close = MagicMock()
+
+    task = asyncio.create_task(bot.start())
+    await entered.wait()
+
+    # Coordinated signal shutdown
+    bot.request_stop()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert bot._ingestion_failed is False
+    assert await bot.stop()
+    bot.inv_manager.close_fill_ingestion.assert_awaited_with(clean=True)
+    bot.inv_manager.close_fill_ingestion.assert_awaited_with(clean=True)
+
+
+@pytest.mark.asyncio
+async def test_ingestion_failure_blocks_local_inventory_liquidation():
+    bot = AvellanedaStoikovBot(ticker="TEST")
+    bot._ingestion_failed = True
+    bot.inv_manager.positions = {"TEST": 5}
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.liquidate_inventory = AsyncMock()
+    bot.om.record_pnl_snapshot_async = AsyncMock()
+    bot.inv_manager.close_fill_ingestion = AsyncMock(return_value=False)
+    bot.om.close = MagicMock()
+
+    res = await bot.stop()
+    assert res is False
+    bot.liquidate_inventory.assert_not_called()

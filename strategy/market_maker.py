@@ -384,6 +384,11 @@ class AvellanedaStoikovBot:
         self._last_shard_rebalance_time: float = 0.0
         self._last_shard_rebalance_dispatch_time: float = 0.0
 
+    def request_stop(self) -> None:
+        """Signal that the bot is stopping gracefully, coordinating shutdown across tasks."""
+        self._stopping = True
+        self.running = False
+
     def _is_inventory_flat(self, ticker: Optional[str] = None) -> bool:
         """Returns True only for an exactly flat local position."""
         target_ticker = ticker or self.ticker
@@ -2261,10 +2266,20 @@ class AvellanedaStoikovBot:
                 if not self._ws_task.done():
                     self._ws_task.cancel()
                 await asyncio.gather(self._ws_task, return_exceptions=True)
+            ingestion_drained = False
             try:
-                await self.inv_manager.close_fill_ingestion(clean=clean)
+                ingestion_drained = await self.inv_manager.close_fill_ingestion(clean=clean)
+            except Exception as e:
+                logger.error(f"Error closing fill ingestion: {e}")
             finally:
-                self.om.close()
+                if (
+                    ingestion_drained
+                    or getattr(self.inv_manager, "_fill_worker", None) is None
+                    or self.inv_manager._fill_worker.done()
+                ):
+                    self.om.close()
+                else:
+                    logger.warning("Deferring OrderManager database pool closure because fill worker is still active.")
 
     async def _stop_before_ingestion_close(self, feed_healthy) -> bool:
         self.running = False
@@ -2315,6 +2330,15 @@ class AvellanedaStoikovBot:
                     quotes_cancelled = False
             if quotes_cancelled:
                 verified_fill_count = self.inv_manager._fill_count
+        elif not self._is_inventory_flat():
+            if self._ingestion_failed or self._ws_task is not None or self._fill_connection_generation is not None:
+                logger.error("Skipping unverified local inventory liquidation on shutdown: fill ingestion has failed or was active.")
+                quotes_cancelled = False
+            else:
+                logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
+                if not await self.liquidate_inventory(self.ticker):
+                    logger.error(f"Failed to fully liquidate inventory on {self.ticker} during shutdown.")
+                    quotes_cancelled = False
 
         # Quiesce fills and drain running background snapshot tasks before final write
         await asyncio.sleep(0)

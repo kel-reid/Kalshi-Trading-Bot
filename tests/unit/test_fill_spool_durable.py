@@ -381,3 +381,50 @@ async def test_disk_failure_from_manager_stops_websocket(tmp_path, monkeypatch):
         connect.assert_called_once()
     finally:
         await manager.close_fill_ingestion()
+
+
+@pytest.mark.asyncio
+async def test_hydration_aborts_when_fill_append_is_pending():
+    ws = MagicMock()
+    ws.subscribe = AsyncMock()
+    manager = InventoryManager(ws)
+    manager._fetch_balance = MagicMock(return_value=10000)
+    manager._fetch_positions = MagicMock(return_value=[{"ticker": "T", "position": 5}])
+
+    # Simulate in-flight fill ingestion
+    manager._pending_fills = 1
+    result = await manager.hydrate()
+    assert result is False
+    assert manager.positions == {}
+    assert manager.balance_cents == 0.0
+
+    manager._pending_fills = 0
+    result = await manager.hydrate()
+    assert result is True
+    assert manager.positions == {"T": 5}
+    assert manager.balance_cents == 10000
+
+
+@pytest.mark.asyncio
+async def test_close_fill_ingestion_timeout_bounds_shutdown(tmp_path, monkeypatch):
+    path = tmp_path / "spool.db"
+    monkeypatch.setenv("FILL_SPOOL_PATH", str(path))
+    ws = MagicMock()
+    ws.subscribe = AsyncMock()
+    manager = InventoryManager(ws, fill_store=MagicMock())
+    await manager.subscribe()
+
+    # Block the fill worker task indefinitely
+    async def hung_worker():
+        await asyncio.sleep(10)
+
+    manager._fill_worker = asyncio.create_task(hung_worker())
+    try:
+        clean = await manager.close_fill_ingestion(clean=True, timeout=0.05)
+        assert clean is False
+        assert manager._fill_spool is not None
+        assert manager._fill_spool.dirty()
+    finally:
+        manager._fill_worker.cancel()
+        await asyncio.gather(manager._fill_worker, return_exceptions=True)
+        manager._fill_spool.close()
