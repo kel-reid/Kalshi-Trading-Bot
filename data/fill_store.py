@@ -186,10 +186,26 @@ class FillStore:
             keys = {"identity:" + value for value in (values["fill_id"], values["trade_id"]) if value}
             for key in sorted(keys):
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+            conditions = []
+            params = []
+            if values["fill_id"] is not None:
+                conditions.append("fill_id = %s")
+                params.append(values["fill_id"])
+            if values["trade_id"] is not None:
+                conditions.append("trade_id = %s")
+                params.append(values["trade_id"])
+            if values["fill_id"] is not None:
+                conditions.append("(trade_id = %s AND fill_id IS NULL)")
+                params.append(values["fill_id"])
+            if values["fill_id"] is None and values["trade_id"] is not None:
+                conditions.append("fill_id = %s")
+                params.append(values["trade_id"])
+
+            columns_sql = ", ".join(_COLUMNS)
+            where_sql = " OR ".join(conditions)
             cursor.execute(
-                "SELECT id, " + ", ".join(_COLUMNS) + " FROM kalshi_fills "
-                "WHERE fill_id IN (%s, %s) OR trade_id IN (%s, %s) FOR UPDATE",
-                (values["fill_id"], values["trade_id"], values["fill_id"], values["trade_id"]),
+                f"SELECT id, {columns_sql} FROM kalshi_fills WHERE ({where_sql}) FOR UPDATE",  # noqa: S608
+                tuple(params),
             )
             rows = cursor.fetchall()
             if len(rows) > 1:

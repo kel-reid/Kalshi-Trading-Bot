@@ -23,9 +23,17 @@ HISTORICAL = "/trade-api/v2/historical/fills"
 
 
 def aware_datetime(value):
-    """Parse an ISO 8601 timestamp, rejecting timestamps without an offset."""
+    """Parse an ISO 8601 timestamp or POSIX epoch, rejecting timestamps without an offset."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
     if isinstance(value, str):
-        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except ValueError:
+                pass
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamps must include a UTC offset")
     return value.astimezone(timezone.utc)
@@ -185,7 +193,10 @@ class FillReconciler:
                         if not isinstance(fill, dict):
                             raise ValueError(f"invalid fill from {path}")
                         if start is not None or end is not None:
-                            timestamp = aware_datetime(fill.get("created_time"))
+                            raw_ts = fill.get("created_time")
+                            if raw_ts is None:
+                                raw_ts = fill.get("ts")
+                            timestamp = aware_datetime(raw_ts)
                             if (start is not None and timestamp < start) or (end is not None and timestamp >= end):
                                 continue
                         report.in_range += 1
