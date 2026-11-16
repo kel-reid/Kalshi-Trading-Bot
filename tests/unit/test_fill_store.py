@@ -256,7 +256,20 @@ def test_cancel_in_flight_invokes_conn_cancel(store):
         db._active_connections.add(conn)
     db.cancel_in_flight()
     conn.cancel.assert_called_once()
+    conn.close.assert_not_called()
     with db._connections_lock:
         db._active_connections.clear()
+
+
+def test_cancel_in_flight_force_invokes_conn_close(store):
+    db, cursor, conn, pool = store
+    with db._connections_lock:
+        db._active_connections.add(conn)
+    db.cancel_in_flight(force=True)
+    conn.cancel.assert_called_once()
+    conn.close.assert_called_once()
+    with db._connections_lock:
+        db._active_connections.clear()
+
 
 
