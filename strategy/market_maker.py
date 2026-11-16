@@ -388,6 +388,7 @@ class AvellanedaStoikovBot:
         self.fill_sync = getattr(self.inv_manager, "fill_sync", None)
         self._deferred_cleanup_task: Optional[asyncio.Task] = None
         self._fill_drain_timeout: Optional[float] = None
+        self._fill_cancel_grace_timeout: float = 1.0
 
     def request_stop(self) -> None:
         """Signal that the bot is stopping gracefully, coordinating shutdown across tasks."""
@@ -2348,7 +2349,26 @@ class AvellanedaStoikovBot:
                 self._ingestion_failed = True
 
             worker = getattr(self.inv_manager, "_fill_worker", None)
+            if not ingestion_drained and worker is not None and not worker.done():
+                logger.warning("Fill worker undrained during shutdown; cancelling in-flight operations and coordinating cleanup.")
+                fill_store = getattr(self, "fill_store", None) or getattr(self.inv_manager, "fill_store", None)
+                if fill_store is not None and hasattr(fill_store, "cancel_in_flight"):
+                    try:
+                        fill_store.cancel_in_flight()
+                    except Exception as e:
+                        logger.error(f"Error cancelling in-flight fill store operations: {e}")
+                grace_timeout = getattr(self, "_fill_cancel_grace_timeout", 1.0)
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker), timeout=grace_timeout)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Fill worker did not finish within cancellation grace period: {e}")
+
             if ingestion_drained or worker is None or worker.done():
+                try:
+                    if hasattr(self.inv_manager, "close_spool_deferred"):
+                        await self.inv_manager.close_spool_deferred()
+                except Exception as e:
+                    logger.error(f"Error closing fill spool: {e}")
                 self.om.close()
             else:
                 logger.warning("Deferring OrderManager database pool closure because fill worker is still active.")
