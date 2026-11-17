@@ -16,7 +16,9 @@ from collections import deque
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union, List
 
-from data.websocket_client import KalshiWebsocketClient
+from data.websocket_client import KalshiWebsocketClient, FatalIngestionError
+from data.fill_store import FillStore
+from data.fill_sync import FillSync
 from data.orderbook_manager import OrderbookManager
 from data.inventory_manager import InventoryManager
 from execution.order_manager import OrderManager
@@ -317,6 +319,7 @@ class AvellanedaStoikovBot:
         self.ob_manager = OrderbookManager(self.ws_client)
         self.inv_manager = InventoryManager(self.ws_client)
         self.om = OrderManager()
+        self.inv_manager.fill_store = FillStore(self.om.db_pool)
         
         self.running = False
         
@@ -375,6 +378,24 @@ class AvellanedaStoikovBot:
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
         self._last_shard_rebalance_dispatch_time: float = 0.0
+        self._ingestion_failed: bool = False
+        self._stopping: bool = False
+        self._ws_task: Optional[asyncio.Task] = None
+        self._sync_task: Optional[asyncio.Task] = None
+        self._fill_connection_generation: Optional[int] = None
+        self._strategy_task: Optional[asyncio.Task] = None
+        self.fill_store = getattr(self.inv_manager, "fill_store", None)
+        self.fill_sync = getattr(self.inv_manager, "fill_sync", None)
+        self._deferred_cleanup_task: Optional[asyncio.Task] = None
+        self._fill_drain_timeout: Optional[float] = None
+        self._fill_cancel_grace_timeout: float = 1.0
+        self._fill_cancel_timeout: float = 0.5
+        self._fill_force_grace_timeout: float = 1.0
+
+    def request_stop(self) -> None:
+        """Signal that the bot is stopping gracefully, coordinating shutdown across tasks."""
+        self._stopping = True
+        self.running = False
 
     def _is_inventory_flat(self, ticker: Optional[str] = None) -> bool:
         """Returns True if position is effectively flat (< 0.5 contracts), preventing sub-contract chatter."""
@@ -639,8 +660,119 @@ class AvellanedaStoikovBot:
 
 
 
+    async def _verified_ticker_positions(self, ticker: str):
+        if self._ws_task is None and self._fill_connection_generation is None:
+            return {}
+        start_fill_count = self.inv_manager._fill_count
+        try:
+            positions = await asyncio.to_thread(self.inv_manager._fetch_ticker_positions, ticker)
+        except Exception as exc:
+            logger.error(f"Position verification failed for {ticker}: {exc}")
+            return None
+        if self.inv_manager._fill_count != start_fill_count:
+            logger.warning(f"Fill raced position verification for {ticker}; refusing stale snapshot.")
+            return None
+        return positions
+
+    async def _subscribe_fills_before_hydration(self):
+        """Wait for the exchange to acknowledge the fill subscription."""
+        responses = {}
+        changed = asyncio.Event()
+        generation = self.ws_client.connection_generation
+
+        async def on_response(message):
+            if message.get("type") in ("subscribed", "error"):
+                responses[message.get("id")] = message
+                changed.set()
+
+        self.ws_client.add_message_handler(on_response)
+        try:
+            await self.inv_manager.subscribe()
+            subscriptions = [s for s in getattr(self.ws_client, "active_subscriptions", [])
+                             if s.get("params", {}).get("channels") == ["fill"]]
+            if not subscriptions:
+                return
+            subscription_id = subscriptions[-1]["id"]
+            async def wait_for_response():
+                while subscription_id not in responses:
+                    changed.clear()
+                    await changed.wait()
+                return responses[subscription_id]
+
+            response = await asyncio.wait_for(wait_for_response(), timeout=10)
+            if (response.get("type") != "subscribed"
+                    or response.get("msg", {}).get("channel") != "fill"
+                    or not self.ws_client.is_connected
+                    or self.ws_client.connection_generation != generation):
+                raise RuntimeError("fill subscription not confirmed on the current connection")
+        except Exception as exc:
+            raise FatalIngestionError("Fill ingestion startup failed; reconciliation required") from exc
+        finally:
+            if on_response in self.ws_client.message_handlers:
+                self.ws_client.message_handlers.remove(on_response)
+
+    async def close_fill_ingestion(self, clean: bool = True):
+        await self.inv_manager.close_fill_ingestion(clean=clean)
+
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
+        if self._ingestion_failed or self._stopping:
+            raise FatalIngestionError("Fill ingestion failed; reconcile missed fills before restarting with a new bot.")
+        self._ws_task = asyncio.create_task(self.ws_client.connect())
+        strategy_task = asyncio.create_task(self._run_strategy())
+        self._strategy_task = strategy_task
+        try:
+            done, _ = await asyncio.wait((self._ws_task, strategy_task), return_when=asyncio.FIRST_COMPLETED)
+            if self._ws_task in done and not strategy_task.done():
+                if self._ws_task.exception() is not None:
+                    raise self._ws_task.exception()
+                await strategy_task
+            elif strategy_task in done:
+                await strategy_task
+            elif self._ws_task in done:
+                if not self._ws_task.cancelled():
+                    self._ingestion_failed = True
+                    self.running = False
+                await self._ws_task
+                raise FatalIngestionError("WebSocket ingestion stopped unexpectedly; reconciliation required")
+        except BaseException:
+            if not self._stopping:
+                self._ingestion_failed = True
+            raise
+        finally:
+            self.running = False
+            if not strategy_task.done():
+                strategy_task.cancel()
+            await asyncio.gather(strategy_task, return_exceptions=True)
+            failure = None
+            strategy_failure = None
+            if self._ws_task.done() and not self._ws_task.cancelled():
+                failure = self._ws_task.exception() or FatalIngestionError(
+                    "WebSocket ingestion stopped unexpectedly; reconciliation required"
+                )
+            if strategy_task.done() and not strategy_task.cancelled():
+                strategy_failure = strategy_task.exception()
+                if strategy_failure is not None and not self._stopping:
+                    failure = strategy_failure
+            if failure is None and self._ingestion_failed and not self._stopping:
+                try:
+                    if not await self._cancel_all_quotes() or self.om.active_orders or self.om._pending_client_ids:
+                        await self._escalate_to_kill_switch(context="cancelled strategy")
+                except Exception:
+                    logger.exception("Failed to withdraw orders after strategy cancellation")
+            if failure is not None:
+                self._ingestion_failed = True
+                logger.critical("Fill ingestion stopped; reconcile missed fills before resuming: %s", failure)
+                try:
+                    if not await self._cancel_all_quotes() or self.om.active_orders or self.om._pending_client_ids:
+                        await self._escalate_to_kill_switch(context="fatal fill ingestion")
+                except Exception:
+                    logger.exception("Failed to withdraw orders after fatal ingestion failure")
+                if failure is strategy_failure or isinstance(failure, FatalIngestionError):
+                    raise failure
+                raise FatalIngestionError("WebSocket ingestion failed; reconciliation required") from failure
+
+    async def _run_strategy(self):
         logger.info(f"Starting Market Maker for {self.ticker}")
         
         # Start Prometheus Metrics Server
@@ -649,23 +781,11 @@ class AvellanedaStoikovBot:
         # 0. Recover state and cancel orphaned orders
         await self.om.sync_and_recover_state()
         
-        # 1. Start the WebSocket Connection
-        ws_task = asyncio.create_task(self.ws_client.connect())
-        self._background_tasks.add(ws_task)
-        ws_task.add_done_callback(self._background_tasks.discard)
-        
         # 2. Wait for connection to establish
         while not self.ws_client.is_connected:
             await asyncio.sleep(0.1)
             
-        logger.info("WebSocket Connected. Hydrating state...")
-        
-        # 3. Hydrate initial inventory and subscribe to channels
-        if not await self.inv_manager.hydrate(is_startup=True):
-            logger.critical("Failed to hydrate initial inventory state from REST API on startup. Aborting startup.")
-            await send_alert(f"Startup Aborted: Failed to hydrate initial portfolio inventory for {self.ticker}.")
-            self.running = False
-            raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
+        logger.info("WebSocket Connected. Preparing startup...")
         
         # 3a. Ensure exchange shard collateral before quoting starts
         if getattr(self, "exchange_index", None) is None:
@@ -690,13 +810,41 @@ class AvellanedaStoikovBot:
 
         await self._refresh_market_metadata()
 
-        # 3b. Launch the periodic reconciliation background task
+        fill_count = self.inv_manager._fill_count
+        observed_fill = asyncio.Event()
+
+        async def observe_fill(message):
+            if message.get("type") == "fill":
+                observed_fill.set()
+
+        self.ws_client.message_handlers.insert(0, observe_fill)
+        try:
+            await self._subscribe_fills_before_hydration()
+            generation = self.ws_client.connection_generation
+            self._fill_connection_generation = generation
+            hydrated = await self.inv_manager.hydrate(is_startup=True)
+            if (observed_fill.is_set() or self.inv_manager._fill_count != fill_count
+                    or not self.ws_client.is_connected
+                    or self.ws_client.connection_generation != generation):
+                raise FatalIngestionError("Startup position snapshot raced fill ingestion or connection loss; reconciliation required")
+        finally:
+            if observe_fill in self.ws_client.message_handlers:
+                self.ws_client.message_handlers.remove(observe_fill)
+        if not hydrated:
+            await send_alert(f"Startup Aborted: Failed to hydrate initial portfolio inventory for {self.ticker}.")
+            raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
+
         self._sync_task = asyncio.create_task(self.inv_manager._sync_loop())
         self._background_tasks.add(self._sync_task)
         self._sync_task.add_done_callback(self._background_tasks.discard)
         
-        await self.inv_manager.subscribe()
         await self.ob_manager.subscribe([self.ticker])
+
+        if self.inv_manager.fill_store is not None:
+            fill_sync = FillSync(self.inv_manager.fill_store, self.ws_client)
+            fill_task = asyncio.create_task(fill_sync.run())
+            self._background_tasks.add(fill_task)
+            fill_task.add_done_callback(self._background_tasks.discard)
         
         logger.info("State hydrated. Beginning quoting loop.")
         self.running = True
@@ -704,10 +852,13 @@ class AvellanedaStoikovBot:
         # 4. Enter Main Loop
         try:
             while self.running:
+                if not self.ws_client.is_connected or self.ws_client.connection_generation != generation:
+                    raise FatalIngestionError("WebSocket connection changed; reconciliation required before resuming")
                 await self._tick()
-                await asyncio.sleep(1) # Re-evaluate every 1 second
+                await asyncio.sleep(getattr(self, "tick_interval", 1))
         except asyncio.CancelledError:
             logger.info("Market Maker stopped.")
+            raise
         except Exception as e:
             logger.error(f"Fatal error in trading loop: {e}", exc_info=True)
             await send_alert(f"Fatal error in trading loop for {self.ticker}: {e}")
@@ -2157,7 +2308,129 @@ class AvellanedaStoikovBot:
         return await self.rotate_market(replacement, allow_liquidation=False)
 
     async def stop(self) -> bool:
+        self._stopping = True
         self.running = False
+        clean = False
+        generation = self._fill_connection_generation
+
+        def feed_healthy():
+            if self._ws_task is None and generation is None:
+                return True
+            return (generation is not None and not self._ingestion_failed and self.ws_client.is_connected
+                    and self.ws_client.connection_generation == generation
+                    and self._ws_task is not None and not self._ws_task.done()
+                    and self.inv_manager._fill_failure is None
+                    and self.ws_client.__dict__.get("_ingestion_failure") is None)
+
+        try:
+            clean = await self._stop_before_ingestion_close(feed_healthy)
+        finally:
+            if not clean:
+                self._ingestion_failed = True
+            tasks = [task for task in self._background_tasks if not task.done()]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._ws_task is not None:
+                if not self._ws_task.done():
+                    self._ws_task.cancel()
+                await asyncio.gather(self._ws_task, return_exceptions=True)
+            ingestion_drained = False
+            try:
+                kwargs = {"clean": clean}
+                drain_timeout = getattr(self, "_fill_drain_timeout", None)
+                if drain_timeout is not None:
+                    kwargs["timeout"] = drain_timeout
+                ingestion_drained = bool(await self.inv_manager.close_fill_ingestion(**kwargs))
+            except Exception as e:
+                logger.error(f"Error closing fill ingestion: {e}")
+
+            clean = bool(clean and ingestion_drained)
+            if not ingestion_drained:
+                self._ingestion_failed = True
+
+            worker = getattr(self.inv_manager, "_fill_worker", None)
+            if not ingestion_drained and worker is not None and not worker.done():
+                logger.warning("Fill worker undrained during shutdown; cancelling in-flight operations and coordinating cleanup.")
+                fill_store = getattr(self, "fill_store", None) or getattr(self.inv_manager, "fill_store", None)
+
+                async def _cancel_store(force: bool):
+                    if fill_store is not None and hasattr(fill_store, "cancel_in_flight"):
+                        cancel_timeout = getattr(self, "_fill_cancel_timeout", 0.5)
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(fill_store.cancel_in_flight, force=force),
+                                timeout=cancel_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(f"In-flight fill cancellation timed out after {cancel_timeout}s (force={force})")
+                        except Exception as cancel_err:
+                            logger.error(f"Error cancelling in-flight fill store operations (force={force}): {cancel_err}")
+
+                await _cancel_store(force=False)
+                grace_timeout = getattr(self, "_fill_cancel_grace_timeout", 1.0)
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker), timeout=grace_timeout)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Fill worker did not finish within cancellation grace period: {e}")
+                    await _cancel_store(force=True)
+                    force_timeout = getattr(self, "_fill_force_grace_timeout", 1.0)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(worker), timeout=force_timeout)
+                    except Exception as force_err:
+                        logger.error(f"Fill worker failed to stop after forced closure: {force_err}")
+
+            if ingestion_drained or worker is None or worker.done():
+                try:
+                    if hasattr(self.inv_manager, "close_spool_deferred"):
+                        await self.inv_manager.close_spool_deferred()
+                except Exception as e:
+                    logger.error(f"Error closing fill spool: {e}")
+                self.om.close()
+            else:
+                logger.warning("Deferring OrderManager database pool closure because fill worker is still active.")
+                self._schedule_deferred_cleanup()
+
+        return clean
+
+    def _schedule_deferred_cleanup(self) -> asyncio.Task:
+        """Schedule background cleanup of spool and DB pool after undrained fill worker finishes."""
+        async def _deferred_cleanup():
+            worker = getattr(self.inv_manager, "_fill_worker", None)
+            if worker is not None and not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except Exception as exc:
+                    logger.error(f"Fill worker failed during deferred drain: {exc}")
+            try:
+                if hasattr(self.inv_manager, "close_spool_deferred"):
+                    await self.inv_manager.close_spool_deferred()
+            except Exception as exc:
+                logger.error(f"Error closing fill spool in deferred cleanup: {exc}")
+            try:
+                self.om.close()
+            except Exception as exc:
+                logger.error(f"Error closing OrderManager in deferred cleanup: {exc}")
+
+        task = asyncio.create_task(_deferred_cleanup())
+        self._deferred_cleanup_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _stop_before_ingestion_close(self, feed_healthy) -> bool:
+        self.running = False
+
+        if self._strategy_task is not None and not self._strategy_task.done():
+            self._strategy_task.cancel()
+            await asyncio.gather(self._strategy_task, return_exceptions=True)
+
+        if self._ws_task is not None and self._ws_task.done() and not self._ws_task.cancelled():
+            self._ingestion_failed = True
+
+        if not feed_healthy():
+            self._ingestion_failed = True
 
         # 0. Cancel background reconciliation loop before capturing shutdown state
         if self._sync_task and not self._sync_task.done():
@@ -2173,12 +2446,26 @@ class AvellanedaStoikovBot:
         if not quotes_cancelled or has_active_orders:
             quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
 
-        # 1b. Liquidate any open inventory on shutdown
-        if not self._is_inventory_flat():
-            logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
-            if not await self.liquidate_inventory(self.ticker):
-                logger.error(f"Failed to fully liquidate inventory on {self.ticker} during shutdown.")
+        # 1b. Confirm exchange inventory / liquidate open inventory
+        if (self._ws_task is not None or self._fill_connection_generation is not None) and quotes_cancelled and not self._ingestion_failed:
+            positions = await self._verified_ticker_positions(self.ticker)
+            if positions is None:
                 quotes_cancelled = False
+            elif any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+                if not await self.liquidate_inventory(self.ticker):
+                    quotes_cancelled = False
+                positions = await self._verified_ticker_positions(self.ticker)
+                if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+                    quotes_cancelled = False
+        elif not self._is_inventory_flat():
+            if self._ingestion_failed or self._ws_task is not None or self._fill_connection_generation is not None:
+                logger.error("Skipping unverified local inventory liquidation on shutdown: fill ingestion has failed or was active.")
+                quotes_cancelled = False
+            else:
+                logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
+                if not await self.liquidate_inventory(self.ticker):
+                    logger.error(f"Failed to fully liquidate inventory on {self.ticker} during shutdown.")
+                    quotes_cancelled = False
 
         # Quiesce fills and drain running background snapshot tasks before final write
         await asyncio.sleep(0)
@@ -2202,6 +2489,11 @@ class AvellanedaStoikovBot:
         except Exception as e:
             logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
 
+        if (self._ws_task is not None or self._fill_connection_generation is not None) and quotes_cancelled and not self._ingestion_failed:
+            positions = await self._verified_ticker_positions(self.ticker)
+            if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+                quotes_cancelled = False
+
         # 2b. Sweep remaining funds back to Shard 0 on shutdown
         if self.auto_sweep_reverse_enabled and quotes_cancelled:
             try:
@@ -2215,6 +2507,24 @@ class AvellanedaStoikovBot:
             task.cancel()
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        if (self._ws_task is not None or self._fill_connection_generation is not None):
+            if not feed_healthy():
+                self._ingestion_failed = True
+            if self._ws_task is not None and not self._ws_task.done():
+                self._ws_task.cancel()
+                await asyncio.gather(self._ws_task, return_exceptions=True)
+                if not self._ws_task.cancelled():
+                    self._ingestion_failed = True
+
+            if quotes_cancelled and not self._ingestion_failed:
+                positions = await self._verified_ticker_positions(self.ticker)
+                if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+                    quotes_cancelled = False
+
+            return (quotes_cancelled and not self._ingestion_failed
+                    and self.inv_manager._fill_failure is None
+                    and self.ws_client.__dict__.get("_ingestion_failure") is None)
 
         return quotes_cancelled
 

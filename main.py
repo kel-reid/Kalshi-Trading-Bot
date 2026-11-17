@@ -109,6 +109,7 @@ async def main():
     # Reconcile pending-shutdown state if a signal arrived during bot construction
     if shutdown_event.is_set():
         print("Shutdown requested during bot initialization; cleaning up resting quotes and aborting startup.")
+        bot.request_stop()
         if not sync_kill_executed:
             await killer.trigger(ticker=bot.ticker)
         shutdown_clean = await bot.stop()
@@ -134,7 +135,7 @@ async def main():
                 await killer.trigger(ticker=bot.ticker)
                 task_exception = exc
         else:
-            bot.running = False
+            bot.request_stop()
             bot_task.cancel()
             await asyncio.gather(bot_task, return_exceptions=True)
     except Exception as e:

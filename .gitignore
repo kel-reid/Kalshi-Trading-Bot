@@ -30,6 +30,10 @@ ENV/
 .vscode/
 
 *.db
+*.sqlite
+*.sqlite3
+*.sqlite3*
+*.lock
 .env
 *.pem
 *.egg-info/

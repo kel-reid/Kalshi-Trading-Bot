@@ -45,6 +45,8 @@ RUN pip install --upgrade pip && \
 # Copy application files (like main.py) and change ownership to the non-privileged user
 COPY --chown=trader:trader . /app/
 
+RUN mkdir -p /var/lib/kalshi-fill-spool && chown trader:trader /var/lib/kalshi-fill-spool
+
 # Switch to the non-privileged user
 USER trader
 
