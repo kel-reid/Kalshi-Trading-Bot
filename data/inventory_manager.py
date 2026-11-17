@@ -9,9 +9,11 @@ It also runs a background reconciliation loop to prevent state drift.
 import logging
 import requests
 import asyncio
+import os
 import math
 import time
 import certifi
+from decimal import Decimal
 from typing import Dict, Any, Optional, List
 
 # Provide required imports from our new module
@@ -30,6 +32,8 @@ from utils.metrics import (
     KALSHI_POSITIONS_VALUE_CENTS,
 )
 from data.pnl_tracker import PnLTracker
+from data.fill_spool import FillSpool
+from data.websocket_client import FatalIngestionError
 
 logger = logging.getLogger("InventoryManager")
 
@@ -39,8 +43,18 @@ class InventoryManager:
     Hydrates initial state via REST and updates via WebSocket 'fill' events.
     Integrates PnLTracker for FIFO trade matching and mark-to-market accounting.
     """
-    def __init__(self, ws_client, pnl_tracker: Optional[PnLTracker] = None):
+    def __init__(self, ws_client, pnl_tracker: Optional[PnLTracker] = None, fill_store=None):
         self.ws_client = ws_client
+        self.fill_store = fill_store
+        self._fill_spool = None
+        self._spool_lock = asyncio.Lock()
+        self._fill_wakeup = asyncio.Event()
+        self._fill_stopping = False
+        self._fill_failure = None
+        self._fill_worker = None
+        self._fill_retry_interval = 1.0
+        self._fill_init_task = None
+        self._seen_fill_ids = {}
         self.balance_cents: float = 0.0
         self.positions_value_cents: float = 0.0
         self._last_mid_prices: Dict[str, float] = {}
@@ -49,6 +63,7 @@ class InventoryManager:
         self.positions: Dict[str, int] = {}
         self.pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
         self._fill_count: int = 0
+        self._pending_fills: int = 0
         self._last_fill_time: float = 0.0
         self._last_fill_times: Dict[str, float] = {}
         
@@ -84,6 +99,46 @@ class InventoryManager:
             return None
         else:
             logger.error(f"Failed to fetch balance: {response.text}")
+            return None
+
+    def _fetch_ticker_positions(self, ticker: str) -> Optional[Dict[int, Decimal]]:
+        """Fetch every shard for one ticker in the primary subaccount, or fail closed."""
+        path = "/trade-api/v2/portfolio/positions"
+        params = {"ticker": ticker, "limit": 200}
+        positions = {}
+        cursors = set()
+        try:
+            while True:
+                headers = get_auth_headers(method="GET", sign_path=path)
+                with measure_latency("GET", path):
+                    response = requests.get(BASE_URL + path, headers=headers, params=params, timeout=10, verify=certifi.where())
+                if response.status_code != 200:
+                    return None
+                data = response.json()
+                if not isinstance(data, dict) or not isinstance(data.get("market_positions"), list):
+                    return None
+                cursor = data.get("cursor")
+                if not isinstance(cursor, str):
+                    return None
+                for entry in data["market_positions"]:
+                    if not isinstance(entry, dict) or entry.get("ticker") != ticker:
+                        return None
+                    shard = entry.get("exchange_index")
+                    raw = entry.get("position_fp", entry.get("position"))
+                    if isinstance(shard, bool) or not isinstance(shard, int) or shard < 0 or shard in positions or isinstance(raw, bool):
+                        return None
+                    value = Decimal(str(raw))
+                    if not value.is_finite():
+                        return None
+                    positions[shard] = value
+                if not cursor:
+                    return positions
+                if cursor in cursors or len(cursors) >= 100:
+                    return None
+                cursors.add(cursor)
+                params["cursor"] = cursor
+        except Exception as exc:
+            logger.error(f"Failed to verify positions for {ticker}: {exc}")
             return None
 
     def _fetch_positions(self) -> Optional[List[Dict[str, Any]]]:
@@ -226,15 +281,22 @@ class InventoryManager:
         """Run hydration asynchronously to avoid blocking the event loop."""
         logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
         start_fill_count = self._fill_count
+        start_pending_fills = self._pending_fills
         bal = await asyncio.to_thread(self._fetch_balance)
         market_positions = await asyncio.to_thread(self._fetch_positions)
 
         # Concurrency guard: if a fill arrived while REST requests were in-flight,
+        # or if fill ingestion was pending when hydration started or finished,
         # the REST snapshot is stale and would overwrite real-time positions.
-        if self._fill_count != start_fill_count:
+        if (
+            self._fill_count != start_fill_count
+            or self._pending_fills > 0
+            or start_pending_fills > 0
+        ):
             logger.info(
-                f"Skipping {'startup' if is_startup else 'periodic'} REST inventory reconciliation: {self._fill_count - start_fill_count} "
-                f"fill(s) received during REST fetch window. Real-time WebSocket state is authoritative."
+                f"Skipping {'startup' if is_startup else 'periodic'} REST inventory reconciliation: fill ingestion "
+                f"in-flight ({self._fill_count - start_fill_count} committed, pending={self._pending_fills}). "
+                f"Real-time WebSocket state is authoritative."
             )
             return False
 
@@ -288,13 +350,163 @@ class InventoryManager:
 
     async def subscribe(self):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""
+        if self.fill_store is not None:
+            if self._fill_spool is not None:
+                raise RuntimeError("fill ingestion already started")
+            path = os.environ.get("FILL_SPOOL_PATH", "data/fill_spool.sqlite3")
+            try:
+                self._fill_spool = await asyncio.to_thread(FillSpool, path)
+                if await self._spool_call(self._fill_spool.dirty):
+                    raise RuntimeError("spool requires reconciliation")
+                await self._spool_call(self._fill_spool.set_dirty)
+            except Exception as exc:
+                self._fill_failure = exc
+                if self._fill_spool is not None:
+                    await self._spool_call(self._fill_spool.close)
+                    self._fill_spool = None
+                raise FatalIngestionError("fill spool requires reconciliation or repair before restart") from exc
+            self._fill_init_task = asyncio.create_task(self._initialize_fill_store(self.fill_store))
+            self._fill_worker = asyncio.create_task(self._persist_fills())
         await self.ws_client.subscribe(["fill"])
+
+    async def _initialize_fill_store(self, store):
+        try:
+            if not await asyncio.to_thread(store.initialize):
+                logger.error("Fill database initialization failed; live persistence will retry")
+        except Exception:
+            logger.exception("Fill database initialization failed; live persistence will retry")
+
+    async def _spool_call(self, operation, *args):
+        async with self._spool_lock:
+            task = asyncio.create_task(asyncio.to_thread(operation, *args))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+    async def _persist_fills(self):
+        try:
+            await asyncio.shield(self._fill_init_task)
+            cursor = 0
+            while not self._fill_stopping:
+                row = await self._spool_call(self._fill_spool.pending, cursor)
+                if row is None:
+                    cursor = 0
+                    self._fill_wakeup.clear()
+                    try:
+                        await asyncio.wait_for(self._fill_wakeup.wait(), self._fill_retry_interval)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                row_id, fill = row
+                try:
+                    success = await asyncio.to_thread(self.fill_store.record, fill, "websocket")
+                except Exception:
+                    logger.exception("WebSocket fill persistence failed")
+                    success = False
+                if success:
+                    await self._spool_call(self._fill_spool.acknowledge, row_id)
+                else:
+                    logger.error("WebSocket fill persistence failed; retained in spool")
+                    if not self._fill_stopping:
+                        try:
+                            await asyncio.to_thread(self.fill_store.initialize)
+                        except Exception:
+                            logger.exception("Fill database initialization failed")
+                if self._fill_stopping:
+                    break
+                cursor = row_id
+        except Exception as exc:
+            self._fill_failure = exc
+            logger.exception("Fatal fill spool failure")
+            await self.ws_client.fail_ingestion(exc)
+
+    async def close_fill_ingestion(self, clean=False, timeout: float = 5.0):
+        """Stop replay and release the spool after WebSocket ingestion has stopped."""
+        self._fill_stopping = True
+        self._fill_wakeup.set()
+        drained = True
+        if self._fill_worker is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._fill_worker), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.error("Timed out waiting for fill worker to drain; spool remains dirty.")
+                drained = False
+                clean = False
+        if self._fill_spool is not None:
+            if clean and drained and self._fill_failure is None and self.ws_client.__dict__.get("_ingestion_failure") is None:
+                await self._spool_call(self._fill_spool.clear_dirty)
+            if drained:
+                await self._spool_call(self._fill_spool.close)
+                self._fill_spool = None
+            else:
+                logger.warning("Retaining active spool file descriptor due to undrained worker.")
+        return drained and clean
+
+    async def close_spool_deferred(self):
+        """Close spool after deferred worker finish."""
+        if self._fill_spool is not None:
+            try:
+                await self._spool_call(self._fill_spool.close)
+            finally:
+                self._fill_spool = None
 
     async def _handle_message(self, message: Dict[str, Any]):
         msg_type = message.get("type")
         
         if msg_type == "fill":
-            self._handle_fill(message.get("msg", {}))
+            fill = message.get("msg", {})
+            if self._fill_failure is not None or self._fill_stopping:
+                raise FatalIngestionError("fill ingestion unavailable")
+            self._pending_fills += 1
+            try:
+                if self.fill_store is not None:
+                    if self._fill_spool is None or self._fill_failure or self._fill_stopping:
+                        raise FatalIngestionError("fill spool unavailable")
+                    try:
+                        await self._spool_call(self._fill_spool.append, fill)
+                    except asyncio.CancelledError as exc:
+                        self._fill_failure = exc
+                        raise
+                    except Exception as exc:
+                        self._fill_failure = exc
+                        raise FatalIngestionError("failed to durably spool fill") from exc
+                    self._fill_wakeup.set()
+                try:
+                    if not isinstance(fill, dict):
+                        raise ValueError("fill payload must be an object")
+                    identities = []
+                    for key in ("fill_id", "trade_id"):
+                        value = fill.get(key)
+                        if value is not None:
+                            if not isinstance(value, str) or not value.strip():
+                                raise ValueError(f"invalid {key}")
+                            identities.append((key, value))
+                    if not any(key == "trade_id" for key, _ in identities):
+                        raise ValueError("WebSocket fill requires trade_id")
+                    content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
+                    existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
+                    if existing:
+                        if any(previous["content"] != content or any(
+                            key in previous["ids"] and previous["ids"][key] != value
+                            for key, value in identities
+                        ) for previous in existing) or any(previous is not existing[0] for previous in existing):
+                            raise ValueError("conflicting fill identity")
+                        existing[0]["ids"].update(identities)
+                        self._seen_fill_ids.update({identity: existing[0] for identity in identities})
+                        return
+                    count_before = self._fill_count
+                    self._handle_fill(fill)
+                    if self._fill_count == count_before:
+                        raise ValueError("invalid inventory fill")
+                    record = {"content": content, "ids": dict(identities)}
+                    self._seen_fill_ids.update({identity: record for identity in identities})
+                except Exception as exc:
+                    self._fill_failure = exc
+                    raise FatalIngestionError("failed to process inventory fill") from exc
+            finally:
+                self._pending_fills -= 1
 
     def _handle_fill(self, fill_msg: Dict[str, Any]):
         """

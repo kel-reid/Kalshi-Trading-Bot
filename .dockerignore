@@ -6,6 +6,9 @@ __pycache__
 *.pem
 *.key
 venv/
+.venv/
+data/*.sqlite*
+data/*.db*
 .pytest_cache/
 tests/*
 !tests/test_strategy.py
