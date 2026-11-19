@@ -979,7 +979,71 @@ class AvellanedaStoikovBot:
                 # Refresh inventory from inv_manager following async discovery check
                 inventory = self.inv_manager.get_position(self.ticker)
 
-        
+        # 2a-0. Expiration Blackout Safeguard (Late-Game Quoting Freeze & Unwind)
+        # Prevents opening or accumulating inventory during late-game blowouts and final game stages.
+        # Evaluated before one-sided book checks or session safeguards to ensure any existing
+        # inventory is unwound via reduce-only IOC orders, and no resting orders persist.
+        if self.blackout_enabled and self._market_close_time is not None:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            remaining_to_close = (self._market_close_time - now_utc).total_seconds()
+            if remaining_to_close <= self.expiration_blackout_seconds:
+                self._in_expiration_blackout = True
+                logger.warning(
+                    f"[EXPIRATION BLACKOUT] Market {self.ticker} within blackout window "
+                    f"({remaining_to_close:.0f}s <= {self.expiration_blackout_seconds}s to close). "
+                    f"Current inventory: {inventory}."
+                )
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="blackout_expiration", ticker=self.ticker).inc()
+                except Exception as e_metric:
+                    logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+                if not self._is_inventory_flat():
+                    await self.liquidate_inventory(self.ticker)
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if not await self._cancel_all_quotes():
+                    logger.error(f"[EXPIRATION BLACKOUT] Quote cancellation unconfirmed for {self.ticker}.")
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                positions = await self._verified_ticker_positions(self.ticker)
+                if positions is None:
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if any(value != 0 for value in positions.values()) or not self._is_inventory_flat():
+                    await self.liquidate_inventory(self.ticker)
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if self._is_inventory_flat():
+                    logger.info(f"[EXPIRATION BLACKOUT] Exchange and local inventory are flat for {self.ticker}.")
+                    verified_fill_count = self.inv_manager._fill_count
+                    if self.auto_rotate:
+                        replacement = await discover_active_market_async(
+                            target_preference=self.target_preference,
+                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
+                            min_mid_price=self.min_mid_price,
+                            max_mid_price=self.max_mid_price,
+                        )
+                        if replacement:
+                            if await self.rotate_market(replacement):
+                                self._market_inactive = False
+                                self._in_expiration_blackout = False
+                                logger.info(f"Successfully rotated from blackout market to {replacement}.")
+                            else:
+                                self._maybe_schedule_pnl_snapshot(now, inventory)
+                                return
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
+                            return
+                    positions = await self._verified_ticker_positions(self.ticker)
+                    if (positions is not None and not any(value != 0 for value in positions.values())
+                            and self._is_inventory_flat() and self.inv_manager._fill_count == verified_fill_count):
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+            else:
+                self._in_expiration_blackout = False
+
         best_bid = self.ob_manager.get_best_bid(self.ticker)
         best_ask = self.ob_manager.get_best_ask(self.ticker)
         
@@ -1152,62 +1216,6 @@ class AvellanedaStoikovBot:
                 self._market_inactive = True
                 self._last_inactive_retry = now
             return
-
-        # 2a-0. Expiration Blackout Safeguard (Late-Game Quoting Freeze & Unwind)
-        # Prevents opening or accumulating inventory during late-game blowouts and final game stages.
-        if self.blackout_enabled and self._market_close_time is not None:
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            remaining_to_close = (self._market_close_time - now_utc).total_seconds()
-            if remaining_to_close <= self.expiration_blackout_seconds:
-                self._in_expiration_blackout = True
-                logger.warning(
-                    f"[EXPIRATION BLACKOUT] Market {self.ticker} within blackout window "
-                    f"({remaining_to_close:.0f}s <= {self.expiration_blackout_seconds}s to close). "
-                    f"Current inventory: {inventory}."
-                )
-                try:
-                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="blackout_expiration", ticker=self.ticker).inc()
-                except Exception as e_metric:
-                    logger.debug(f"Safeguard metric update failed: {e_metric}")
-
-                if not self._is_inventory_flat():
-                    await self.liquidate_inventory(self.ticker)
-                    return
-                if not await self._cancel_all_quotes():
-                    logger.error(f"[EXPIRATION BLACKOUT] Quote cancellation unconfirmed for {self.ticker}.")
-                    return
-                positions = await self._verified_ticker_positions(self.ticker)
-                if positions is None:
-                    return
-                if any(value != 0 for value in positions.values()) or not self._is_inventory_flat():
-                    await self.liquidate_inventory(self.ticker)
-                    return
-                if self._is_inventory_flat():
-                    logger.info(f"[EXPIRATION BLACKOUT] Exchange and local inventory are flat for {self.ticker}.")
-                    verified_fill_count = self.inv_manager._fill_count
-                    if self.auto_rotate:
-                        replacement = await discover_active_market_async(
-                            target_preference=self.target_preference,
-                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
-                            min_mid_price=self.min_mid_price,
-                            max_mid_price=self.max_mid_price,
-                        )
-                        if replacement:
-                            if await self.rotate_market(replacement):
-                                self._market_inactive = False
-                                self._in_expiration_blackout = False
-                                logger.info(f"Successfully rotated from blackout market to {replacement}.")
-                            else:
-                                return
-                            return
-                    positions = await self._verified_ticker_positions(self.ticker)
-                    if (positions is not None and not any(value != 0 for value in positions.values())
-                            and self._is_inventory_flat() and self.inv_manager._fill_count == verified_fill_count):
-                        self._market_inactive = True
-                        self._last_inactive_retry = now
-                    return
-            else:
-                self._in_expiration_blackout = False
 
         # 2a. Extreme Price Collar Safeguard:
         # If orderbook midpoint drifts outside [min_mid_price, max_mid_price]:
@@ -1649,14 +1657,30 @@ class AvellanedaStoikovBot:
 
 
     async def _verified_ticker_positions(self, ticker: str):
-        start_fill_count = self.inv_manager._fill_count
+        raw_fill_count = getattr(self.inv_manager, "_fill_count", 0)
+        start_fill_count = raw_fill_count if isinstance(raw_fill_count, int) and not isinstance(raw_fill_count, bool) else 0
+        raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        start_pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
+
         try:
             positions = await asyncio.to_thread(self.inv_manager._fetch_ticker_positions, ticker)
         except Exception as exc:
             logger.error(f"Position verification failed for {ticker}: {exc}")
             return None
-        if self.inv_manager._fill_count != start_fill_count:
-            logger.warning(f"Fill raced position verification for {ticker}; refusing stale snapshot.")
+
+        current_raw_fill_count = getattr(self.inv_manager, "_fill_count", 0)
+        current_fill_count = current_raw_fill_count if isinstance(current_raw_fill_count, int) and not isinstance(current_raw_fill_count, bool) else 0
+        current_raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        current_pending_fills = current_raw_pending if isinstance(current_raw_pending, int) and not isinstance(current_raw_pending, bool) else 0
+
+        if (current_fill_count != start_fill_count
+                or start_pending_fills > 0
+                or current_pending_fills > 0):
+            logger.warning(
+                f"Fill raced or pending during position verification for {ticker} "
+                f"(count: {start_fill_count}->{current_fill_count}, "
+                f"pending: {start_pending_fills}->{current_pending_fills}); refusing stale snapshot."
+            )
             return None
         return positions
 
@@ -1699,10 +1723,13 @@ class AvellanedaStoikovBot:
                 return False
             exposed = [(index, value) for index, value in positions.items() if value != 0]
             if not exposed:
+                raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+                pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
                 if (self.om._pending_client_ids or any(order.get("ticker") == target_ticker
                         for order in self.om.active_orders.values())
-                        or self.inv_manager.get_position(target_ticker) != 0):
-                    logger.error(f"Exchange is flat but local inventory for {target_ticker} is not; await fill reconciliation before retrying.")
+                        or self.inv_manager.get_position(target_ticker) != 0
+                        or pending_fills > 0):
+                    logger.error(f"Exchange is flat but local inventory for {target_ticker} is not or fills are pending; await fill reconciliation before retrying.")
                     return False
                 logger.info(f"Liquidation confirmed for {target_ticker}. Net position is flat.")
                 return True
