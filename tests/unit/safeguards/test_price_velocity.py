@@ -193,6 +193,7 @@ class TestPriceVelocityCircuitBreaker:
         bot.ob_manager.unsubscribe = AsyncMock(return_value=True)
         bot.ob_manager.subscribe = AsyncMock(return_value=True)
         bot.om.record_pnl_snapshot_async = AsyncMock(return_value=True)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
 
         # Populate state
         bot._mid_price_history.append((time.time(), 50.0))

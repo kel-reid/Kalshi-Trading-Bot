@@ -596,7 +596,7 @@ async def test_market_maker_startup_gating_aborts_on_uncollateralized_shard():
     with patch("strategy.market_maker.get_market_exchange_index", return_value=3):
         bot = AvellanedaStoikovBot("KXNBAGAME-STARTUP-GATE")
         bot.om.sync_and_recover_state = AsyncMock()
-        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.connect = AsyncMock(side_effect=asyncio.Event().wait)
         bot.ws_client.is_connected = True
         bot.inv_manager.hydrate = AsyncMock(return_value=True)
         bot.ensure_shard_collateral = AsyncMock(return_value=False)
@@ -605,8 +605,14 @@ async def test_market_maker_startup_gating_aborts_on_uncollateralized_shard():
         with patch("strategy.market_maker.start_metrics_server"):
             with patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
                 with patch("asyncio.sleep", new_callable=AsyncMock):
-                    with pytest.raises(RuntimeError, match="Startup failed: Insufficient verified shard collateral"):
-                        await bot.start()
+                    try:
+                        with pytest.raises(RuntimeError, match="Startup failed: Insufficient verified shard collateral"):
+                            await bot.start()
+
+                        assert not bot._ws_task.done()
+                    finally:
+                        bot._ws_task.cancel()
+                        await asyncio.gather(bot._ws_task, return_exceptions=True)
 
                     assert bot.ensure_shard_collateral.await_count == 3
                     assert bot.running is False

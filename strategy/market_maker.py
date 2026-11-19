@@ -17,10 +17,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Union, List
 
 from data.websocket_client import KalshiWebsocketClient, FatalIngestionError
-from data.fill_store import FillStore
-from data.fill_sync import FillSync
 from data.orderbook_manager import OrderbookManager
 from data.inventory_manager import InventoryManager
+from data.fill_store import FillStore
+from data.fill_sync import FillSync
 from execution.order_manager import OrderManager
 from utils.alerting import send_alert
 from utils.market_discovery import (
@@ -320,6 +320,7 @@ class AvellanedaStoikovBot:
         self.inv_manager = InventoryManager(self.ws_client)
         self.om = OrderManager()
         self.inv_manager.fill_store = FillStore(self.om.db_pool)
+        self.fill_store = self.inv_manager.fill_store
         
         self.running = False
         
@@ -370,6 +371,11 @@ class AvellanedaStoikovBot:
 
         # Background task references to prevent garbage collection in asyncio
         self._background_tasks = set()
+        self._ws_task: Optional[asyncio.Task] = None
+        self._strategy_task: Optional[asyncio.Task] = None
+        self._ingestion_failed = False
+        self._stopping = False
+        self._fill_connection_generation = None
         self._sync_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
 
@@ -378,12 +384,6 @@ class AvellanedaStoikovBot:
         self._consecutive_hedge_failures: int = 0
         self._last_shard_rebalance_time: float = 0.0
         self._last_shard_rebalance_dispatch_time: float = 0.0
-        self._ingestion_failed: bool = False
-        self._stopping: bool = False
-        self._ws_task: Optional[asyncio.Task] = None
-        self._sync_task: Optional[asyncio.Task] = None
-        self._fill_connection_generation: Optional[int] = None
-        self._strategy_task: Optional[asyncio.Task] = None
         self.fill_store = getattr(self.inv_manager, "fill_store", None)
         self.fill_sync = getattr(self.inv_manager, "fill_sync", None)
         self._deferred_cleanup_task: Optional[asyncio.Task] = None
@@ -398,10 +398,10 @@ class AvellanedaStoikovBot:
         self.running = False
 
     def _is_inventory_flat(self, ticker: Optional[str] = None) -> bool:
-        """Returns True if position is effectively flat (< 0.5 contracts), preventing sub-contract chatter."""
+        """Returns True only for an exactly flat local position."""
         target_ticker = ticker or self.ticker
         pos = self.inv_manager.get_position(target_ticker)
-        return abs(pos) < 0.5
+        return pos == 0
 
     def _get_rotation_exclude_tickers(self, exclude_event: bool = False) -> List[str]:
         """
@@ -660,60 +660,6 @@ class AvellanedaStoikovBot:
 
 
 
-    async def _verified_ticker_positions(self, ticker: str):
-        if self._ws_task is None and self._fill_connection_generation is None:
-            return {}
-        start_fill_count = self.inv_manager._fill_count
-        try:
-            positions = await asyncio.to_thread(self.inv_manager._fetch_ticker_positions, ticker)
-        except Exception as exc:
-            logger.error(f"Position verification failed for {ticker}: {exc}")
-            return None
-        if self.inv_manager._fill_count != start_fill_count:
-            logger.warning(f"Fill raced position verification for {ticker}; refusing stale snapshot.")
-            return None
-        return positions
-
-    async def _subscribe_fills_before_hydration(self):
-        """Wait for the exchange to acknowledge the fill subscription."""
-        responses = {}
-        changed = asyncio.Event()
-        generation = self.ws_client.connection_generation
-
-        async def on_response(message):
-            if message.get("type") in ("subscribed", "error"):
-                responses[message.get("id")] = message
-                changed.set()
-
-        self.ws_client.add_message_handler(on_response)
-        try:
-            await self.inv_manager.subscribe()
-            subscriptions = [s for s in getattr(self.ws_client, "active_subscriptions", [])
-                             if s.get("params", {}).get("channels") == ["fill"]]
-            if not subscriptions:
-                return
-            subscription_id = subscriptions[-1]["id"]
-            async def wait_for_response():
-                while subscription_id not in responses:
-                    changed.clear()
-                    await changed.wait()
-                return responses[subscription_id]
-
-            response = await asyncio.wait_for(wait_for_response(), timeout=10)
-            if (response.get("type") != "subscribed"
-                    or response.get("msg", {}).get("channel") != "fill"
-                    or not self.ws_client.is_connected
-                    or self.ws_client.connection_generation != generation):
-                raise RuntimeError("fill subscription not confirmed on the current connection")
-        except Exception as exc:
-            raise FatalIngestionError("Fill ingestion startup failed; reconciliation required") from exc
-        finally:
-            if on_response in self.ws_client.message_handlers:
-                self.ws_client.message_handlers.remove(on_response)
-
-    async def close_fill_ingestion(self, clean: bool = True):
-        await self.inv_manager.close_fill_ingestion(clean=clean)
-
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
         if self._ingestion_failed or self._stopping:
@@ -723,18 +669,13 @@ class AvellanedaStoikovBot:
         self._strategy_task = strategy_task
         try:
             done, _ = await asyncio.wait((self._ws_task, strategy_task), return_when=asyncio.FIRST_COMPLETED)
-            if self._ws_task in done and not strategy_task.done():
-                if self._ws_task.exception() is not None:
-                    raise self._ws_task.exception()
-                await strategy_task
-            elif strategy_task in done:
-                await strategy_task
-            elif self._ws_task in done:
+            if self._ws_task in done:
                 if not self._ws_task.cancelled():
                     self._ingestion_failed = True
                     self.running = False
                 await self._ws_task
                 raise FatalIngestionError("WebSocket ingestion stopped unexpectedly; reconciliation required")
+            await strategy_task
         except BaseException:
             if not self._stopping:
                 self._ingestion_failed = True
@@ -771,6 +712,42 @@ class AvellanedaStoikovBot:
                 if failure is strategy_failure or isinstance(failure, FatalIngestionError):
                     raise failure
                 raise FatalIngestionError("WebSocket ingestion failed; reconciliation required") from failure
+
+    async def _subscribe_fills_before_hydration(self):
+        """Wait for the exchange to acknowledge the fill subscription."""
+        responses = {}
+        changed = asyncio.Event()
+        generation = self.ws_client.connection_generation
+
+        async def on_response(message):
+            if message.get("type") in ("subscribed", "error"):
+                responses[message.get("id")] = message
+                changed.set()
+
+        self.ws_client.add_message_handler(on_response)
+        try:
+            await self.inv_manager.subscribe()
+            subscriptions = [s for s in self.ws_client.active_subscriptions
+                             if s.get("params", {}).get("channels") == ["fill"]]
+            if not subscriptions:
+                raise RuntimeError("fill subscription was not registered")
+            subscription_id = subscriptions[-1]["id"]
+            async def wait_for_response():
+                while subscription_id not in responses:
+                    changed.clear()
+                    await changed.wait()
+                return responses[subscription_id]
+
+            response = await asyncio.wait_for(wait_for_response(), timeout=10)
+            if (response.get("type") != "subscribed"
+                    or response.get("msg", {}).get("channel") != "fill"
+                    or not self.ws_client.is_connected
+                    or self.ws_client.connection_generation != generation):
+                raise RuntimeError("fill subscription not confirmed on the current connection")
+        except Exception as exc:
+            raise FatalIngestionError("Fill ingestion startup failed; reconciliation required") from exc
+        finally:
+            self.ws_client.message_handlers.remove(on_response)
 
     async def _run_strategy(self):
         logger.info(f"Starting Market Maker for {self.ticker}")
@@ -828,12 +805,12 @@ class AvellanedaStoikovBot:
                     or self.ws_client.connection_generation != generation):
                 raise FatalIngestionError("Startup position snapshot raced fill ingestion or connection loss; reconciliation required")
         finally:
-            if observe_fill in self.ws_client.message_handlers:
-                self.ws_client.message_handlers.remove(observe_fill)
+            self.ws_client.message_handlers.remove(observe_fill)
         if not hydrated:
             await send_alert(f"Startup Aborted: Failed to hydrate initial portfolio inventory for {self.ticker}.")
             raise RuntimeError(f"Startup hydration failed for {self.ticker}; cannot safely trade without verified position ground truth.")
 
+        # 3b. Launch the periodic reconciliation background task
         self._sync_task = asyncio.create_task(self.inv_manager._sync_loop())
         self._background_tasks.add(self._sync_task)
         self._sync_task.add_done_callback(self._background_tasks.discard)
@@ -855,7 +832,7 @@ class AvellanedaStoikovBot:
                 if not self.ws_client.is_connected or self.ws_client.connection_generation != generation:
                     raise FatalIngestionError("WebSocket connection changed; reconciliation required before resuming")
                 await self._tick()
-                await asyncio.sleep(getattr(self, "tick_interval", 1))
+                await asyncio.sleep(1) # Re-evaluate every 1 second
         except asyncio.CancelledError:
             logger.info("Market Maker stopped.")
             raise
@@ -886,28 +863,29 @@ class AvellanedaStoikovBot:
         if self._market_inactive:
             if self.current_bid_id or self.current_ask_id:
                 logger.warning(f"Retrying quote cancellation for inactive market {self.ticker}...")
-                await self._cancel_all_quotes()
+                if not await self._cancel_all_quotes():
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
 
             if now - self._last_inactive_retry >= self._inactive_retry_interval:
                 self._last_inactive_retry = now
-                if not self._is_inventory_flat():
-                    logger.warning(f"Retrying liquidation for inactive market {self.ticker}...")
-                    if not await self.liquidate_inventory(self.ticker):
-                        hydrated = False
-                        try:
-                            hydrated = await self.inv_manager.hydrate(is_startup=False)
-                        except Exception as e_hyd:
-                            logger.error(f"Failed to hydrate inventory on inactive retry for {self.ticker}: {e_hyd}")
-                        if not hydrated:
-                            await send_alert(
-                                f"⚠️ Inactive market liquidation could not be confirmed for {self.ticker}; "
-                                "position state is unknown after inventory hydration failed."
-                            )
-                        elif not self._is_inventory_flat():
-                            await send_alert(
-                                f"⚠️ Inactive market liquidation retry failed for {self.ticker} "
-                                f"(position={self.inv_manager.get_position(self.ticker)})."
-                            )
+                logger.warning(f"Retrying liquidation for inactive market {self.ticker}...")
+                if not await self.liquidate_inventory(self.ticker):
+                    hydrated = False
+                    try:
+                        hydrated = await self.inv_manager.hydrate(is_startup=False)
+                    except Exception as e_hyd:
+                        logger.error(f"Failed to hydrate inventory on inactive retry for {self.ticker}: {e_hyd}")
+                    if not hydrated:
+                        await send_alert(
+                            f"⚠️ Inactive market liquidation could not be confirmed for {self.ticker}; "
+                            "position state is unknown after inventory hydration failed."
+                        )
+                    elif not self._is_inventory_flat():
+                        await send_alert(
+                            f"⚠️ Inactive market liquidation retry failed for {self.ticker} "
+                            f"(position={self.inv_manager.get_position(self.ticker)})."
+                        )
 
                 if self.auto_rotate:
                     logger.info(f"Retrying market discovery for inactive market {self.ticker}...")
@@ -1001,7 +979,71 @@ class AvellanedaStoikovBot:
                 # Refresh inventory from inv_manager following async discovery check
                 inventory = self.inv_manager.get_position(self.ticker)
 
-        
+        # 2a-0. Expiration Blackout Safeguard (Late-Game Quoting Freeze & Unwind)
+        # Prevents opening or accumulating inventory during late-game blowouts and final game stages.
+        # Evaluated before one-sided book checks or session safeguards to ensure any existing
+        # inventory is unwound via reduce-only IOC orders, and no resting orders persist.
+        if self.blackout_enabled and self._market_close_time is not None:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            remaining_to_close = (self._market_close_time - now_utc).total_seconds()
+            if remaining_to_close <= self.expiration_blackout_seconds:
+                self._in_expiration_blackout = True
+                logger.warning(
+                    f"[EXPIRATION BLACKOUT] Market {self.ticker} within blackout window "
+                    f"({remaining_to_close:.0f}s <= {self.expiration_blackout_seconds}s to close). "
+                    f"Current inventory: {inventory}."
+                )
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="blackout_expiration", ticker=self.ticker).inc()
+                except Exception as e_metric:
+                    logger.debug(f"Safeguard metric update failed: {e_metric}")
+
+                if not self._is_inventory_flat():
+                    await self.liquidate_inventory(self.ticker)
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if not await self._cancel_all_quotes():
+                    logger.error(f"[EXPIRATION BLACKOUT] Quote cancellation unconfirmed for {self.ticker}.")
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                positions = await self._verified_ticker_positions(self.ticker)
+                if positions is None:
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if any(value != 0 for value in positions.values()) or not self._is_inventory_flat():
+                    await self.liquidate_inventory(self.ticker)
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+                if self._is_inventory_flat():
+                    logger.info(f"[EXPIRATION BLACKOUT] Exchange and local inventory are flat for {self.ticker}.")
+                    verified_fill_count = self.inv_manager._fill_count
+                    if self.auto_rotate:
+                        replacement = await discover_active_market_async(
+                            target_preference=self.target_preference,
+                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
+                            min_mid_price=self.min_mid_price,
+                            max_mid_price=self.max_mid_price,
+                        )
+                        if replacement:
+                            if await self.rotate_market(replacement):
+                                self._market_inactive = False
+                                self._in_expiration_blackout = False
+                                logger.info(f"Successfully rotated from blackout market to {replacement}.")
+                            else:
+                                self._maybe_schedule_pnl_snapshot(now, inventory)
+                                return
+                            self._maybe_schedule_pnl_snapshot(now, inventory)
+                            return
+                    positions = await self._verified_ticker_positions(self.ticker)
+                    if (positions is not None and not any(value != 0 for value in positions.values())
+                            and self._is_inventory_flat() and self.inv_manager._fill_count == verified_fill_count):
+                        self._market_inactive = True
+                        self._last_inactive_retry = now
+                    self._maybe_schedule_pnl_snapshot(now, inventory)
+                    return
+            else:
+                self._in_expiration_blackout = False
+
         best_bid = self.ob_manager.get_best_bid(self.ticker)
         best_ask = self.ob_manager.get_best_ask(self.ticker)
         
@@ -1174,73 +1216,6 @@ class AvellanedaStoikovBot:
                 self._market_inactive = True
                 self._last_inactive_retry = now
             return
-
-        # 2a-0. Expiration Blackout Safeguard (Late-Game Quoting Freeze & Unwind)
-        # Prevents opening or accumulating inventory during late-game blowouts and final game stages.
-        if self.blackout_enabled and self._market_close_time is not None:
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            remaining_to_close = (self._market_close_time - now_utc).total_seconds()
-            if remaining_to_close <= self.expiration_blackout_seconds:
-                self._in_expiration_blackout = True
-                logger.warning(
-                    f"[EXPIRATION BLACKOUT] Market {self.ticker} within blackout window "
-                    f"({remaining_to_close:.0f}s <= {self.expiration_blackout_seconds}s to close). "
-                    f"Current inventory: {inventory}."
-                )
-                try:
-                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="blackout_expiration", ticker=self.ticker).inc()
-                except Exception as e_metric:
-                    logger.debug(f"Safeguard metric update failed: {e_metric}")
-
-                if self._is_inventory_flat():
-                    logger.info(f"[EXPIRATION BLACKOUT] Inventory is flat ({inventory}). Withdrawing quotes and rotating away from {self.ticker}.")
-                    await self._cancel_all_quotes()
-                    if self.auto_rotate:
-                        replacement = await discover_active_market_async(
-                            target_preference=self.target_preference,
-                            exclude_tickers=self._get_rotation_exclude_tickers(exclude_event=True),
-                            min_mid_price=self.min_mid_price,
-                            max_mid_price=self.max_mid_price,
-                        )
-                        if replacement:
-                            if await self.rotate_market(replacement):
-                                self._market_inactive = False
-                                self._in_expiration_blackout = False
-                                logger.info(f"Successfully rotated from blackout market to {replacement}.")
-                            else:
-                                self._market_inactive = True
-                                self._last_inactive_retry = now
-                        else:
-                            self._market_inactive = True
-                            self._last_inactive_retry = now
-                    else:
-                        self._market_inactive = True
-                        self._last_inactive_retry = now
-                    return
-                else:
-                    # Holding open inventory during blackout: UNWIND ONLY!
-                    # Only place the exit leg to bring position to 0; never place a new risk leg.
-                    if inventory > 0:
-                        optimal_bid = None
-                        optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
-                    else:
-                        optimal_ask = None
-                        optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
-
-                    realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
-                    unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
-                    logger.info(
-                        f"[EXPIRATION BLACKOUT UNWIND] Mid={mid_price:.1f}c | Inventory={inventory} | "
-                        f"→ Bid={optimal_bid}c  Ask={optimal_ask}c | "
-                        f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
-                    )
-                    # Never exceed the open position when unwinding
-                    unwind_target = int(abs(inventory))
-                    self._current_quote_size = max(1, min(quote_size, unwind_target))
-                    await self._update_quotes(optimal_bid, optimal_ask)
-                    return
-            else:
-                self._in_expiration_blackout = False
 
         # 2a. Extreme Price Collar Safeguard:
         # If orderbook midpoint drifts outside [min_mid_price, max_mid_price]:
@@ -1681,6 +1656,34 @@ class AvellanedaStoikovBot:
 
 
 
+    async def _verified_ticker_positions(self, ticker: str):
+        raw_fill_count = getattr(self.inv_manager, "_fill_count", 0)
+        start_fill_count = raw_fill_count if isinstance(raw_fill_count, int) and not isinstance(raw_fill_count, bool) else 0
+        raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        start_pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
+
+        try:
+            positions = await asyncio.to_thread(self.inv_manager._fetch_ticker_positions, ticker)
+        except Exception as exc:
+            logger.error(f"Position verification failed for {ticker}: {exc}")
+            return None
+
+        current_raw_fill_count = getattr(self.inv_manager, "_fill_count", 0)
+        current_fill_count = current_raw_fill_count if isinstance(current_raw_fill_count, int) and not isinstance(current_raw_fill_count, bool) else 0
+        current_raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        current_pending_fills = current_raw_pending if isinstance(current_raw_pending, int) and not isinstance(current_raw_pending, bool) else 0
+
+        if (current_fill_count != start_fill_count
+                or start_pending_fills > 0
+                or current_pending_fills > 0):
+            logger.warning(
+                f"Fill raced or pending during position verification for {ticker} "
+                f"(count: {start_fill_count}->{current_fill_count}, "
+                f"pending: {start_pending_fills}->{current_pending_fills}); refusing stale snapshot."
+            )
+            return None
+        return positions
+
     async def liquidate_inventory(self, ticker: Optional[str] = None, max_retries: int = 3) -> bool:
         """
         Aggressively liquidates open inventory for a ticker by crossing the orderbook
@@ -1690,9 +1693,6 @@ class AvellanedaStoikovBot:
         """
         target_ticker = ticker or self.ticker
         current_inv = self.inv_manager.get_position(target_ticker)
-        if abs(current_inv) < 0.5:
-            logger.info(f"Inventory for {target_ticker} is already flat ({current_inv}). No liquidation needed.")
-            return True
 
         logger.warning(
             f"Initiating aggressive liquidation for {target_ticker}: "
@@ -1707,13 +1707,34 @@ class AvellanedaStoikovBot:
             )
             return False
 
+        if self.om._pending_client_ids:
+            logger.error(f"Cannot liquidate {target_ticker} while order placements are pending.")
+            return False
+
         failed_attempts = 0
         total_slices = 0
         while failed_attempts < max_retries:
-            inv = self.inv_manager.get_position(target_ticker)
-            if abs(inv) < 0.5:
-                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is flat ({inv}).")
+            if (self.om._pending_client_ids or any(
+                    order.get("ticker") == target_ticker for order in self.om.active_orders.values())):
+                logger.error(f"Outstanding orders prevent liquidation of {target_ticker}.")
+                return False
+            positions = await self._verified_ticker_positions(target_ticker)
+            if positions is None:
+                return False
+            exposed = [(index, value) for index, value in positions.items() if value != 0]
+            if not exposed:
+                raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+                pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
+                if (self.om._pending_client_ids or any(order.get("ticker") == target_ticker
+                        for order in self.om.active_orders.values())
+                        or self.inv_manager.get_position(target_ticker) != 0
+                        or pending_fills > 0):
+                    logger.error(f"Exchange is flat but local inventory for {target_ticker} is not or fills are pending; await fill reconciliation before retrying.")
+                    return False
+                logger.info(f"Liquidation confirmed for {target_ticker}. Net position is flat.")
                 return True
+            shard, inv = exposed[0]
+            before_positions = positions
 
             best_bid = self.ob_manager.get_best_bid(target_ticker)
             best_ask = self.ob_manager.get_best_ask(target_ticker)
@@ -1725,7 +1746,7 @@ class AvellanedaStoikovBot:
                 )
                 return False
 
-            slice_count = min(int(abs(inv)), self.max_order_contracts)
+            slice_count = min(abs(inv), Decimal(str(self.max_order_contracts)))
             if slice_count <= 0:
                 logger.error(
                     f"Residual inventory ({inv}) for {target_ticker} cannot be closed with whole-contract "
@@ -1747,22 +1768,26 @@ class AvellanedaStoikovBot:
                 f"@ {price}c for {target_ticker} (current position: {inv}, consecutive failed attempts: {failed_attempts}/{max_retries})"
             )
 
-            order_kwargs = {}
-            if getattr(self, "exchange_index", 0) and target_ticker == self.ticker:
-                order_kwargs["exchange_index"] = self.exchange_index
-            order_id = await self.om.place_order(
-                ticker=target_ticker,
-                side="yes",
-                action=action,
-                count=slice_count,
-                price=price,
-                **order_kwargs,
-            )
+            order_kwargs = {"reduce_only": True, "time_in_force": "immediate_or_cancel", "exchange_index": shard}
+            try:
+                order_id = await self.om.place_order(
+                    ticker=target_ticker,
+                    side="yes",
+                    action=action,
+                    count=slice_count,
+                    price=price,
+                    **order_kwargs,
+                )
+            except Exception as exc:
+                logger.error(f"Liquidation order failed for {target_ticker}: {exc}")
+                await self._verified_ticker_positions(target_ticker)
+                return False
             if not order_id:
                 logger.error(
                     f"Failed to place liquidation order on {target_ticker}; "
                     f"order outcome unconfirmed. Aborting liquidation to avoid untracked exposure."
                 )
+                await self._verified_ticker_positions(target_ticker)
                 return False
 
             # Wait briefly for execution / WebSocket fill propagation
@@ -1770,11 +1795,17 @@ class AvellanedaStoikovBot:
 
             # Clean up any un-executed portion if order is still resting
             if order_id in self.om.active_orders:
-                if not await self.om.cancel_order(order_id):
+                try:
+                    cancelled = await self.om.cancel_order(order_id)
+                except Exception as exc:
+                    logger.error(f"Could not cancel liquidation order {order_id}: {exc}")
+                    cancelled = False
+                if not cancelled:
                     logger.error(
                         f"Failed to cancel liquidation order {order_id} on {target_ticker}; "
                         f"aborting to prevent overfill or unintended position exposure."
                     )
+                    await self._verified_ticker_positions(target_ticker)
                     return False
 
             try:
@@ -1784,95 +1815,41 @@ class AvellanedaStoikovBot:
                         f"Resting-order reconciliation failed during liquidation on {target_ticker}; "
                         f"aborting to prevent overfill."
                     )
+                    await self._verified_ticker_positions(target_ticker)
                     return False
             except Exception as e_rec:
                 logger.error(f"Resting-order reconciliation raised during liquidation on {target_ticker}: {e_rec}")
+                await self._verified_ticker_positions(target_ticker)
                 return False
 
-            # Drain any pending WebSocket fill tasks from the event loop before sizing next slice
-            await asyncio.sleep(0.1)
-
-            new_inv = self.inv_manager.get_position(target_ticker)
-
-            # Authoritative Execution and Fill Barrier:
-            # If local inventory has not changed, verify execution on exchange before sizing next slice.
-            # Prevents submitting duplicate slices if WebSocket fill notifications are delayed.
-            if new_inv == inv and hasattr(self.om, "get_order_status"):
+            # IOC must be terminal before the position snapshot can be trusted.
+            try:
                 order_status = await self.om.get_order_status(order_id)
-                if order_status is not None:
-                    count_raw = order_status.get(
-                        "initial_count_fp",
-                        order_status.get("count_fp", order_status.get("count", slice_count)),
-                    )
-                    rem_raw = order_status.get(
-                        "remaining_count_fp",
-                        order_status.get("remaining_count"),
-                    )
-                    fill_raw = order_status.get(
-                        "fill_count_fp",
-                        order_status.get("fill_count"),
-                    )
-                    status_str = order_status.get("status")
-
-                    try:
-                        if fill_raw is not None:
-                            exec_count = max(Decimal("0"), Decimal(str(fill_raw)))
-                        elif rem_raw is not None:
-                            exec_count = max(
-                                Decimal("0"),
-                                Decimal(str(count_raw)) - Decimal(str(rem_raw)),
-                            )
-                        elif status_str == "executed":
-                            exec_count = Decimal(str(count_raw))
-                        else:
-                            exec_count = Decimal("0")
-                    except (InvalidOperation, TypeError, ValueError) as exc:
-                        logger.error(
-                            f"Invalid execution quantities for order {order_id} on {target_ticker}: {exc}; "
-                            f"aborting liquidation to prevent unverified exposure."
-                        )
-                        return False
-
-                    if exec_count > 0:
-                        logger.info(
-                            f"Order {order_id} executed {exec_count} contracts on exchange; "
-                            f"awaiting WebSocket fill processing..."
-                        )
-                        # Wait up to 2 seconds for WebSocket fill to be dispatched locally
-                        for _ in range(20):
-                            await asyncio.sleep(0.1)
-                            new_inv = self.inv_manager.get_position(target_ticker)
-                            if new_inv != inv:
-                                break
-
-                        # If WebSocket fill still hasn't arrived after wait, perform authoritative REST hydration
-                        if new_inv == inv:
-                            logger.warning(
-                                f"WebSocket fill delayed for order {order_id} on {target_ticker}; "
-                                f"performing authoritative REST position hydration..."
-                            )
-                            hydrated = await self.inv_manager.hydrate(is_startup=False)
-                            new_inv = self.inv_manager.get_position(target_ticker)
-                            if new_inv == inv:
-                                logger.error(
-                                    f"Authoritative position confirmation failed for {target_ticker} after order {order_id}; "
-                                    f"aborting liquidation to prevent unverified exposure."
-                                )
-                                return False
-                else:
-                    # Order status query failed; attempt authoritative position hydration as fallback
-                    logger.warning(
-                        f"Order status query unconfirmed for {order_id}; "
-                        f"attempting authoritative REST position check for {target_ticker}..."
-                    )
-                    hydrated = await self.inv_manager.hydrate(is_startup=False)
-                    new_inv = self.inv_manager.get_position(target_ticker)
-                    if not hydrated and new_inv == inv:
-                        logger.error(
-                            f"Execution outcome of liquidation order {order_id} unconfirmed on {target_ticker}; "
-                            f"aborting liquidation to prevent overfill."
-                        )
-                        return False
+            except Exception as exc:
+                logger.error(f"Cannot confirm liquidation order {order_id}: {exc}")
+                order_status = None
+            positions = await self._verified_ticker_positions(target_ticker)
+            if positions is None or not isinstance(order_status, dict) or order_status.get("status") not in ("executed", "canceled", "cancelled"):
+                return False
+            if any(positions.get(index, Decimal("0")) != previous
+                   for index, previous in before_positions.items() if index != shard) or any(
+                       value != 0 for index, value in positions.items()
+                       if index != shard and index not in before_positions):
+                return False
+            new_inv = positions.get(shard, Decimal("0"))
+            try:
+                raw_fill = order_status.get("fill_count_fp", order_status.get("fill_count"))
+                if raw_fill is None or isinstance(raw_fill, bool):
+                    return False
+                filled = Decimal(str(raw_fill))
+                if not filled.is_finite() or filled < 0 or filled > slice_count:
+                    return False
+                expected = inv - filled if inv > 0 else inv + filled
+                if new_inv != expected:
+                    logger.error(f"Order and position snapshots disagree for {target_ticker}; refusing to continue.")
+                    return False
+            except (InvalidOperation, ValueError, TypeError):
+                return False
 
             if (inv > 0 and new_inv < 0) or (inv < 0 and new_inv > 0):
                 logger.error(
@@ -1881,7 +1858,12 @@ class AvellanedaStoikovBot:
                 )
                 return False
 
-            if new_inv == 0:
+            if new_inv == 0 and not any(value != 0 for value in positions.values()):
+                if (self.om._pending_client_ids or any(order.get("ticker") == target_ticker
+                        for order in self.om.active_orders.values())
+                        or self.inv_manager.get_position(target_ticker) != 0):
+                    logger.error(f"Liquidation of {target_ticker} awaits pending orders or local fill reconciliation.")
+                    return False
                 logger.info(f"Liquidation confirmed for {target_ticker}. Net position is 0.")
                 return True
 
@@ -1894,17 +1876,8 @@ class AvellanedaStoikovBot:
                     f"(position remains {new_inv}). Consecutive failed attempts: {failed_attempts}/{max_retries}."
                 )
 
-        # Final position verification
-        remaining_inv = self.inv_manager.get_position(target_ticker)
-        if remaining_inv == 0:
-            logger.info(f"Liquidation successfully flattened inventory for {target_ticker}.")
-            return True
-        else:
-            logger.error(
-                f"Liquidation incomplete for {target_ticker} after {total_slices} slices and "
-                f"{failed_attempts} failed attempts. Remaining inventory: {remaining_inv} contracts."
-            )
-            return False
+        logger.error(f"Liquidation incomplete for {target_ticker} after {total_slices} slices.")
+        return False
 
     async def _cancel_all_quotes(self, ticker: Optional[str] = None) -> bool:
         """Withdraws all active quotes from the market."""
@@ -1918,6 +1891,12 @@ class AvellanedaStoikovBot:
             if self.current_ask_id:
                 tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_targets.append(("ask", self.current_ask_id))
+
+        quoted_ids = {order_id for _, order_id in cancel_targets}
+        for order_id, details in list(self.om.active_orders.items()):
+            if details.get("ticker") == target_ticker and order_id not in quoted_ids:
+                tasks.append(self.om.cancel_order(order_id))
+                cancel_targets.append(("tracked", order_id))
              
         all_cancelled = True
 
@@ -1939,7 +1918,7 @@ class AvellanedaStoikovBot:
                     self.current_bid_id = None
                     self.current_bid_price = None
                     self.current_bid_size = None
-                else:
+                elif side == "ask":
                     self.current_ask_id = None
                     self.current_ask_price = None
                     self.current_ask_size = None
@@ -1954,6 +1933,9 @@ class AvellanedaStoikovBot:
             logger.error(f"Exchange resting order sweep failed during quote withdrawal: {e_rec}")
             all_cancelled = False
 
+        if self.om._pending_client_ids:
+            logger.warning(f"Pending order placements prevent confirming withdrawal for {target_ticker}.")
+            all_cancelled = False
         return all_cancelled
 
     def _maybe_schedule_pnl_snapshot(self, now: float, inventory: Optional[int] = None) -> None:
@@ -2080,54 +2062,18 @@ class AvellanedaStoikovBot:
             await self._escalate_to_kill_switch(context=f"market rotation from {old_ticker} to {new_ticker}")
             return False
 
-        # 1b. Liquidate any open inventory on old_ticker before unsubscribing
-        old_inv = self.inv_manager.get_position(old_ticker)
-        if abs(old_inv) >= 0.5:
+        # Confirm all shards, including when the local feed currently appears flat.
+        positions = await self._verified_ticker_positions(old_ticker)
+        if positions is None:
+            return False
+        if any(value != 0 for value in positions.values()) or self.inv_manager.get_position(old_ticker) != 0:
             if not allow_liquidation:
-                logger.warning(
-                    f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation "
-                    f"with allow_liquidation=False. Aborting rotation to manage existing position."
-                )
                 return False
-            logger.warning(
-                f"Open inventory of {old_inv} contracts detected on {old_ticker} during rotation. "
-                f"Liquidating position to prevent unhedged inventory decay..."
-            )
             liquidation_ok = await self.liquidate_inventory(ticker=old_ticker)
-            if not liquidation_ok:
-                # Trigger immediate portfolio REST hydration to reconcile potential exchange settlement
-                hydration_succeeded = False
-                try:
-                    hydration_succeeded = await self.inv_manager.hydrate(is_startup=False)
-                except Exception as e_hyd:
-                    logger.error(f"Failed to hydrate inventory during rotation from {old_ticker}: {e_hyd}")
-
-                remaining_inv = self.inv_manager.get_position(old_ticker)
-                if hydration_succeeded and abs(remaining_inv) < 0.5:
-                    logger.info(
-                        f"Inventory for {old_ticker} reconciled to flat ({remaining_inv}) following exchange hydration; proceeding with rotation."
-                    )
-                else:
-                    raw_status = await get_raw_market_status_async(old_ticker)
-                    if raw_status in ("closed", "settled", "determined", "finalized"):
-                        logger.warning(
-                            f"Market {old_ticker} is {raw_status} on exchange with unliquidated inventory {remaining_inv}. "
-                            f"Proceeding with rotation to {new_ticker} as exchange settlement will finalize position."
-                        )
-                        await send_alert(
-                            f"⚠️ Market {old_ticker} is {raw_status} with remaining position {remaining_inv}. "
-                            f"Rotating to {new_ticker}; awaiting exchange settlement."
-                        )
-                    else:
-                        logger.error(
-                            f"Aborting rotation from {old_ticker} to {new_ticker}: failed to liquidate existing inventory. "
-                            f"Remaining inventory: {remaining_inv} (market status: {raw_status})"
-                        )
-                        await send_alert(
-                            f"⚠️ Rotation aborted: liquidation of {old_ticker} incomplete. "
-                            f"Remaining position: {remaining_inv} (market status: {raw_status})."
-                        )
-                        return False
+            positions = await self._verified_ticker_positions(old_ticker)
+            if not liquidation_ok or positions is None or any(value != 0 for value in positions.values()):
+                await send_alert(f"⚠️ Rotation aborted: liquidation of {old_ticker} incomplete or unconfirmed.")
+                return False
 
         # Yield to event loop to quiesce in-flight fill processing and drain running snapshot tasks
         await asyncio.sleep(0)
@@ -2154,16 +2100,36 @@ class AvellanedaStoikovBot:
         # 1c. Sweep excess collateral from old trading shard back to Shard 0 if applicable
         old_exchange_index = getattr(self, "exchange_index", None)
         new_exchange_index = await asyncio.to_thread(get_market_exchange_index, new_ticker)
-        if (
-            self.auto_sweep_reverse_enabled
-            and old_exchange_index not in (0, None)
-            and new_exchange_index != old_exchange_index
-        ):
-            await self.sweep_shard_to_shard0(source_shard=old_exchange_index)
+        # Delayed WebSocket fills must not be ignored between the REST check and swap.
+        positions = await self._verified_ticker_positions(old_ticker)
+        if positions is None or any(value != 0 for value in positions.values()) or self.inv_manager.get_position(old_ticker) != 0:
+            logger.error(f"Aborting rotation: {old_ticker} position is nonzero or unconfirmed.")
+            return False
 
         # 2. Swap orderbook subscription
+        verified_fill_count = self.inv_manager._fill_count
         await self.ob_manager.unsubscribe([old_ticker])
         await self.ob_manager.subscribe([new_ticker])
+        positions = await self._verified_ticker_positions(old_ticker)
+        if (positions is None or any(value != 0 for value in positions.values())
+                or self.inv_manager._fill_count != verified_fill_count
+                or self.inv_manager.get_position(old_ticker) != 0):
+            await self.ob_manager.unsubscribe([new_ticker])
+            await self.ob_manager.subscribe([old_ticker])
+            logger.error(f"Aborting rotation: fill or unconfirmed position during subscription swap for {old_ticker}.")
+            return False
+
+        if (self.auto_sweep_reverse_enabled and old_exchange_index not in (0, None)
+                and new_exchange_index != old_exchange_index):
+            await self.sweep_shard_to_shard0(source_shard=old_exchange_index)
+            positions = await self._verified_ticker_positions(old_ticker)
+            if (positions is None or any(value != 0 for value in positions.values())
+                    or self.inv_manager._fill_count != verified_fill_count
+                    or self.inv_manager.get_position(old_ticker) != 0):
+                await self.ob_manager.unsubscribe([new_ticker])
+                await self.ob_manager.subscribe([old_ticker])
+                logger.error(f"Aborting rotation: fill or unconfirmed position during collateral sweep for {old_ticker}.")
+                return False
 
         # 3. Update target ticker and reset state trackers
         self.ticker = new_ticker
@@ -2314,8 +2280,6 @@ class AvellanedaStoikovBot:
         generation = self._fill_connection_generation
 
         def feed_healthy():
-            if self._ws_task is None and generation is None:
-                return True
             return (generation is not None and not self._ingestion_failed and self.ws_client.is_connected
                     and self.ws_client.connection_generation == generation
                     and self._ws_task is not None and not self._ws_task.done()
@@ -2446,17 +2410,28 @@ class AvellanedaStoikovBot:
         if not quotes_cancelled or has_active_orders:
             quotes_cancelled = await self._escalate_to_kill_switch(context="shutdown")
 
-        # 1b. Confirm exchange inventory / liquidate open inventory
-        if (self._ws_task is not None or self._fill_connection_generation is not None) and quotes_cancelled and not self._ingestion_failed:
+        # 1b. Confirm exchange inventory even if the local feed appears flat.
+        verified_fill_count = None
+        if quotes_cancelled and not self._ingestion_failed:
             positions = await self._verified_ticker_positions(self.ticker)
             if positions is None:
+                logger.error(f"Failed to verify exchange inventory on {self.ticker} during shutdown.")
                 quotes_cancelled = False
-            elif any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
-                if not await self.liquidate_inventory(self.ticker):
-                    quotes_cancelled = False
+            elif any(value != 0 for value in positions.values()) or not self._is_inventory_flat():
+                logger.warning(f"Liquidating remaining inventory on shutdown for {self.ticker}...")
+                try:
+                    liquidation_ok = await self.liquidate_inventory(self.ticker)
+                except Exception as e:
+                    logger.error(f"Shutdown liquidation raised for {self.ticker}: {e}")
+                    liquidation_ok = False
                 positions = await self._verified_ticker_positions(self.ticker)
-                if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+                if (not liquidation_ok or positions is None
+                        or any(value != 0 for value in positions.values())
+                        or not self._is_inventory_flat()):
+                    logger.error(f"Failed to confirm flat inventory on {self.ticker} during shutdown.")
                     quotes_cancelled = False
+            if quotes_cancelled:
+                verified_fill_count = self.inv_manager._fill_count
         elif not self._is_inventory_flat():
             if self._ingestion_failed or self._ws_task is not None or self._fill_connection_generation is not None:
                 logger.error("Skipping unverified local inventory liquidation on shutdown: fill ingestion has failed or was active.")
@@ -2489,13 +2464,18 @@ class AvellanedaStoikovBot:
         except Exception as e:
             logger.error(f"Failed to record shutdown PnL snapshot for {self.ticker}: {e}")
 
-        if (self._ws_task is not None or self._fill_connection_generation is not None) and quotes_cancelled and not self._ingestion_failed:
+        if quotes_cancelled and not self._ingestion_failed:
             positions = await self._verified_ticker_positions(self.ticker)
-            if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
+            if (positions is None or any(value != 0 for value in positions.values())
+                    or not self._is_inventory_flat()
+                    or self.inv_manager._fill_count != verified_fill_count):
+                logger.error(f"Shutdown position changed or is unconfirmed for {self.ticker}.")
                 quotes_cancelled = False
 
         # 2b. Sweep remaining funds back to Shard 0 on shutdown
-        if self.auto_sweep_reverse_enabled and quotes_cancelled:
+        if not feed_healthy():
+            self._ingestion_failed = True
+        if self.auto_sweep_reverse_enabled and quotes_cancelled and not self._ingestion_failed:
             try:
                 await self.sweep_shard_to_shard0(retain_dollars=0.0)
             except Exception as e:
@@ -2508,25 +2488,25 @@ class AvellanedaStoikovBot:
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
-        if (self._ws_task is not None or self._fill_connection_generation is not None):
-            if not feed_healthy():
+        if not feed_healthy():
+            self._ingestion_failed = True
+        if self._ws_task is not None and not self._ws_task.done():
+            self._ws_task.cancel()
+            await asyncio.gather(self._ws_task, return_exceptions=True)
+            if not self._ws_task.cancelled():
                 self._ingestion_failed = True
-            if self._ws_task is not None and not self._ws_task.done():
-                self._ws_task.cancel()
-                await asyncio.gather(self._ws_task, return_exceptions=True)
-                if not self._ws_task.cancelled():
-                    self._ingestion_failed = True
 
-            if quotes_cancelled and not self._ingestion_failed:
-                positions = await self._verified_ticker_positions(self.ticker)
-                if positions is None or any(v != 0 for v in positions.values()) or not self._is_inventory_flat():
-                    quotes_cancelled = False
+        if quotes_cancelled and not self._ingestion_failed:
+            positions = await self._verified_ticker_positions(self.ticker)
+            if (positions is None or any(value != 0 for value in positions.values())
+                    or not self._is_inventory_flat()
+                    or self.inv_manager._fill_count != verified_fill_count):
+                logger.error(f"Shutdown position changed or is unconfirmed for {self.ticker}.")
+                quotes_cancelled = False
 
-            return (quotes_cancelled and not self._ingestion_failed
-                    and self.inv_manager._fill_failure is None
-                    and self.ws_client.__dict__.get("_ingestion_failure") is None)
-
-        return quotes_cancelled
+        return (quotes_cancelled and not self._ingestion_failed
+                and self.inv_manager._fill_failure is None
+                and self.ws_client.__dict__.get("_ingestion_failure") is None)
 
 
 # Backward-compatible alias

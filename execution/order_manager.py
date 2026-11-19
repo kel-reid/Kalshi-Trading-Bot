@@ -19,6 +19,7 @@ import psycopg2
 from psycopg2 import pool
 import datetime
 import time
+from decimal import Decimal
 from typing import Dict, Any, List, Optional, Union
 from utils.rate_limiter import RateLimiter
 from utils.metrics import measure_latency, ORDERS_PLACED_TOTAL, ORDER_ERRORS_TOTAL
@@ -39,6 +40,7 @@ class OrderManager:
     def __init__(self):
         # Maps client_order_id -> Order Dict
         self.active_orders: Dict[str, Dict[str, Any]] = {}
+        self._ioc_order_ids: Dict[str, str] = {}
         # In-flight client_order_ids currently undergoing placement POST requests
         self._pending_client_ids: set[str] = set()
         self.db_pool: Optional[pool.ThreadedConnectionPool] = None
@@ -137,7 +139,7 @@ class OrderManager:
                         action VARCHAR(255),
                         side VARCHAR(255),
                         price INTEGER,
-                        count INTEGER,
+                        count NUMERIC,
                         status VARCHAR(255),
                         created_at TIMESTAMPTZ,
                         updated_at TIMESTAMPTZ,
@@ -146,6 +148,9 @@ class OrderManager:
                 ''')
                 cursor.execute('''
                     ALTER TABLE orders ADD COLUMN IF NOT EXISTS exchange_index INTEGER
+                ''')
+                cursor.execute('''
+                    ALTER TABLE orders ALTER COLUMN count TYPE NUMERIC
                 ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS pnl_attribution (
@@ -277,19 +282,46 @@ class OrderManager:
         ticker: str,
         side: str,
         action: str,
-        count: int,
+        count: Union[int, float, Decimal],
         price: Union[int, float],
         exchange_index: Optional[int] = None,
+        *,
+        reduce_only: bool = False,
+        time_in_force: str = "good_till_canceled",
     ) -> Optional[str]:
         """
         Place a new order.
         side: "yes" or "no"
         action: "buy" or "sell"
-        count: number of contracts
+        count: positive number of contracts, in increments of 0.01
         price: limit price in cents (1-99, or sub-cent float like 32.4)
         exchange_index: optional exchange shard index (0=default, 3=NBA/sports, etc.)
+        reduce_only: cap the order by the current position; requires immediate_or_cancel
+        time_in_force: good_till_canceled, immediate_or_cancel, or fill_or_kill
         Returns the client_order_id if successful, None otherwise.
         """
+        if isinstance(count, bool) or not isinstance(count, (int, float, Decimal)):
+            raise ValueError("count must be a positive number of contracts")
+        count_decimal = Decimal(str(count))
+        if not count_decimal.is_finite() or count_decimal <= 0:
+            raise ValueError("count must be a finite, positive number of contracts")
+        _, digits, exponent = count_decimal.as_tuple()
+        while exponent < -2 and digits and digits[-1] == 0:
+            digits = digits[:-1]
+            exponent += 1
+        if exponent < -2:
+            raise ValueError("count must be in increments of 0.01 contracts")
+        count_str = format(count_decimal, "f")
+        if "." in count_str:
+            whole, fraction = count_str.split(".")
+            count_str = whole + "." + fraction[:2]
+        if not isinstance(reduce_only, bool):
+            raise ValueError("reduce_only must be a boolean")
+        if time_in_force not in ("good_till_canceled", "immediate_or_cancel", "fill_or_kill"):
+            raise ValueError("invalid time_in_force")
+        if reduce_only and time_in_force != "immediate_or_cancel":
+            raise ValueError("reduce_only requires immediate_or_cancel")
+
         client_order_id = str(uuid.uuid4())
         
         # Map legacy (action, side) parameters to V2 order book (side) parameter
@@ -319,14 +351,16 @@ class OrderManager:
 
         payload = {
             "side": v2_side,
-            "count": str(count),
+            "count": count_str,
             "type": "limit",
             "ticker": ticker,
             "client_order_id": client_order_id,
             "price": price_str,
-            "time_in_force": "good_till_canceled",
+            "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross"
         }
+        if reduce_only:
+            payload["reduce_only"] = True
         if target_shard is not None:
             payload["exchange_index"] = int(target_shard)
         
@@ -362,19 +396,23 @@ class OrderManager:
                             "ticker": ticker,
                             "side": side,
                             "action": action,
-                            "count": count,
+                            "count": count if isinstance(count, int) else count_decimal,
                             "price": price,
                             "kalshi_order_id": kalshi_order_id,
                             "exchange_index": confirmed_shard,
                         }
-                        self.active_orders[client_order_id] = order_record
+                        if time_in_force in ("immediate_or_cancel", "fill_or_kill"):
+                            if kalshi_order_id:
+                                self._ioc_order_ids[client_order_id] = kalshi_order_id
+                        else:
+                            self.active_orders[client_order_id] = order_record
                         if confirmed_shard is not None and ticker:
                             self._ticker_exchange_indices[ticker] = int(confirmed_shard)
                         
                         # Persist to database
                         self._update_db_order_status(
                             client_order_id, 
-                            "resting", 
+                            {"immediate_or_cancel": "ioc_completed", "fill_or_kill": "fok_completed"}.get(time_in_force, "resting"),
                             kalshi_order_id=kalshi_order_id,
                             order_details=order_record,
                             exchange_index=confirmed_shard,
@@ -641,6 +679,8 @@ class OrderManager:
         kalshi_id = order_id
         if order_id in self.active_orders and self.active_orders[order_id].get("kalshi_order_id"):
             kalshi_id = self.active_orders[order_id]["kalshi_order_id"]
+        elif order_id in self._ioc_order_ids:
+            kalshi_id = self._ioc_order_ids[order_id]
 
         sign_path = f"/trade-api/v2/portfolio/orders/{kalshi_id}"
         max_retries = 2
@@ -1078,4 +1118,3 @@ class OrderManager:
             f"{resp.status_code if resp is not None else 'No response'} - {resp.text if resp is not None else ''}"
         )
         return False
-
