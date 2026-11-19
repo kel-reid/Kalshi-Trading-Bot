@@ -142,6 +142,40 @@ async def test_fill_during_position_fetch_invalidates_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_pending_fill_during_position_fetch_invalidates_snapshot():
+    bot = AvellanedaStoikovBot(ticker="OLD")
+
+    def fetch(ticker):
+        # A fill arrived and is buffering/spooling, incrementing _pending_fills before _fill_count
+        bot.inv_manager._pending_fills += 1
+        return {}
+
+    bot.inv_manager._fetch_ticker_positions = MagicMock(side_effect=fetch)
+    assert await bot._verified_ticker_positions("OLD") is None
+
+
+@pytest.mark.asyncio
+async def test_preexisting_pending_fills_invalidates_snapshot():
+    bot = AvellanedaStoikovBot(ticker="OLD")
+    bot.inv_manager._pending_fills = 1
+    bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
+    assert await bot._verified_ticker_positions("OLD") is None
+
+
+@pytest.mark.asyncio
+async def test_liquidate_inventory_rejects_flatness_if_fills_pending():
+    bot = AvellanedaStoikovBot(ticker="OLD")
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+    # Positions on exchange appear empty, but an in-flight fill is pending in ingestion
+    bot._verified_ticker_positions = AsyncMock(return_value={})
+    bot.inv_manager._pending_fills = 1
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+
+    assert await bot.liquidate_inventory("OLD") is False
+
+
+@pytest.mark.asyncio
 async def test_partial_fill_uses_exchange_residual_for_next_order():
     bot = AvellanedaStoikovBot(ticker="OLD")
     bot._cancel_all_quotes = AsyncMock(return_value=True)

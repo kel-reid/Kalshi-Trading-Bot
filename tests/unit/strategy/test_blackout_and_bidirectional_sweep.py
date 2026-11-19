@@ -318,6 +318,88 @@ async def test_expiration_blackout_excludes_game_event_prefix_during_rotation():
         assert "KXNBAGAME-26OCT28PHIIND" in exclude_tickers
 
 
+@pytest.mark.asyncio
+async def test_expiration_blackout_runs_before_one_sided_book_early_return():
+    """
+    In expiration blackout, long inventory must be unwound even if the orderbook
+    is one-sided (bids exist but asks are empty), rather than early-returning from _tick.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-EXPIRING",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        auto_rotate=False,
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=10)
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=3)  # Long 3
+    # One-sided orderbook: bids exist, but asks are empty
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=None)
+
+    _mock_blackout_liquidation(bot, 3)
+
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
+
+    assert bot._in_expiration_blackout is True
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "sell", 3, 48)
+
+
+@pytest.mark.asyncio
+async def test_expiration_blackout_runs_before_session_risk_hedge_resting_quotes():
+    """
+    When a session risk limit (fee churn or stop-loss) is breached inside the blackout window,
+    the bot must unwind via liquidate_inventory (IOC reduce-only) rather than placing resting
+    limit quotes via _update_quotes.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-EXPIRING",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        auto_rotate=False,
+        blackout_enabled=True,
+        expiration_blackout_seconds=1800,
+        max_session_loss_cents=100.0,
+    )
+
+    now = time.time()
+    bot._last_market_status_check = now
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bot._market_close_time = now_utc + datetime.timedelta(minutes=10)
+
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=5)  # Long 5 >= hedge_threshold (5)
+    # Simulate session stop-loss breach
+    bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+        "session_fees_cents": 0.0,
+        "session_realized_pnl_cents": -200.0,
+        "unrealized_pnl_cents": 0.0,
+    })
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+    _mock_blackout_liquidation(bot, 5)
+
+    with patch("strategy.market_maker.asyncio.sleep", new=AsyncMock()):
+        await bot._tick()
+
+    assert bot._in_expiration_blackout is True
+    bot.om.place_order.assert_awaited_once()
+    _assert_blackout_liquidation_order(bot, "sell", 5, 49)
+    bot._update_quotes.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 2. DANGER-ZONE BLACKOUT SAFEGUARD
 # ---------------------------------------------------------------------------
