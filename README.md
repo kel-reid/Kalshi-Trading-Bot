@@ -1,10 +1,10 @@
-# Kalshi Market Maker
+# Market Making Engine
 
 [![CI/CD Pipeline](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kel-reid/Kalshi-Trading-Bot/actions/workflows/ci-cd.yml)
 [![codecov](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot/branch/main/graph/badge.svg?token=KkibaTfdjc)](https://codecov.io/gh/kel-reid/Kalshi-Trading-Bot)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-An asynchronous market maker for [Kalshi](https://kalshi.com) prediction markets. It quotes both sides of in-season sports contracts with Avellaneda-Stoikov pricing, skews its quotes against the inventory it holds, and trades real capital. Because of that, every design choice starts with one question: what happens to open orders and positions when something goes wrong?
+An algorithmic market maker for [Kalshi](https://kalshi.com) prediction markets. It quotes both sides of in-season sports contracts with Avellaneda-Stoikov pricing, skews its quotes against the inventory it holds, and trades real capital. Because of that, every design choice starts with one question: what happens to open orders and positions when something goes wrong?
 
 ## Key Capabilities
 
