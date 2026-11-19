@@ -14,6 +14,12 @@ from data.inventory_manager import InventoryManager
 from strategy.market_maker import AvellanedaStoikovBot
 
 
+def setup_healthy_feed(bot):
+    bot.ws_client.is_connected = True
+    bot._fill_connection_generation = bot.ws_client.connection_generation
+    bot._ws_task = asyncio.create_task(asyncio.Event().wait())
+
+
 class TestMarketMakerPnLLifecycle:
     """Verifies MarketMaker PnL snapshot triggers, lifecycle events, and error handling."""
 
@@ -70,6 +76,7 @@ class TestMarketMakerPnLLifecycle:
         bot.ob_manager.subscribe = AsyncMock()
         bot.om.record_pnl_snapshot_async = AsyncMock()
         bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
 
         # Successful snapshot during rotation
         res = await bot.rotate_market("KXTEST-MM-ROT2")
@@ -87,7 +94,13 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_records_pnl_and_handles_error(self):
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-STOP")
         call_order = []
-        bot._cancel_all_quotes = AsyncMock(side_effect=lambda: call_order.append("cancel"))
+
+        async def cancel():
+            call_order.append("cancel")
+            return True
+
+        bot._cancel_all_quotes = AsyncMock(side_effect=cancel)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.om.record_pnl_snapshot_async = AsyncMock(side_effect=lambda **kwargs: call_order.append("snapshot"))
 
         # Successful stop: quotes cancelled first, then snapshot persisted
@@ -113,7 +126,9 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_escalates_to_emergency_kill_on_cancel_failure(self):
         """Verify bot.stop() escalates to emergency KillSwitch when _cancel_all_quotes fails."""
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-FAIL-CANCEL")
+        setup_healthy_feed(bot)
         bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.om.record_pnl_snapshot_async = AsyncMock()
 
         mock_killer = MagicMock()
@@ -130,6 +145,8 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_escalates_to_emergency_kill_when_om_has_tracked_active_orders(self):
         """Verify bot.stop() triggers emergency KillSwitch when om.active_orders is non-empty even if quote IDs are None."""
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-ACTIVE-ORDERS")
+        setup_healthy_feed(bot)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.current_bid_id = None
         bot.current_ask_id = None
         bot.om.active_orders = {"stray-order-1": {"kalshi_order_id": "k1"}}
@@ -153,6 +170,8 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_clears_quote_ids_and_returns_true_when_kill_switch_clears_active_orders(self):
         """Verify bot.stop() resets current quote IDs and returns True if KillSwitch successfully cancels active orders."""
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-KILL-RECOVER")
+        setup_healthy_feed(bot)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.current_bid_id = "bid-order-1"
         bot.current_bid_price = 45
         bot.om.active_orders = {"bid-order-1": {"kalshi_order_id": "k-bid-1"}}
@@ -177,12 +196,15 @@ class TestMarketMakerPnLLifecycle:
     async def test_market_maker_start_propagates_fatal_exception(self):
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-CRASH")
         bot.om.sync_and_recover_state = AsyncMock()
-        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.connect = AsyncMock(side_effect=asyncio.Event().wait)
         bot.ws_client.is_connected = True
         bot.inv_manager.hydrate = AsyncMock(return_value=True)
         bot.inv_manager._sync_loop = AsyncMock()
         bot.inv_manager.subscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()
+        bot._subscribe_fills_before_hydration = AsyncMock()
+        bot.ensure_shard_collateral = AsyncMock(return_value=True)
+        bot._refresh_market_metadata = AsyncMock()
 
         # Make _tick raise a fatal exception
         bot._tick = AsyncMock(side_effect=RuntimeError("Fatal quoting error"))
@@ -193,18 +215,23 @@ class TestMarketMakerPnLLifecycle:
                 await bot.start()
 
         assert bot.running is False
+        bot._ws_task.cancel()
+        await asyncio.gather(bot._ws_task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_market_maker_start_aborts_on_startup_hydration_failure(self):
         bot = AvellanedaStoikovBot(ticker="KXTEST-MM-HYDRATE-FAIL")
         bot.om.sync_and_recover_state = AsyncMock()
-        bot.ws_client.connect = AsyncMock()
+        bot.ws_client.connect = AsyncMock(side_effect=asyncio.Event().wait)
         bot.ws_client.is_connected = True
         # Simulate startup hydration returning False (e.g. REST API timeout/error)
         bot.inv_manager.hydrate = AsyncMock(return_value=False)
         bot.inv_manager._sync_loop = AsyncMock()
         bot.inv_manager.subscribe = AsyncMock()
         bot.ob_manager.subscribe = AsyncMock()
+        bot._subscribe_fills_before_hydration = AsyncMock()
+        bot.ensure_shard_collateral = AsyncMock(return_value=True)
+        bot._refresh_market_metadata = AsyncMock()
 
         with patch("strategy.market_maker.start_metrics_server"), \
              patch("strategy.market_maker.send_alert", new_callable=AsyncMock) as mock_alert:
@@ -212,6 +239,8 @@ class TestMarketMakerPnLLifecycle:
                 await bot.start()
 
         assert bot.running is False
+        bot._ws_task.cancel()
+        await asyncio.gather(bot._ws_task, return_exceptions=True)
         mock_alert.assert_awaited_once()
         assert "Startup Aborted" in mock_alert.await_args[0][0]
 
@@ -268,6 +297,7 @@ class TestMarketMakerPnLLifecycle:
     async def test_stop_cancels_untracked_quote_and_clears_id_only_on_confirmation(self):
         """Verify stop() cancels untracked quotes via om.cancel_order and retains IDs/returns False if cancel fails."""
         bot = AvellanedaStoikovBot(ticker="KXTEST-UNTRACKED")
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.current_bid_id = "untracked-bid-999"
         bot.current_bid_price = 45
         bot.om.active_orders = {}  # Quote was never tracked in om.active_orders
@@ -287,6 +317,13 @@ class TestMarketMakerPnLLifecycle:
         bot.om.cancel_order.assert_awaited_with("untracked-bid-999")
 
         # Scenario 2: cancel_order succeeds on Kalshi
+        bot = AvellanedaStoikovBot(ticker="KXTEST-UNTRACKED")
+        setup_healthy_feed(bot)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
+        bot.current_bid_id = "untracked-bid-999"
+        bot.current_bid_price = 45
+        bot._cancel_all_quotes = AsyncMock(return_value=False)
+        bot.om.record_pnl_snapshot_async = AsyncMock()
         bot.om.cancel_order = AsyncMock(return_value=True)
         with patch("execution.kill_switch.KillSwitch", return_value=mock_killer):
             res_success = await bot.stop()
@@ -466,6 +503,7 @@ class TestMarketMakerPnLLifecycle:
         """Verify market maker serializes snapshot tasks and cancels sync task on stop."""
         bot = AvellanedaStoikovBot(ticker="KXTEST-SERIALIZE")
         bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
         bot.om.record_pnl_snapshot_async = AsyncMock()
 
         # Simulate running sync task
