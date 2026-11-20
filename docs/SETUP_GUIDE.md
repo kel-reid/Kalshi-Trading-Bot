@@ -178,6 +178,9 @@ Create a dashboard in Grafana Cloud with the following PromQL queries:
 | **Total Strategy PnL ($)** | `(kalshi_realized_pnl_cents + kalshi_unrealized_pnl_cents) / 100` | Stat / Time Series | Total economic performance across open and closed inventory. |
 | **Total Exchange Fees ($)** | `kalshi_total_fees_cents / 100` | Stat | Total trading transaction fees paid to Kalshi. |
 | **Round Trip Trade Outcomes** | `kalshi_round_trips_total` | Bar Chart / Pie Chart | Total completed round trips categorized by profit, loss, or scratch. |
+| **Cash Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from exchange REST hydration. |
+| **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market (`q`). |
+| **Kalshi API Latency** | `rate(kalshi_api_latency_seconds_sum[1m]) / rate(kalshi_api_latency_seconds_count[1m]) * 1000` | Time Series | Rolling REST execution roundtrip latency (ms). |
 
 ---
 
@@ -191,29 +194,50 @@ If the container crashes or the WebSocket drops ungracefully, the bot enters a f
 CRITICAL - Fill ingestion stopped; reconcile missed fills before resuming: Fill ingestion startup failed; reconciliation required
 ```
 
-To verify pending fills and clear the dirty latch on the Droplet:
+> [!WARNING]
+> **Reconciliation Precedes Latch Clearing**:
+> A pending fill count of `0` in SQLite only proves that all locally captured spool records were synced to PostgreSQL. It **does not prove** that no fills occurred on Kalshi during the outage. Always run exchange-level fill reconciliation for the outage window before clearing the dirty latch.
+
+To recover and safely clear the dirty latch on the Droplet:
+
 ```bash
-# 1. Inspect un-synced fills and dirty status inside the volume:
+# 1. Stop the bot container to prevent restart-loop race conditions:
+docker compose stop kalshi-bot
+
+# 2. Inspect un-synced fills and dirty status inside the volume:
 docker run --rm --entrypoint python -v kalshi-trading-bot_fill_spool:/var/lib/kalshi-fill-spool \
   ghcr.io/kel-reid/kalshi-trading-bot:latest -c \
   "import sqlite3; db = sqlite3.connect('/var/lib/kalshi-fill-spool/fills.sqlite3'); print('Pending fills:', db.execute('SELECT count(*) FROM fills').fetchone()[0]); print('State:', db.execute('SELECT * FROM state').fetchall())"
 
-# 2. Once verified/reconciled, clear the dirty flag:
+# 3. Perform exchange fill backfill across the outage window (see Section 2 below).
+# If un-synced fills existed in SQLite or Kalshi executed fills while disconnected,
+# ensure they are reconciled into PostgreSQL before proceeding.
+
+# 4. Once verified and reconciled, clear the dirty flag:
 docker run --rm --entrypoint python -v kalshi-trading-bot_fill_spool:/var/lib/kalshi-fill-spool \
   ghcr.io/kel-reid/kalshi-trading-bot:latest -c \
   "import sqlite3; db = sqlite3.connect('/var/lib/kalshi-fill-spool/fills.sqlite3'); db.execute(\"DELETE FROM state WHERE key = 'dirty'\"); db.commit(); db.close(); print('Spool marked clean.')"
 
-# 3. Restart the trading stack with Doppler:
-cd ~/Kalshi-Trading-Bot && doppler run -- docker compose up -d
+# 5. Restart the trading stack with Doppler secrets:
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose up -d kalshi-bot
 ```
 
 ### 2. Backfilling Historical Exchange Fills
 To backfill execution records directly from the Kalshi REST API into PostgreSQL `kalshi_fills`:
+
+**On the Droplet (via container with Doppler credentials):**
 ```bash
 # Dry-run validation (validates date range without connecting):
-python scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+  scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00
 
 # Execute live backfill:
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+  scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00 --execute
+```
+
+**On a Local Workstation (from cloned repository):**
+```bash
 python scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00 --execute
 ```
 
@@ -222,19 +246,26 @@ To query exchange fills recorded in PostgreSQL:
 ```sql
 SELECT fill_id, trade_id, market_ticker, side, action, quantity,
        yes_price_dollars, fee_dollars, is_taker,
-       COALESCE(created_time::timestamptz, to_timestamp(ts_ms / 1000.0), to_timestamp(ts)) AS executed_at
+       COALESCE(
+         CASE WHEN created_time ~ '^\d{4}-\d{2}-\d{2}' THEN created_time::timestamptz ELSE NULL END,
+         to_timestamp(ts_ms / 1000.0),
+         to_timestamp(ts)
+       ) AS executed_at
 FROM kalshi_fills
-ORDER BY executed_at DESC
+ORDER BY executed_at DESC NULLS LAST
 LIMIT 25;
 ```
 
 ### 4. Generating Daily Performance Reports
 To run an automated post-session quantitative performance and P&L attribution report:
+
+**On the Droplet (via container with Doppler credentials):**
 ```bash
-# Defaults to yesterday's 24-hour trading session (America/New_York)
-python scripts/generate_daily_report.py --date 2026-11-19
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+  scripts/generate_daily_report.py --date 2026-11-19
 ```
 
-| **Cash Balance ($)** | `bot_pnl_cents / 100` | Time Series | Real-time bot cash balance in USD from exchange REST hydration. |
-| **Net Inventory Position** | `bot_inventory_net_position` | Time Series | Net contract exposure on active market (`q`). |
-| **Kalshi API Latency** | `rate(kalshi_api_latency_seconds_sum[1m]) / rate(kalshi_api_latency_seconds_count[1m]) * 1000` | Time Series | Rolling REST execution roundtrip latency (ms). |
+**On a Local Workstation (from cloned repository):**
+```bash
+python scripts/generate_daily_report.py --date 2026-11-19
+```
