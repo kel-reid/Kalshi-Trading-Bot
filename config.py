@@ -195,7 +195,7 @@ MAX_SESSION_LOSS_CENTS = _get_int_env("MAX_SESSION_LOSS_CENTS", 900)
 
 # Post-Fill Adverse Selection Protection (Seconds)
 # Pause quoting after an execution fill to allow orderbook stabilization during rapid information jumps.
-POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 8.0, allow_zero=True)
+POST_FILL_PAUSE_SECONDS = _get_float_env("POST_FILL_PAUSE_SECONDS", 12.0, allow_zero=True)
 
 # Fast Market / Price Velocity Circuit Breaker Safeguards
 # Automatically withdraw resting quotes when orderbook midpoint shifts faster than threshold over rolling window.

@@ -17,83 +17,36 @@ This guide formalizes the mathematics, market microstructure, and distributed sy
 
 
 ### Table of Contents
-1. [The Mathematical Rosetta Stone: Systems & Microstructure Equivalence Mapping](#1-the-mathematical-rosetta-stone-systems--microstructure-equivalence-mapping)
-2. [Market Microstructure & Limit Order Book (LOB) Dynamics](#2-market-microstructure--limit-order-book-lob-dynamics)
-   - [Continuous Double Auctions & Discrete Priority Queues (FIFO vs. Pro-Rata)](#continuous-double-auctions--discrete-priority-queues-fifo-vs-pro-rata)
+1. [Market Microstructure & Order Flow Economics](#1-market-microstructure--order-flow-economics)
    - [Maker vs. Taker Asymmetries & The Spread Triad](#maker-vs-taker-asymmetries--the-spread-triad)
    - [Adverse Selection, The Winner's Curse & Kyle's Lambda](#adverse-selection-the-winners-curse--kyles-lambda)
-3. [The Avellaneda-Stoikov Stochastic Control Framework](#3-the-avellaneda-stoikov-stochastic-control-framework)
+2. [The Avellaneda-Stoikov Stochastic Control Framework](#2-the-avellaneda-stoikov-stochastic-control-framework)
    - [Continuous Arithmetic Brownian Motion & Poisson Order Arrivals](#continuous-arithmetic-brownian-motion--poisson-order-arrivals)
    - [CARA Utility & Hamilton-Jacobi-Bellman (HJB) Dynamic Programming](#cara-utility--hamilton-jacobi-bellman-hjb-dynamic-programming)
    - [Analytical Derivation of the Reservation Price (Indifference Price)](#analytical-derivation-of-the-reservation-price-indifference-price)
    - [Closed-Form Dynamic Spread Solver ($\gamma, \sigma, \kappa$)](#closed-form-dynamic-spread-solver-gamma-sigma-kappa)
-4. [Prediction Market Derivatives: Bounded Metric Spaces & Event Contracts](#4-prediction-market-derivatives-bounded-metric-spaces--event-contracts)
+3. [Prediction Market Derivatives: Bounded Metric Spaces & Event Contracts](#3-prediction-market-derivatives-bounded-metric-spaces--event-contracts)
    - [Probability Space Bounding ($P \in [1¢, 99¢]$) & Terminal Singularity](#probability-space-bounding-p-in-1-99--terminal-singularity)
    - [The Fundamental YES/NO Parity Duality](#the-fundamental-yesno-parity-duality)
    - [Kalshi's Non-Linear Quadratic Fee Mechanics & The Breakeven Spread Floor](#kalshis-non-linear-quadratic-fee-mechanics--the-breakeven-spread-floor)
    - [Expiration Pin Risk, Gamma Explosions & Blackout Safeguards](#expiration-pin-risk-gamma-explosions--blackout-safeguards)
-5. [Adversarial Safeguards & Real-Time Execution Control Loops](#5-adversarial-safeguards--real-time-execution-control-loops)
+4. [Adversarial Safeguards & Real-Time Execution Control Loops](#4-adversarial-safeguards--real-time-execution-control-loops)
    - [The 1 Hz Control Loop Architecture](#the-1-hz-control-loop-architecture)
    - [Price Velocity Circuit Breakers (Fast Market Detection)](#price-velocity-circuit-breakers-fast-market-detection)
    - [Post-Fill Quiescence & Toxic Order Clustering](#post-fill-quiescence--toxic-order-clustering)
    - [Quote Flicker vs. Queue Priority: Replacement Tolerances](#quote-flicker-vs-queue-priority-replacement-tolerances)
-6. [State Reconciliation, Concurrency & Financial Conservation Laws](#6-state-reconciliation-concurrency--financial-conservation-laws)
+5. [State Reconciliation, Concurrency & Financial Conservation Laws](#5-state-reconciliation-concurrency--financial-conservation-laws)
    - [The Conservation Invariant ($\text{Total PnL} \equiv \text{Realized} + \text{Unrealized}$)](#the-conservation-invariant-texttotal-pnl-equiv-textrealized--textunrealized)
    - [Eventual Consistency (WebSocket) vs. Authoritative Ground Truth (REST)](#eventual-consistency-websocket-vs-authoritative-ground-truth-rest)
    - [Zero-Leakage Shutdown & The Kill Switch Protocol](#zero-leakage-shutdown--the-kill-switch-protocol)
-7. [Capital Allocation, Bankroll Growth & Drawdown Absorption](#7-capital-allocation-bankroll-growth--drawdown-absorption)
+6. [Capital Allocation, Bankroll Growth & Drawdown Absorption](#6-capital-allocation-bankroll-growth--drawdown-absorption)
    - [Binary Contract Kelly Criterion Formulation](#binary-contract-kelly-criterion-formulation)
    - [Shard Sweeping & Collateral Reserve Rebalancing](#shard-sweeping--collateral-reserve-rebalancing)
    - [Drawdown Limits & Session Loss Control](#drawdown-limits--session-loss-control)
-8. [Summary Checklist for Systems Implementation](#summary-checklist-for-systems-implementation)
-9. [Curated Academic & Industry Bibliography](#curated-academic--industry-bibliography)
+7. [Summary Checklist for Systems Implementation](#7-summary-checklist-for-systems-implementation)
 
 
-### 1. The Mathematical Rosetta Stone: Systems & Microstructure Equivalence Mapping
-
-| Software / Systems Engineering Concept | Quantitative Trading / Microstructure Concept | Mathematical Formalism |
-| :--- | :--- | :--- |
-| **Feedback Control Loop (PID / Kalman Filter)** | Continuous Quoting & Inventory Skewing | $r(s, q, t) = s - q \gamma \sigma^2 (T - t)$ |
-| **Adversarial Network Environment / Byzantine Fault** | Adverse Selection / Toxic Informed Flow | $\Delta P_{\text{post-fill}} = \lambda \cdot \text{Sign}(\text{Trade}) \cdot \text{Vol}$ |
-| **Resource Contention / Buffer Capacity** | Inventory Delta Exposure & Position Limits | $\|q_t\| \le Q_{\max}, \quad q_t \in \mathbb{Z}$ |
-| **Transaction Processing Overhead & Serialization Tax** | Exchange Fees, Quadratic Slippage & Breakeven Floor | $\text{Fee}(P) = c \cdot P(1 - P), \quad s^* \ge 2\lceil\text{Fee}\rceil + \epsilon$ |
-| **Eventual Consistency vs. Authoritative Master** | Real-time WebSocket Orderbook vs. Authoritative REST Portfolio | $\text{State}_{t} = \text{State}_{\text{REST}} \cup \int \Delta_{\text{WS}} dt$ |
-| **State Conservation Law / Double-Entry Invariant** | Total Strategy P&L Conservation Identity | $\Pi_{\text{total}} \equiv \Pi_{\text{realized}} + \Pi_{\text{unrealized}}$ |
-| **Race Condition / TOCTOU (Time-of-Check to Time-of-Use)** | Latency Arbitrage & Stale Quote Sniping | $\tau_{\text{react}} > \Delta t_{\text{info-propagation}} \implies \text{Arb Loss}$ |
-| **Rate Limiter / Exponential Backoff** | Post-Fill Quiescence & Cooldown Timers | $t - t_{\text{last-fill}} < \tau_{\text{quiesce}} \implies \text{Suppress Quotes}$ |
-| **Discrete 0-1 Knapsack / Portfolio Selection** | Binary Allocation under Margin Constraints | $\max \sum w_i r_i \quad \text{s.t.} \quad \sum w_i C_i \le \text{Collateral}$ |
-| **Graceful Degradation / Circuit Breaker Pattern** | Price Velocity Halt & Dynamic Liquidation Engine | $|\Delta S_{\Delta t}| \ge \theta_v \implies \text{CancelAll}() \land \text{Quiesce}()$ |
-
-
-### 2. Market Microstructure & Limit Order Book (LOB) Dynamics
-
-#### Continuous Double Auctions & Discrete Priority Queues (FIFO vs. Pro-Rata)
-Electronic financial exchanges match buyers and sellers via continuous double auctions managed by a **Limit Order Book (LOB)**. The LOB maintains two discrete, sorted priority queues:
-- **Bids (Buy Orders)**: Sorted by price descending (highest willingness to pay first), then by timestamp ascending ($t_{\text{order}}$).
-- **Asks / Offers (Sell Orders)**: Sorted by price ascending (lowest willingness to sell first), then by timestamp ascending.
-
-```
-                         THE LIMIT ORDER BOOK STATE
-                         
-   ASKS (Offers to Sell)
-   ------------------------------------------------------------------
-   Price (¢)      Aggregate Size (Contracts)   Queue Allocation
-   ------------------------------------------------------------------
-   55¢            120 contracts                Level 2 Ask
-   54¢            35 contracts                 Best Ask (L1) ◄── [Bot Ask Quote]
-   ------------------------------------------------------------------
-   --- SPREAD = 54¢ - 50¢ = 4¢ (Midpoint S = 52.0¢) ---
-   ------------------------------------------------------------------
-   50¢            25 contracts                 Best Bid (L1) ◄── [Bot Bid Quote]
-   49¢            80 contracts                 Level 2 Bid
-   48¢            200 contracts                Level 3 Bid
-   ------------------------------------------------------------------
-   BIDS (Offers to Buy)
-```
-
-In a standard **FIFO (First-In, First-Out / Price-Time Priority)** matching engine, queue position is a valuable financial asset. If 100 contracts rest at 50¢ ahead of your 10-contract bid, all 100 contracts must execute before your order fills. 
-
-Cancelling or modifying an existing resting quote loses queue seniority and pushes the order to the tail of the priority queue. Therefore, market makers must balance price accuracy against the latency cost of queue repositioning.
+### 1. Market Microstructure & Order Flow Economics
 
 #### Maker vs. Taker Asymmetries & The Spread Triad
 Every trade requires two counterparties with distinct economic profiles:
@@ -124,7 +77,7 @@ $$\Delta P_t = \lambda \cdot Q_t + \eta_t, \quad \lambda = \frac{2 \text{Cov}(v,
 where $\sigma_v$ is fundamental asset volatility and $\sigma_u$ is noise trader volume. When informed order flow dominates or volatility spikes, $\lambda$ increases, widening the equilibrium spread necessary to prevent the market maker from being depleted of capital.
 
 
-### 3. The Avellaneda-Stoikov Stochastic Control Framework
+### 2. The Avellaneda-Stoikov Stochastic Control Framework
 
 The intellectual core of this trading bot is derived from the classic **Avellaneda & Stoikov (2008)** stochastic control model for high-frequency market making.
 
@@ -218,7 +171,7 @@ The optimal round-trip spread $s^*$ is the exact sum of:
 This closed-form formulation is calculated dynamically in [calculate_optimal_spread()](file:///Users/kelreid/Projects/Kalshi-Trading-Bot/strategy/dynamic_spread.py#L156-L216) using real-time realized midpoint standard deviations over sliding observation windows.
 
 
-### 4. Prediction Market Derivatives: Bounded Metric Spaces & Event Contracts
+### 3. Prediction Market Derivatives: Bounded Metric Spaces & Event Contracts
 
 #### Probability Space Bounding ($P \in [1¢, 99¢]$) & Terminal Singularity
 Unlike equities ($S_t \in [0, \infty)$) or interest rate futures ($r \in \mathbb{R}$), Kalshi event contracts are cash-settled binary options whose price space is strictly bounded:
@@ -303,7 +256,7 @@ The bot neutralizes this hazard through multi-tiered pre-settlement gating:
 2. **Expiration Blackout**: When within `EXPIRATION_BLACKOUT_SECONDS` of settlement, quotes are pulled if mid-price enters the dangerous inflection collar $[15¢, 85¢]$ (`BLACKOUT_DANGER_PRICE_LOW` to `HIGH`).
 
 
-### 5. Adversarial Safeguards & Real-Time Execution Control Loops
+### 4. Adversarial Safeguards & Real-Time Execution Control Loops
 
 #### The 1 Hz Control Loop Architecture
 The market maker operates as a hard real-time, deterministic state machine evaluated on a 1-second tick interval. Defensive checks are prioritized in order of increasing computational cost:
@@ -347,8 +300,8 @@ In high-volatility events, informed flow sweeps the order book in milliseconds. 
 #### Post-Fill Quiescence & Toxic Order Clustering
 Empirical microstructure research proves that execution fills exhibit strong positive autocorrelation (autocorrelated Poisson cluster arrivals). Large institutional orders are broken up and swept through algorithms as sequential slices.
 
-If your Bid is filled, the probability of an immediate follow-up sell order is significantly higher than baseline. To defend against multi-fill adverse selection, the bot enforces `POST_FILL_PAUSE_SECONDS = 3.0`:
-- After any fill event, quoting is suspended for 3 seconds.
+If your Bid is filled, the probability of an immediate follow-up sell order is significantly higher than baseline. To defend against multi-fill adverse selection, the bot enforces `POST_FILL_PAUSE_SECONDS = 12.0`:
+- After any fill event, quoting is suspended for 12 seconds.
 - This allows informed flow to exhaust itself and the orderbook midpoint to reach a new post-impact equilibrium before the bot posts fresh bids.
 
 #### Quote Flicker vs. Queue Priority: Replacement Tolerances
@@ -359,7 +312,7 @@ $$\text{If } |P_{\text{target}} - P_{\text{resting}}| < 1.0¢ \implies \text{Ret
 Quotes are only replaced if the mathematical reservation price has shifted by at least one whole integer cent, preserving valuable FIFO queue priority.
 
 
-### 6. State Reconciliation, Concurrency & Financial Conservation Laws
+### 5. State Reconciliation, Concurrency & Financial Conservation Laws
 
 #### The Conservation Invariant ($\text{Total PnL} \equiv \text{Realized} + \text{Unrealized}$)
 Financial accounting in a trading system requires invariant checking. In [data/inventory_manager.py](file:///Users/kelreid/Projects/Kalshi-Trading-Bot/data/inventory_manager.py), the bot maintains the strict conservation identity:
@@ -393,7 +346,7 @@ The bot implements an atomic, escalating shutdown pipeline:
 5. **Confirmation Gating**: The process refuses to exit with code `0` until the exchange REST API explicitly returns zero resting orders for the account.
 
 
-### 7. Capital Allocation, Bankroll Growth & Drawdown Absorption
+### 6. Capital Allocation, Bankroll Growth & Drawdown Absorption
 
 #### Binary Contract Kelly Criterion Formulation
 In classical portfolio theory, the **Kelly Criterion** determines the optimal fraction $f^*$ of bankroll $W$ to commit to maximize the long-term geometric growth rate of capital:
@@ -423,7 +376,7 @@ To guarantee survival against structural market regime shifts or mispriced news 
 - **Session Fee Cap (`MAX_SESSION_FEES_CENTS = 250`)**: Prevents "churning"—running continuous trades that generate high volume for the exchange while earning negligible net spread.
 
 
-### 8. Summary Checklist for Systems Implementation
+### 7. Summary Checklist for Systems Implementation
 
 When developing, testing, or deploying changes to this trading infrastructure, ensure all implementations comply with the following architectural checklist:
 
@@ -431,27 +384,7 @@ When developing, testing, or deploying changes to this trading infrastructure, e
 - [ ] **Spread Floor Constraint**: Ensure dynamically generated spreads never undercut the fee breakeven floor: $s^* \ge \lceil 2 \cdot \lceil\text{Fee}(S)\rceil + \text{Target Edge}\rceil$.
 - [ ] **FIFO Priority Preservation**: Never cancel and replace resting quotes unless the price change exceeds `QUOTE_REPLACEMENT_TOLERANCE_CENTS` (1¢).
 - [ ] **Dual-Gating Preconditions**: Quoting loops must gate on both WebSocket order book health and REST portfolio balance verification before placing orders.
-- [ ] **Adverse Selection Quiescence**: Fills must trigger an immediate quoting pause (`POST_FILL_PAUSE_SECONDS = 3.0`) to avoid clustered execution losses.
+- [ ] **Adverse Selection Quiescence**: Fills must trigger an immediate quoting pause (`POST_FILL_PAUSE_SECONDS = 12.0`) to avoid clustered execution losses.
 - [ ] **Zero Unconfirmed Orders**: Shutdown sequences must fail closed, re-querying the exchange to guarantee zero resting orders remain active.
 - [ ] **State Conservation**: Total P&L calculations must satisfy $\Pi_{\text{total}} \equiv \Pi_{\text{realized}} + \Pi_{\text{unrealized}}$ without dropping deferred fees or basis precision.
 
-
-### 9. Curated Academic & Industry Bibliography
-
-#### Foundational Market Making Papers
-1. **Avellaneda, M., & Stoikov, S. (2008)**. *High-frequency trading in a limit order book*. Quantitative Finance, 8(3), 217-224.
-   - *The seminal paper deriving the Hamilton-Jacobi-Bellman formulation for reservation prices and dynamic spreads used in this codebase.*
-2. **Ho, T., & Stoll, H. R. (1981)**. *Optimal dealer pricing under transactions and return uncertainty*. Journal of Financial Economics, 9(1), 47-73.
-   - *The original framework introducing inventory risk and dealer reservation prices in equity markets.*
-3. **Guéant, O., Tapia, C. A., & Manziadi, Z. (2012)**. *Dealing with the inventory risk: a solution to the market making problem*. Mathematics and Financial Economics, 6(4), 259-277.
-   - *Provides closed-form, linearized approximations and infinite-horizon solutions to the Avellaneda-Stoikov HJB system.*
-4. **Kyle, A. S. (1985)**. *Continuous auctions and informed trader*. Econometrica, 53(6), 1315-1335.
-   - *Introduced Kyle's Lambda and the theoretical foundation for measuring price impact and adverse selection.*
-
-#### Definitive Graduate Textbooks
-- **Cartea, Á., Jaimungal, S., & Penalva, J. (2015)**. *Algorithmic and High-Frequency Trading*. Cambridge University Press.
-  - *The canonical reference on stochastic control, trade execution algorithms (TWAP/VWAP), and market making.*
-- **Bouchaud, J. P., Bonart, J., Donier, J., & Gould, M. (2018)**. *Trades, Quotes and Prices: Financial Markets Under the Microscope*. Cambridge University Press.
-  - *Explores the statistical physics of limit order books, the square-root law of market impact, and order book resilience.*
-- **O'Hara, M. (1995)**. *Market Microstructure Theory*. Blackwell Publishers.
-  - *The essential theoretical treatise on information asymmetry, inventory control models, and exchange price discovery.*

@@ -88,3 +88,9 @@ class TestPostFillAdverseSelectionBackoff:
 
         # Quoting proceeded without pause
         bot._update_quotes.assert_called_once_with(48, 52)
+
+    def test_default_post_fill_pause_seconds_is_twelve(self):
+        """When not explicitly passed, post_fill_pause_seconds defaults to config POST_FILL_PAUSE_SECONDS (12.0s)."""
+        bot = AvellanedaStoikovBot(ticker="KXDEFAULT-PAUSE")
+        assert bot.post_fill_pause_seconds == 12.0
+
