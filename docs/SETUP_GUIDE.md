@@ -187,7 +187,7 @@ Create a dashboard in Grafana Cloud with the following PromQL queries:
 ## Part 4: Operational Troubleshooting & Recovery Runbook
 
 ### 1. Reconciling & Clearing SQLite Spool Dirty State
-The bot uses a durable SQLite write-ahead spool (`fills.sqlite3` mounted at `/var/lib/kalshi-fill-spool`) to ensure zero fills are lost during network disconnects. On startup, the spool is marked `dirty`; on clean shutdown, it is cleared.
+The bot uses a durable SQLite write-ahead spool (`fills.sqlite3` mounted at `/var/lib/kalshi-fill-spool`) to buffer received WebSocket fills during network and database disconnects. On startup, the spool is marked `dirty`; on clean shutdown, it is cleared.
 
 If the container crashes or the WebSocket drops ungracefully, the bot enters a fail-safe restart loop on next boot:
 ```text
@@ -195,14 +195,15 @@ CRITICAL - Fill ingestion stopped; reconcile missed fills before resuming: Fill 
 ```
 
 > [!WARNING]
-> **Reconciliation Precedes Latch Clearing**:
-> A pending fill count of `0` in SQLite only proves that all locally captured spool records were synced to PostgreSQL. It **does not prove** that no fills occurred on Kalshi during the outage. Always run exchange-level fill reconciliation for the outage window before clearing the dirty latch.
+> **Reconciliation Precedes Latch Clearing & Incompleteness Handling**:
+> A pending fill count of `0` in SQLite only proves that all locally captured spool records were synced to PostgreSQL. It **does not prove** that no fills occurred on Kalshi during the outage, and even a successful reconciliation scan cannot definitively prove completeness against silent exchange-side drops.
+> Always run exchange-level fill reconciliation for the outage window before clearing the dirty latch. If reconciliation fails, errors, or remains incomplete, **keep the bot stopped and leave the spool marked dirty** while investigating and retrying before attempting to clear the latch.
 
 To recover and safely clear the dirty latch on the Droplet:
 
 ```bash
 # 1. Stop the bot container to prevent restart-loop race conditions:
-docker compose stop kalshi-bot
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose stop bot
 
 # 2. Inspect un-synced fills and dirty status inside the volume:
 docker run --rm --entrypoint python -v kalshi-trading-bot_fill_spool:/var/lib/kalshi-fill-spool \
@@ -219,7 +220,7 @@ docker run --rm --entrypoint python -v kalshi-trading-bot_fill_spool:/var/lib/ka
   "import sqlite3; db = sqlite3.connect('/var/lib/kalshi-fill-spool/fills.sqlite3'); db.execute(\"DELETE FROM state WHERE key = 'dirty'\"); db.commit(); db.close(); print('Spool marked clean.')"
 
 # 5. Restart the trading stack with Doppler secrets:
-cd ~/Kalshi-Trading-Bot && doppler run -- docker compose up -d kalshi-bot
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose up -d bot
 ```
 
 ### 2. Backfilling Historical Exchange Fills
@@ -228,11 +229,11 @@ To backfill execution records directly from the Kalshi REST API into PostgreSQL 
 **On the Droplet (via container with Doppler credentials):**
 ```bash
 # Dry-run validation (validates date range without connecting):
-cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python bot \
   scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00
 
 # Execute live backfill:
-cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python bot \
   scripts/backfill_fills.py --start 2026-11-01T00:00:00-04:00 --end 2026-11-20T00:00:00-05:00 --execute
 ```
 
@@ -261,7 +262,7 @@ To run an automated post-session quantitative performance and P&L attribution re
 
 **On the Droplet (via container with Doppler credentials):**
 ```bash
-cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python kalshi-bot \
+cd ~/Kalshi-Trading-Bot && doppler run -- docker compose run --rm --entrypoint python bot \
   scripts/generate_daily_report.py --date 2026-11-19
 ```
 
