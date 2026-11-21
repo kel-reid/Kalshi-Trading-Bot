@@ -14,12 +14,12 @@ An asynchronous market maker for [Kalshi](https://kalshi.com) prediction markets
   - **Fast market:** a mid-price move of 6¢ or more within 20 seconds pulls all quotes for 30 seconds.
   - **Price collar:** no quoting when the mid price is below 10¢ or above 90¢.
   - **Session limits:** a $3.00 net loss or $2.50 in fees triggers liquidation and a move to another market.
-  - **Post-fill pause:** 3 seconds without quoting after a fill, so the order book can settle.
+  - **Post-fill pause:** 12 seconds without quoting after a fill, so the order book can settle.
   - **Pre-settlement exit:** quoting stops and inventory is sold down in slices 90 minutes before expiry.
 - **Market discovery:** picks liquid in-season contracts (college football, NFL, NBA, MLB) that expire within 8 days, after checking the live order book.
 - **Telemetry:** Prometheus metrics (API latency, inventory, P&L) scraped by Grafana Alloy into Grafana Cloud, with webhook alerts.
 
-For the order these checks run in each second, see **[How It Works](docs/HOW_IT_WORKS.md)**.
+For the architectural rationale and safeguard designs, see **[Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md)**.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ For the order these checks run in each second, see **[How It Works](docs/HOW_IT_
 - **Secrets:** Doppler injects API keys and the RSA signing key at runtime; nothing sensitive is written to disk.
 - **Delivery:** GitHub Actions runs tests with coverage, Terraform checks and security scans, then publishes to GHCR and deploys.
 
-The full component diagram is in the **[wiki](https://github.com/kel-reid/Kalshi-Trading-Bot/wiki#system-architecture)**.
+The full architectural rationale is documented in **[Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md)**.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ Set your API credentials first, using `.env.example` as a template. For Docker, 
 | `RISK_GAMMA` | `0.7` | How strongly quotes skew against inventory. |
 | `MAX_SESSION_LOSS_CENTS` | `300` | Session loss that triggers liquidation and rotation. |
 
-Every parameter, including credentials, safeguard thresholds and database settings, is listed in **[Configuration](docs/CONFIGURATION.md)**.
+Every parameter, including credentials, safeguard thresholds and database settings, is documented with typing and defaults directly in **[`config.py`](config.py)**.
 
 ## Shutdown & Risk
 
@@ -115,11 +115,8 @@ MarketMaker - INFO - >> Placing new ASK: 4 YES @ 27c
 
 | Document | What's in it |
 | :--- | :--- |
-| [How It Works](docs/HOW_IT_WORKS.md) | Startup, the per-second quoting loop and each safeguard |
+| [Setup & Operations Guide](docs/SETUP_GUIDE.md) | Provisioning, deploying, daily reporting, and operational runbook |
+| [Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md) | Technical decisions behind concurrency, quoting lifecycle, and risk safeguards |
 | [Quantitative Trading Guide](docs/QUANTITATIVE_TRADING_GUIDE.md) | Deep-dive on market making math, LOB dynamics, adverse selection, binary options, and system invariants |
-| [Architecture Decisions](docs/ARCHITECTURE_DECISIONS.md) | Why each design choice was made |
-| [Configuration](docs/CONFIGURATION.md) | Every parameter and its default |
-| [Setup & Operations Guide](docs/SETUP_GUIDE.md) | Provisioning, deploying and operating the bot |
 | [Sports Season Router](docs/SPORTS_SEASON_ROUTER.md) | How markets are discovered and ranked |
-| [Feature Roadmap](docs/FEATURE_ROADMAP.md) | Planned work with acceptance criteria |
 

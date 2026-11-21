@@ -88,3 +88,16 @@ class TestPostFillAdverseSelectionBackoff:
 
         # Quoting proceeded without pause
         bot._update_quotes.assert_called_once_with(48, 52)
+
+    def test_default_post_fill_pause_seconds_is_twelve(self, monkeypatch):
+        """When not explicitly passed, post_fill_pause_seconds defaults to config POST_FILL_PAUSE_SECONDS (12.0s)."""
+        # 1. Verify fallback in config when environment variable is unset
+        monkeypatch.delenv("POST_FILL_PAUSE_SECONDS", raising=False)
+        from config import _get_float_env
+        assert _get_float_env("POST_FILL_PAUSE_SECONDS", 12.0, allow_zero=True) == 12.0
+
+        # 2. Verify bot constructor default adheres to POST_FILL_PAUSE_SECONDS constant
+        monkeypatch.setattr("strategy.market_maker.POST_FILL_PAUSE_SECONDS", 12.0)
+        bot = AvellanedaStoikovBot(ticker="KXDEFAULT-PAUSE")
+        assert bot.post_fill_pause_seconds == 12.0
+
