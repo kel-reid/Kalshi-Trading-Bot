@@ -66,8 +66,9 @@ async def send_alert(
     prior_entry: Optional[Tuple[float, int]] = None
 
     if throttle_active:
-        if key in _alert_history:
-            last_sent, count = _alert_history[key]
+        entry = _alert_history.get(key)
+        if entry is not None:
+            last_sent, count = entry
             elapsed = now - last_sent
             if elapsed < cooldown_seconds:
                 _alert_history[key] = (last_sent, count + 1)
@@ -160,8 +161,9 @@ def send_alert_sync(
     prior_entry: Optional[Tuple[float, int]] = None
 
     if throttle_active:
-        if key in _alert_history:
-            last_sent, count = _alert_history[key]
+        entry = _alert_history.get(key)
+        if entry is not None:
+            last_sent, count = entry
             elapsed = now - last_sent
             if elapsed < cooldown_seconds:
                 _alert_history[key] = (last_sent, count + 1)

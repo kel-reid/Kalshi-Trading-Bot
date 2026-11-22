@@ -277,9 +277,9 @@ class InventoryManager:
         if market_positions is not None:
             self._apply_positions(market_positions, is_startup=is_startup)
 
-    async def hydrate(self, is_startup: bool = False) -> bool:
+    async def hydrate(self, is_startup: bool = False, require_complete: bool = False) -> bool:
         """Run hydration asynchronously to avoid blocking the event loop."""
-        logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
+        logger.info(f"Hydrating inventory state from REST API (startup={is_startup}, require_complete={require_complete})...")
         start_fill_count = self._fill_count
         start_pending_fills = self._pending_fills
         bal = await asyncio.to_thread(self._fetch_balance)
@@ -300,12 +300,13 @@ class InventoryManager:
             )
             return False
 
-        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # On startup or strict recovery mode, verified ground truth for BOTH balance and positions is mandatory.
         # Boundary precondition check: reject immediately without mutating state if either is missing.
-        if is_startup:
+        must_be_complete = is_startup or require_complete
+        if must_be_complete:
             if bal is None or market_positions is None:
                 logger.error(
-                    f"Startup portfolio hydration failed: missing required ground truth "
+                    f"Portfolio hydration failed: missing required ground truth "
                     f"(balance={'ok' if bal is not None else 'failed'}, "
                     f"positions={'ok' if market_positions is not None else 'failed'}). "
                     f"Aborting without mutating portfolio state."
@@ -316,11 +317,11 @@ class InventoryManager:
         if market_positions is not None:
             positions_applied = self._apply_positions(market_positions, is_startup=is_startup)
 
-        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # On startup or strict recovery, verified ground truth for BOTH balance and positions is mandatory.
         # Commit balance only after positions validate successfully to ensure atomic hydration.
-        if is_startup:
+        if must_be_complete:
             if not positions_applied:
-                logger.error("Startup portfolio hydration failed: positions validation rejected payload.")
+                logger.error("Portfolio hydration failed: positions validation rejected payload.")
                 return False
             self.balance_cents = bal
             logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
@@ -406,7 +407,13 @@ class InventoryManager:
                 # 3. Run REST reconciliation against Kalshi fills API
                 if reconciler is None:
                     from data.fill_reconciliation import FillReconciler
-                    reconciler = FillReconciler(self.fill_store, BASE_URL, get_auth_headers, min_interval=0.1)
+                    reconciler = FillReconciler(
+                        self.fill_store,
+                        BASE_URL,
+                        get_auth_headers,
+                        min_interval=0.1,
+                        on_fill=self.apply_reconciled_fill,
+                    )
 
                 try:
                     report = await reconciler.reconcile()
@@ -440,6 +447,35 @@ class InventoryManager:
                 except Exception:
                     pass
             return False
+
+    def apply_reconciled_fill(self, fill: Dict[str, Any]) -> bool:
+        """
+        Apply a REST-recovered fill to PnLTracker and inventory if it was not already
+        processed by the live WebSocket ingestion path.
+        Deduplicates against self._seen_fill_ids so fills are never double-counted.
+        """
+        if not isinstance(fill, dict):
+            return False
+        identities = []
+        for key in ("fill_id", "trade_id"):
+            value = fill.get(key)
+            if value is not None and isinstance(value, str) and value.strip():
+                identities.append((key, value))
+        if not identities:
+            return False
+
+        # If any identity is already recorded, this fill was already processed
+        if any(identity in self._seen_fill_ids for identity in identities):
+            return False
+
+        content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
+        count_before = self._fill_count
+        self._handle_fill(fill)
+        if self._fill_count > count_before:
+            record = {"content": content, "ids": dict(identities)}
+            self._seen_fill_ids.update({identity: record for identity in identities})
+            return True
+        return False
 
     async def subscribe(self, auto_reconcile: bool = False):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""

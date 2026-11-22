@@ -75,7 +75,7 @@ class FillReconciler:
     """
 
     def __init__(self, store, base_url, auth_headers, *, session=None,
-                 limit=1000, retries=3, min_interval=0.1, timeout=15):
+                 limit=1000, retries=3, min_interval=0.1, timeout=15, on_fill=None):
         if not 1 <= limit <= 1000 or retries < 0 or min_interval < 0 or timeout <= 0:
             raise ValueError("invalid pagination, retry, rate or timeout settings")
         self.store = store
@@ -86,6 +86,7 @@ class FillReconciler:
         self.retries = retries
         self.min_interval = min_interval
         self.timeout = timeout
+        self.on_fill = on_fill
         self._last_request = None
         self._lock = asyncio.Lock()
 
@@ -211,6 +212,11 @@ class FillReconciler:
                                 report.warnings.append(f"Fill persistence failed: {exc}")
                             continue
                         report.persisted += 1
+                        if self.on_fill is not None:
+                            try:
+                                self.on_fill(fill)
+                            except Exception:
+                                pass
                     if not next_cursor:
                         break
                     seen.add(next_cursor)
