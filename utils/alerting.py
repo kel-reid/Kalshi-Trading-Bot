@@ -143,3 +143,78 @@ async def send_alert(
                 _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
 
 
+def send_alert_sync(
+    message: str,
+    cooldown_seconds: Optional[float] = DEFAULT_ALERT_COOLDOWN_SECONDS,
+    bypass_throttle: bool = False,
+):
+    """
+    Sends a synchronous alert to a configured webhook URL (e.g., Slack or Discord).
+    Useful during synchronous signal handling, process termination, or when an event
+    loop is not running.
+    """
+    now = time.time()
+    key = _normalize_alert_key(message)
+    suppressed_count = 0
+    throttle_active = (not bypass_throttle) and (cooldown_seconds is not None) and (cooldown_seconds > 0)
+    prior_entry: Optional[Tuple[float, int]] = None
+
+    if throttle_active:
+        if key in _alert_history:
+            last_sent, count = _alert_history[key]
+            elapsed = now - last_sent
+            if elapsed < cooldown_seconds:
+                _alert_history[key] = (last_sent, count + 1)
+                logger.debug(
+                    f"Alert throttled (key='{key}', suppressed {count + 1} times, {elapsed:.1f}s / {cooldown_seconds}s): {message}"
+                )
+                return
+            else:
+                suppressed_count = count
+                prior_entry = (last_sent, count)
+
+        _alert_history[key] = (now, 0)
+
+    delivered_message = message
+    if suppressed_count > 0:
+        delivered_message = (
+            f"[Suppressed {suppressed_count} identical alerts in last {int(cooldown_seconds or 0)}s]\n{message}"
+        )
+
+    if not ALERT_WEBHOOK_URL:
+        logger.warning(f"ALERT (Local Only - No Webhook Configured): {delivered_message}")
+        return
+
+    payload = {
+        "text": f"*Kalshi Bot Alert* \n{delivered_message}"
+    }
+
+    delivery_succeeded = False
+    try:
+        resp = requests.post(
+            ALERT_WEBHOOK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=5,
+        )
+        if resp.status_code < 400:
+            delivery_succeeded = True
+            logger.info(f"Webhook alert sent successfully (key='{key}').")
+        else:
+            logger.error(f"Failed to send webhook alert (HTTP {resp.status_code}): {resp.text}")
+    except Exception as e:
+        logger.error(f"Failed to send webhook alert: {e}")
+    finally:
+        if throttle_active and not delivery_succeeded:
+            _, in_flight_suppressed = _alert_history.get(key, (now, 0))
+            if prior_entry is None:
+                if in_flight_suppressed > 0:
+                    _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+                else:
+                    _alert_history.pop(key, None)
+            else:
+                prior_last_sent, _ = prior_entry
+                _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
+
+
+

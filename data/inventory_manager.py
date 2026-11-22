@@ -348,12 +348,107 @@ class InventoryManager:
             except Exception as e:
                 logger.error(f"Error during periodic inventory reconciliation: {e}")
 
-    async def subscribe(self):
+    async def reconcile_dirty_spool(self, reconciler=None) -> bool:
+        """
+        If the write-ahead fill spool is flagged dirty from a prior ungraceful shutdown,
+        drain any pending spooled fills into the fill store, run REST reconciliation
+        against Kalshi to ingest any missed exchange fills, and clear the dirty latch.
+        Returns True if the spool is clean (or was reconciled cleanly), False if reconciliation failed.
+        """
+        path = os.environ.get("FILL_SPOOL_PATH", "data/fill_spool.sqlite3")
+        if not os.path.exists(path):
+            return True
+
+        spool = None
+        try:
+            spool = await asyncio.to_thread(FillSpool, path)
+            is_dirty = await asyncio.to_thread(spool.dirty)
+            if not is_dirty:
+                await asyncio.to_thread(spool.close)
+                return True
+
+            logger.warning(
+                "Fill spool at %s is marked dirty from a previous shutdown; initiating automatic startup reconciliation...",
+                path,
+            )
+
+            # If a fill store is present, drain spooled fills and run REST reconciliation
+            if self.fill_store is not None:
+                # 1. Ensure fill store is initialized
+                if not await asyncio.to_thread(self.fill_store.initialize):
+                    logger.error("Failed to initialize fill store during startup reconciliation; spool remains dirty.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+                # 2. Drain any pending spooled fills into the fill store
+                cursor = 0
+                while True:
+                    row = await asyncio.to_thread(spool.pending, cursor)
+                    if row is None:
+                        break
+                    row_id, fill = row
+                    success = await asyncio.to_thread(self.fill_store.record, fill, "websocket")
+                    if success:
+                        await asyncio.to_thread(spool.acknowledge, row_id)
+                    else:
+                        logger.error("Failed to persist spooled fill %s during startup reconciliation; aborting.", row_id)
+                        await asyncio.to_thread(spool.close)
+                        return False
+                    cursor = row_id
+
+                # Verify no fills remain in spool
+                remaining = await asyncio.to_thread(spool.pending)
+                if remaining is not None:
+                    logger.error("Spool still contains unpersisted fills; spool remains dirty.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+                # 3. Run REST reconciliation against Kalshi fills API
+                if reconciler is None:
+                    from data.fill_reconciliation import FillReconciler
+                    reconciler = FillReconciler(self.fill_store, BASE_URL, get_auth_headers, min_interval=0.1)
+
+                try:
+                    report = await reconciler.reconcile()
+                    logger.info(
+                        "Startup fill reconciliation completed: %s pages visited, %s records persisted.",
+                        report.pages, report.persisted,
+                    )
+                except Exception as e:
+                    logger.error("REST fill reconciliation failed during startup reconciliation: %s", e)
+                    await asyncio.to_thread(spool.close)
+                    return False
+            else:
+                # If no fill store is configured, check if spool has pending fills
+                pending_fill = await asyncio.to_thread(spool.pending)
+                if pending_fill is not None:
+                    logger.error("Spool has pending fills but no fill_store configured; cannot safely clear dirty latch.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+            # 4. Clear dirty latch
+            await asyncio.to_thread(spool.clear_dirty)
+            logger.info("Startup fill reconciliation successful; dirty latch cleared.")
+            await asyncio.to_thread(spool.close)
+            return True
+
+        except Exception as e:
+            logger.error("Error during startup spool reconciliation: %s", e, exc_info=True)
+            if spool is not None:
+                try:
+                    await asyncio.to_thread(spool.close)
+                except Exception:
+                    pass
+            return False
+
+    async def subscribe(self, auto_reconcile: bool = False):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""
         if self.fill_store is not None:
             if self._fill_spool is not None:
                 raise RuntimeError("fill ingestion already started")
             path = os.environ.get("FILL_SPOOL_PATH", "data/fill_spool.sqlite3")
+            if auto_reconcile:
+                await self.reconcile_dirty_spool()
             try:
                 self._fill_spool = await asyncio.to_thread(FillSpool, path)
                 if await self._spool_call(self._fill_spool.dirty):

@@ -93,18 +93,8 @@ class KillSwitch:
     def trigger_synchronous(self, ticker: Optional[str] = None):
         """Immediately cancel all known local and exchange resting orders synchronously."""
         logger.warning("Kill Switch Triggered (Sync). Canceling all resting orders...")
-        from config import ALERT_WEBHOOK_URL
-        if ALERT_WEBHOOK_URL:
-            try:
-                payload = {"text": "*Kalshi Bot Alert* \nKill Switch Triggered (Synchronous). Withdrawing all quotes."}
-                requests.post(
-                    ALERT_WEBHOOK_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=2
-                )
-            except Exception as e:
-                logger.error(f"Failed to send sync webhook alert: {e}")
+        from utils.alerting import send_alert_sync
+        send_alert_sync("Kill Switch Triggered (Synchronous). Withdrawing all quotes.")
 
         target_ticker = ticker or self.ticker
         active_ids = list(self.om.active_orders.keys())

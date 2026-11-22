@@ -726,6 +726,8 @@ class AvellanedaStoikovBot:
 
         self.ws_client.add_message_handler(on_response)
         try:
+            if hasattr(self.inv_manager, "reconcile_dirty_spool"):
+                await self.inv_manager.reconcile_dirty_spool()
             await self.inv_manager.subscribe()
             subscriptions = [s for s in self.ws_client.active_subscriptions
                              if s.get("params", {}).get("channels") == ["fill"]]
@@ -830,7 +832,10 @@ class AvellanedaStoikovBot:
         try:
             while self.running:
                 if not self.ws_client.is_connected or self.ws_client.connection_generation != generation:
-                    raise FatalIngestionError("WebSocket connection changed; reconciliation required before resuming")
+                    if self.inv_manager.fill_store is not None and getattr(self, "reconnect_resilience", True):
+                        generation = await self._handle_connection_change(generation)
+                    else:
+                        raise FatalIngestionError("WebSocket connection changed; reconciliation required before resuming")
                 await self._tick()
                 await asyncio.sleep(1) # Re-evaluate every 1 second
         except asyncio.CancelledError:
@@ -841,6 +846,74 @@ class AvellanedaStoikovBot:
             await send_alert(f"Fatal error in trading loop for {self.ticker}: {e}")
             self.running = False
             raise
+
+    async def _handle_connection_change(self, old_generation: int) -> int:
+        """
+        Handle a transient WebSocket disconnection or connection generation change
+        without terminating the entire process.
+        1. Immediately withdraws active quotes to eliminate fill risk on a stale connection.
+        2. Bounded wait for the WebSocket client to re-establish connection.
+        3. Reconciles any fills that occurred during the disconnection gap via REST.
+        4. Re-hydrates portfolio inventory and balance via REST.
+        5. Re-syncs order manager state on the exchange.
+        6. Updates tracked generation and resumes quoting.
+        """
+        logger.warning(
+            "WebSocket connection change detected for %s (connected=%s, generation=%s, expected=%s). "
+            "Withdrawing quotes and initiating in-flight state reconciliation...",
+            self.ticker, self.ws_client.is_connected, self.ws_client.connection_generation, old_generation,
+        )
+        # 1. Immediately withdraw quotes
+        try:
+            await self._cancel_all_quotes()
+        except Exception as e:
+            logger.error("Failed to cancel quotes during connection recovery: %s", e)
+
+        # 2. Bounded wait for websocket reconnection
+        reconnect_timeout = 30.0
+        start_wait = time.monotonic()
+        while not self.ws_client.is_connected:
+            if time.monotonic() - start_wait > reconnect_timeout:
+                logger.critical("WebSocket failed to reconnect within %ss. Escalating to fatal error.", reconnect_timeout)
+                raise FatalIngestionError("WebSocket ingestion stopped unexpectedly; reconciliation required")
+            await asyncio.sleep(0.5)
+
+        # 3. Allow subscriptions to be restored on the newly connected socket
+        await asyncio.sleep(0.5)
+        new_generation = self.ws_client.connection_generation
+
+        # 4. Reconcile missed fills via REST if fill store is configured
+        if self.inv_manager.fill_store is not None:
+            try:
+                from config import BASE_URL
+                from auth.kalshi_auth import get_auth_headers
+                from data.fill_reconciliation import FillReconciler
+                reconciler = FillReconciler(self.inv_manager.fill_store, BASE_URL, get_auth_headers, min_interval=0.1)
+                report = await reconciler.reconcile()
+                logger.info(
+                    "In-flight fill reconciliation completed: %s pages visited, %s records persisted.",
+                    report.pages, report.persisted,
+                )
+            except Exception as e:
+                logger.error("In-flight fill reconciliation failed during connection recovery: %s", e)
+                raise FatalIngestionError("Failed to reconcile fills during WebSocket recovery; reconciliation required") from e
+
+        # 5. Re-hydrate portfolio balance and positions via REST
+        hydrated = await self.inv_manager.hydrate(is_startup=False)
+        if not hydrated:
+            logger.error("Failed to re-hydrate inventory state following WebSocket recovery for %s.", self.ticker)
+            raise FatalIngestionError("Failed to re-hydrate inventory after WebSocket reconnect; reconciliation required")
+
+        # 6. Re-sync order manager active orders on exchange
+        await self.om.sync_and_recover_state()
+
+        # 7. Update tracked connection generation
+        self._fill_connection_generation = new_generation
+        logger.info(
+            "Successfully recovered from WebSocket connection change (generation %s). Resuming quoting on %s.",
+            new_generation, self.ticker,
+        )
+        return new_generation
 
     async def _tick(self):
         """The core logic evaluated every cycle."""
