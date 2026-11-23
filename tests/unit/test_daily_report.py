@@ -229,6 +229,21 @@ def test_drawdown_concentration_majority_vs_minority():
     assert not any("accounting for" in o and "majority" in o for o in obs_min)
     assert any("Significant drawdown and inventory excursions occurred in `KXTEST-A`" in o for o in obs_min)
 
+    # Offsetting profit case: A loses 60c (inv 4), B loses 940c (inv 1), C gains 900c.
+    # Net session realized is -100c, but gross ticker losses are 1,000c.
+    # A accounts for only 6% of gross ticker losses, so it must NOT be reported as a 60% majority.
+    offsetting_profit_metrics = {
+        "totals": {"total_realized_delta_cents": -100.0, "snapshot_count": 50},
+        "tickers": {
+            "KXTEST-A": {"realized_delta_cents": -60.0, "min_inventory": -4, "max_inventory": 4, "has_inventory_snapshot": True},
+            "KXTEST-B": {"realized_delta_cents": -940.0, "min_inventory": -1, "max_inventory": 1, "has_inventory_snapshot": True},
+            "KXTEST-C": {"realized_delta_cents": 900.0, "min_inventory": 0, "max_inventory": 0, "has_inventory_snapshot": True},
+        },
+    }
+    obs_offset = generate_observations(offsetting_profit_metrics)
+    assert not any("accounting for" in o for o in obs_offset)
+    assert any("Significant drawdown and inventory excursions occurred in `KXTEST-A`" in o for o in obs_offset)
+
 
 def test_ending_inventory_telemetry_availability():
     # Case 1: No snapshots recorded
@@ -240,13 +255,41 @@ def test_ending_inventory_telemetry_availability():
     assert any("Inventory snapshot telemetry was unavailable" in o for o in obs_no_snap)
     assert not any("All event markets resolved or liquidated to exactly 0" in o for o in obs_no_snap)
 
-    # Case 2: Snapshots recorded with 5 open contracts
+    # Case 2: Complete snapshots recorded with 5 open contracts
     open_inv_metrics = {
         "totals": {"snapshot_count": 50, "total_orders": 10},
         "tickers": {"KXTEST-1": {"ending_inventory": 5, "has_inventory_snapshot": True, "snapshot_count": 50}},
     }
     obs_open = generate_observations(open_inv_metrics)
     assert any("Carried 5 open contracts into session close" in o for o in obs_open)
+
+
+def test_ending_inventory_telemetry_partial_coverage():
+    # Case 1: Partial coverage with 0 measured contracts
+    partial_flat_metrics = {
+        "totals": {"snapshot_count": 25, "total_orders": 20},
+        "tickers": {
+            "KXTEST-MEASURED": {"ending_inventory": 0, "has_inventory_snapshot": True, "snapshot_count": 25, "net_pnl_cents": 0, "fees_delta_cents": 0},
+            "KXTEST-UNRECORDED": {"ending_inventory": 0, "has_inventory_snapshot": False, "snapshot_count": 0, "net_pnl_cents": 0, "fees_delta_cents": 0},
+        },
+    }
+    obs_partial_flat = generate_observations(partial_flat_metrics)
+    assert any("Measured markets resolved or liquidated to 0 open contracts before session close (1 market(s) lacked snapshot telemetry)." in o for o in obs_partial_flat)
+    slack_partial_flat = format_slack_report(partial_flat_metrics)
+    assert "• *Ending Open Inventory*: `0` contracts (partial: 1 market(s) unrecorded)" in slack_partial_flat
+
+    # Case 2: Partial coverage with 5 measured open contracts
+    partial_open_metrics = {
+        "totals": {"snapshot_count": 25, "total_orders": 20},
+        "tickers": {
+            "KXTEST-MEASURED": {"ending_inventory": 5, "has_inventory_snapshot": True, "snapshot_count": 25, "net_pnl_cents": 0, "fees_delta_cents": 0},
+            "KXTEST-UNRECORDED": {"ending_inventory": 0, "has_inventory_snapshot": False, "snapshot_count": 0, "net_pnl_cents": 0, "fees_delta_cents": 0},
+        },
+    }
+    obs_partial_open = generate_observations(partial_open_metrics)
+    assert any("Carried 5 open contracts into session close across measured markets (1 market(s) lacked snapshot telemetry)." in o for o in obs_partial_open)
+    slack_partial_open = format_slack_report(partial_open_metrics)
+    assert "• *Ending Open Inventory*: `5` contracts (partial: 1 market(s) unrecorded)" in slack_partial_open
 
 
 def test_inventory_risk_consensus_no_incorrect_gamma_baseline():

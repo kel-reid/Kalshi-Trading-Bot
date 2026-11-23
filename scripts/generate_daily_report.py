@@ -442,7 +442,12 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
 
     # 2. Drawdown & inventory concentration observation
     concentrated_drawdowns = []
-    total_drawdown_cents = abs(realized_cents) if realized_cents < 0 else 0.0
+    # Sum of negative per-ticker realized deltas to avoid distortion from offsetting profits in other markets
+    total_ticker_losses_cents = sum(
+        abs(t_data.get("realized_delta_cents", 0.0))
+        for t_data in tickers.values()
+        if t_data.get("realized_delta_cents", 0.0) < 0
+    )
     for ticker, t_data in tickers.items():
         t_real = t_data.get("realized_delta_cents", 0.0)
         min_inv = t_data.get("min_inventory", 0)
@@ -453,10 +458,10 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
     if concentrated_drawdowns:
         details = ", ".join([f"`{t}` (${loss:+.2f}, inv [{min_i}, +{max_i}])" for t, loss, min_i, max_i, _ in concentrated_drawdowns])
         qualifying_loss_sum = sum(raw_cents for _, _, _, _, raw_cents in concentrated_drawdowns)
-        if total_drawdown_cents > 0 and (qualifying_loss_sum / total_drawdown_cents) >= 0.50:
-            pct = (qualifying_loss_sum / total_drawdown_cents * 100.0)
+        if total_ticker_losses_cents > 0 and (qualifying_loss_sum / total_ticker_losses_cents) >= 0.50:
+            pct = (qualifying_loss_sum / total_ticker_losses_cents * 100.0)
             observations.append(
-                f"Session drawdown was concentrated in {details}, accounting for {pct:.1f}% of total session realized losses."
+                f"Session drawdown was concentrated in {details}, accounting for {pct:.1f}% of total ticker realized losses."
             )
         else:
             observations.append(
@@ -515,9 +520,14 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
                     "eliminating overnight directional exposure."
                 )
         else:
-            observations.append(
-                f"Carried {ending_inv_total} open contracts into session close with active mark-to-market exposure."
-            )
+            if untracked:
+                observations.append(
+                    f"Carried {ending_inv_total} open contracts into session close across measured markets ({len(untracked)} market(s) lacked snapshot telemetry)."
+                )
+            else:
+                observations.append(
+                    f"Carried {ending_inv_total} open contracts into session close with active mark-to-market exposure."
+                )
 
     if not observations:
         observations.append("Session execution proceeded within nominal operating tolerances.")
@@ -861,8 +871,14 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
     has_snaps = totals.get("snapshot_count", 0) > 0 or any(
         t.get("has_inventory_snapshot") or t.get("snapshot_count", 0) > 0 for t in tickers.values()
     )
+    untracked_tickers = [t for t, d in tickers.items() if not d.get("has_inventory_snapshot") and d.get("snapshot_count", 0) == 0]
     ending_inv_total = sum(abs(t.get("ending_inventory") or 0) for t in tickers.values() if t.get("ending_inventory") is not None)
-    ending_inv_str = f"`{ending_inv_total}` contracts" if has_snaps else "`N/A` (no snapshot telemetry)"
+    if not has_snaps:
+        ending_inv_str = "`N/A` (no snapshot telemetry)"
+    elif untracked_tickers:
+        ending_inv_str = f"`{ending_inv_total}` contracts (partial: {len(untracked_tickers)} market(s) unrecorded)"
+    else:
+        ending_inv_str = f"`{ending_inv_total}` contracts"
 
     lines = [
         f"📊 *Kalshi Trading Bot — Daily Performance Report: {target_date}*",
