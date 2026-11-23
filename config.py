@@ -39,8 +39,10 @@ if "pytest" not in sys.modules and not has_env_key and not PRIVATE_KEY_PATH.exis
         f"Please check your KALSHI_PRIVATE_KEY_PATH environment variable."
     )
 
-# Alerting
+# Alerting & Reporting
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+REPORTS_WEBHOOK_URL = os.getenv("REPORTS_WEBHOOK_URL")
+REPORTS_SLACK_CHANNEL = os.getenv("REPORTS_SLACK_CHANNEL", "#reports")
 
 def _get_float_env(name: str, default: float, allow_zero: bool = False) -> float:
     val = os.getenv(name)

@@ -33,6 +33,8 @@ try:
     DEFAULT_DB_USER = getattr(config, "DB_USER", "postgres")
     DEFAULT_DB_PASSWORD = getattr(config, "DB_PASSWORD", "postgres")
     DEFAULT_ALERT_WEBHOOK_URL = getattr(config, "ALERT_WEBHOOK_URL", os.getenv("ALERT_WEBHOOK_URL"))
+    DEFAULT_REPORTS_WEBHOOK_URL = getattr(config, "REPORTS_WEBHOOK_URL", os.getenv("REPORTS_WEBHOOK_URL")) or DEFAULT_ALERT_WEBHOOK_URL
+    DEFAULT_REPORTS_CHANNEL = getattr(config, "REPORTS_SLACK_CHANNEL", os.getenv("REPORTS_SLACK_CHANNEL", "#reports"))
 except ImportError:
     DEFAULT_DB_HOST = os.getenv("DB_HOST", "localhost")
     DEFAULT_DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -40,6 +42,8 @@ except ImportError:
     DEFAULT_DB_USER = os.getenv("DB_USER", "postgres")
     DEFAULT_DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
     DEFAULT_ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+    DEFAULT_REPORTS_WEBHOOK_URL = os.getenv("REPORTS_WEBHOOK_URL") or DEFAULT_ALERT_WEBHOOK_URL
+    DEFAULT_REPORTS_CHANNEL = os.getenv("REPORTS_SLACK_CHANNEL", "#reports")
 
 logger = logging.getLogger("DailyReportGenerator")
 
@@ -790,13 +794,20 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def send_slack_report(webhook_url: Optional[str], message: str, timeout: int = 10) -> bool:
+def send_slack_report(
+    webhook_url: Optional[str],
+    message: str,
+    channel: Optional[str] = None,
+    timeout: int = 10,
+) -> bool:
     """Delivers a formatted report message to a Slack incoming webhook."""
     if not webhook_url:
         logger.error("No Slack webhook URL configured.")
         return False
 
     payload = {"text": message}
+    if channel:
+        payload["channel"] = channel
     try:
         resp = requests.post(
             webhook_url,
@@ -844,8 +855,14 @@ def main():
     parser.add_argument(
         "--webhook-url",
         type=str,
-        default=DEFAULT_ALERT_WEBHOOK_URL,
-        help="Webhook URL for Slack delivery (defaults to ALERT_WEBHOOK_URL).",
+        default=DEFAULT_REPORTS_WEBHOOK_URL,
+        help="Webhook URL for Slack delivery (defaults to REPORTS_WEBHOOK_URL or ALERT_WEBHOOK_URL).",
+    )
+    parser.add_argument(
+        "--channel",
+        type=str,
+        default=DEFAULT_REPORTS_CHANNEL,
+        help="Target Slack channel (defaults to REPORTS_SLACK_CHANNEL or #reports).",
     )
     parser.add_argument("--db-host", type=str, default=DEFAULT_DB_HOST, help="PostgreSQL host.")
     parser.add_argument("--db-port", type=int, default=DEFAULT_DB_PORT, help="PostgreSQL port.")
@@ -892,7 +909,7 @@ def main():
 
         if args.slack:
             slack_msg = format_slack_report(metrics)
-            success = send_slack_report(args.webhook_url, slack_msg)
+            success = send_slack_report(args.webhook_url, slack_msg, channel=args.channel)
             if not success:
                 sys.exit(1)
     finally:

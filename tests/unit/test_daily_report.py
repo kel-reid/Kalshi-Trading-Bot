@@ -165,6 +165,21 @@ def test_send_slack_report_success():
         )
 
 
+def test_send_slack_report_with_channel():
+    with patch("requests.post") as mock_post:
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.text = "ok"
+
+        success = send_slack_report("https://hooks.slack.com/services/TEST", "Test Report", channel="#reports")
+        assert success is True
+        mock_post.assert_called_once_with(
+            "https://hooks.slack.com/services/TEST",
+            json={"text": "Test Report", "channel": "#reports"},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+
+
 def test_send_slack_report_failure_status():
     with patch("requests.post") as mock_post:
         mock_post.return_value.status_code = 404
