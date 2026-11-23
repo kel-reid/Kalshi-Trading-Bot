@@ -4,6 +4,7 @@ Verifies pre-blackout sizing scaling, gamma skew boosting, reduce-only quote gat
 and invariant preservation leading into market expiration.
 """
 
+import asyncio
 import datetime
 from decimal import Decimal
 import math
@@ -346,6 +347,7 @@ class TestInventoryTapering:
         )
         bot.om.place_order = AsyncMock(return_value="order-123")
         bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.inv_manager.get_position = MagicMock(return_value=1.5)
         bot._current_ask_quote_size = 1.5
         bot._current_bid_quote_size = 10
 
@@ -362,6 +364,7 @@ class TestInventoryTapering:
         # Test bid side with fractional size
         bot.om.place_order.reset_mock()
         bot.current_ask_id = None
+        bot.inv_manager.get_position = MagicMock(return_value=-0.5)
         bot._current_bid_quote_size = 0.5
         await bot._update_quotes(48, None)
         bot.om.place_order.assert_called_once_with(
@@ -394,7 +397,13 @@ class TestInventoryTapering:
         bot._update_quotes = AsyncMock()
 
         # Trigger session risk via fee churn: 500c >= 300c
-        bot.inv_manager.get_pnl_summary = MagicMock(return_value={"total_fees_paid_cents": 500, "realized_pnl_cents": 0.0})
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={
+            "session_fees_cents": 500,
+            "total_fees_cents": 500,
+            "session_realized_pnl_cents": 0.0,
+            "realized_pnl_cents": 0.0,
+            "unrealized_pnl_cents": 0.0,
+        })
 
         # 1. Long Inventory (6 contracts >= hedge threshold 5): ask size capped at 6, not 10!
         bot.inv_manager.get_position = MagicMock(return_value=6)
@@ -481,3 +490,111 @@ class TestInventoryTapering:
         bot.inv_manager.get_position = MagicMock(return_value=-0.5)
         await bot._tick()
         assert bot._current_bid_quote_size == 0.5
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fill_during_cancellation_caps_quote_size(self):
+        """Fills arriving during cancellation re-cap the replacement quote or abort if flattened."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-CONCURRENT",
+            order_size=10,
+            inventory_taper_enabled=True,
+        )
+        bot._is_reduce_only = True
+        bot._current_taper_factor = 0.25
+        bot._current_ask_quote_size = 5
+        bot.current_ask_id = "old-ask-1"
+        bot.current_ask_price = 55
+        bot.current_ask_size = 10
+        bot.om.place_order = AsyncMock(return_value="new-ask-1")
+
+        # Scenario 1: Partial fill arrives while cancellation is in flight (inventory drops from 5 to 2)
+        async def fake_cancel_partial(order_id):
+            bot.inv_manager.get_position.return_value = 2
+            return True
+
+        bot.om.cancel_order = AsyncMock(side_effect=fake_cancel_partial)
+        bot.inv_manager.get_position = MagicMock(return_value=5)
+
+        await bot._update_quotes(None, 52)
+        # Order placement must use fresh inventory (2) instead of the stale snapshot (5)!
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-CONCURRENT",
+            side="yes",
+            action="sell",
+            count=2,
+            price=52,
+        )
+        assert bot.current_ask_size == 2
+
+        # Scenario 2: Complete fill arrives while cancellation is in flight (inventory drops to 0)
+        bot.om.place_order.reset_mock()
+        bot.current_ask_id = "old-ask-2"
+        bot.current_ask_price = 55
+        bot.current_ask_size = 2
+        bot._current_ask_quote_size = 2
+
+        async def fake_cancel_complete(order_id):
+            bot.inv_manager.get_position.return_value = 0
+            return True
+
+        bot.om.cancel_order = AsyncMock(side_effect=fake_cancel_complete)
+        bot.inv_manager.get_position = MagicMock(return_value=2)
+
+        await bot._update_quotes(None, 52)
+        # Order placement must be completely skipped because position is flat!
+        bot.om.place_order.assert_not_called()
+        assert bot.current_ask_id is None
+
+    @pytest.mark.asyncio
+    async def test_opposing_quote_withdrawal_confirmed_before_hedge(self):
+        """Hedge quote placement is aborted if opposing quote withdrawal fails."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-OPPOSING",
+            order_size=10,
+        )
+        bot._is_reduce_only = True
+        # Active opposing BID quote on the exchange
+        bot.current_bid_id = "active-bid-1"
+        bot.current_bid_price = 45
+        bot.current_bid_size = 5
+        bot._current_ask_quote_size = 5
+
+        # Cancellation fails (e.g. timeout or API error)
+        bot.om.cancel_order = AsyncMock(return_value=False)
+        bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+        bot.om.place_order = AsyncMock(return_value="hedge-ask-1")
+        bot.inv_manager.get_position = MagicMock(return_value=5)
+
+        # Single-sided long hedge: new_bid is None (halt bids), new_ask is 52 (cross ask)
+        await bot._update_quotes(None, 52)
+
+        # Because opposing BID withdrawal was not confirmed, ASK placement must be aborted!
+        bot.om.place_order.assert_not_called()
+        assert bot.current_bid_id == "active-bid-1"
+        assert bot.current_ask_id is None
+
+    @pytest.mark.asyncio
+    async def test_failed_cancellation_oversized_quote_handling(self):
+        """Failed cancellation retains quote ID to prevent duplicates and triggers reconciliation."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-FAILED-CANCEL",
+            order_size=10,
+        )
+        bot.current_ask_id = "old-ask-oversized"
+        bot.current_ask_price = 55
+        bot.current_ask_size = 10
+        bot._current_ask_quote_size = 2
+
+        bot.om.cancel_order = AsyncMock(return_value=False)
+        bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+        bot.om.place_order = AsyncMock(return_value="new-ask-1")
+        bot.inv_manager.get_position = MagicMock(return_value=2)
+
+        await bot._update_quotes(None, 52)
+
+        # Retains active quote ID to block duplicate placement
+        assert bot.current_ask_id == "old-ask-oversized"
+        bot.om.place_order.assert_not_called()
+        # Dispatched reconciliation task in background
+        await asyncio.sleep(0.01)
+        bot.om.reconcile_resting_orders.assert_called_once_with(ticker="KXTEST-FAILED-CANCEL")
