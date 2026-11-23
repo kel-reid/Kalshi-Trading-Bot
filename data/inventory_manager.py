@@ -16,7 +16,7 @@ import threading
 from datetime import datetime, timezone
 import certifi
 from decimal import Decimal
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 # Provide required imports from our new module
 
@@ -224,6 +224,8 @@ class InventoryManager:
         market_positions: List[Dict[str, Any]],
         is_startup: bool = False,
         timestamp: Optional[float] = None,
+        snapshot_boundary: Optional[float] = None,
+        snapshot_window: Optional[Tuple[float, float]] = None,
     ) -> bool:
         """Applies REST positions to state, running on the event loop thread."""
         # Atomically validate and parse all entries before mutating state or PnL lots
@@ -256,15 +258,12 @@ class InventoryManager:
                 return False
             validated_entries.append((ticker.strip(), position, pos))
 
-        if timestamp is not None:
+        if snapshot_boundary is not None:
+            recon_time = snapshot_boundary
+        elif timestamp is not None:
             recon_time = timestamp
         else:
-            now = time.time()
-            if self._recorded_fills:
-                max_fill_ts = max(f["timestamp"] for f in self._recorded_fills)
-                recon_time = max(now, max_fill_ts + 0.001)
-            else:
-                recon_time = now
+            recon_time = time.time()
 
         new_positions = {}
         for ticker, position, pos in validated_entries:
@@ -283,13 +282,23 @@ class InventoryManager:
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
                     self._initial_seeded_inventory[ticker] = (position, cost_basis)
                 else:
-                    self.pnl_tracker.reconcile_inventory(ticker, position, timestamp=recon_time)
+                    self.pnl_tracker.reconcile_inventory(
+                        ticker,
+                        position,
+                        timestamp=recon_time,
+                        snapshot_window=snapshot_window,
+                    )
 
         # For any previously tracked market that is now flat (not in REST active positions)
         if not is_startup:
             for active_ticker in list(self.positions.keys()):
                 if active_ticker not in new_positions:
-                    self.pnl_tracker.reconcile_inventory(active_ticker, 0, timestamp=recon_time)
+                    self.pnl_tracker.reconcile_inventory(
+                        active_ticker,
+                        0,
+                        timestamp=recon_time,
+                        snapshot_window=snapshot_window,
+                    )
 
         # Identify all tickers affected by this hydration/reconciliation
         all_affected_tickers = set(new_positions.keys()) | (set(self.positions.keys()) if not is_startup else set())
@@ -322,17 +331,26 @@ class InventoryManager:
 
     def _hydrate_positions(self, is_startup: bool = False):
         """Fetch initial positions via REST synchronously."""
+        t_req_start = time.time()
         market_positions = self._fetch_positions()
+        t_req_end = time.time()
         if market_positions is not None:
-            self._apply_positions(market_positions, is_startup=is_startup)
+            self._apply_positions(
+                market_positions,
+                is_startup=is_startup,
+                snapshot_boundary=t_req_start,
+                snapshot_window=(t_req_start, t_req_end),
+            )
 
     async def hydrate(self, is_startup: bool = False, require_complete: bool = False) -> bool:
         """Run hydration asynchronously to avoid blocking the event loop."""
         logger.info(f"Hydrating inventory state from REST API (startup={is_startup}, require_complete={require_complete})...")
         start_fill_count = self._fill_count
         start_pending_fills = self._pending_fills
+        t_req_start = time.time()
         bal = await asyncio.to_thread(self._fetch_balance)
         market_positions = await asyncio.to_thread(self._fetch_positions)
+        t_req_end = time.time()
 
         # Concurrency guard: if a fill arrived while REST requests were in-flight,
         # or if fill ingestion was pending when hydration started or finished,
@@ -364,7 +382,12 @@ class InventoryManager:
 
         positions_applied = True
         if market_positions is not None:
-            positions_applied = self._apply_positions(market_positions, is_startup=is_startup)
+            positions_applied = self._apply_positions(
+                market_positions,
+                is_startup=is_startup,
+                snapshot_boundary=t_req_start,
+                snapshot_window=(t_req_start, t_req_end),
+            )
 
         # On startup or strict recovery, verified ground truth for BOTH balance and positions is mandatory.
         # Commit balance only after positions validate successfully to ensure atomic hydration.
@@ -780,6 +803,26 @@ class InventoryManager:
                 )
             elif ev["type"] == "reconciliation":
                 r = ev["data"]
+                # Fail closed on uncertain snapshot ordering: if any session fill occurred within
+                # the in-flight HTTP request window [snapshot_start, snapshot_end], the exchange state
+                # relative to the fill is ambiguous. Discard the uncertain snapshot to prevent
+                # fabricating erroneous MTM adjustments.
+                snap_start = r.get("snapshot_start")
+                snap_end = r.get("snapshot_end")
+                is_uncertain = False
+                if snap_start is not None and snap_end is not None and snap_end > snap_start:
+                    for f in ticker_fills:
+                        if snap_start <= f["timestamp"] <= snap_end:
+                            is_uncertain = True
+                            logger.warning(
+                                f"Discarding uncertain reconciliation snapshot for {ticker} at {r['timestamp']:.3f}: "
+                                f"fill {f.get('fill', {}).get('fill_id')} executed during in-flight request window "
+                                f"[{snap_start:.3f}, {snap_end:.3f}]."
+                            )
+                            break
+                if is_uncertain:
+                    continue
+
                 if r.get("mid_price") is not None:
                     market.last_mid_price = r["mid_price"]
                 self.pnl_tracker.reconcile_inventory(

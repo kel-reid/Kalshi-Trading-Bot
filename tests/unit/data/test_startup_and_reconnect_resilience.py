@@ -1342,5 +1342,159 @@ async def test_live_fill_periodic_reconciliation_and_partial_rest_recovery_accou
     assert len(pnl.get_or_create_market("KXTEST").open_lots) == 0
 
 
+@pytest.mark.asyncio
+async def test_live_fill_periodic_reconciliation_missed_fill_between_snapshot_creation_and_application():
+    """
+    Verify that when a position snapshot is created at T_create, a missed fill executes on the
+    exchange at T_fill (where T_create < T_fill < T_apply), and the snapshot is applied at T_apply,
+    replay orders the snapshot by its verified creation boundary rather than application time.
+
+    The snapshot therefore does NOT close the subsequent long position or add a false synthetic MTM adjustment.
+
+    Scenario:
+    1. T0 (09:30:00): Buy 10 @ 50c (live fill). Mid price = 60c.
+       -> Position = 10, open lot: 10 @ 50c, Realized PnL = 0c.
+    2. T1 (09:31:00): Exchange executes Sell 10 @ 60c (missed by WebSocket).
+       -> Exchange position drops to 0.
+    3. T2 (09:31:30): Snapshot creation boundary on exchange. Exchange returns flat position (0 contracts).
+    4. T3 (09:31:35): Another missed fill executes on exchange: Buy 10 @ 40c (missed by WebSocket).
+       -> Exchange position is now 10 contracts.
+    5. T4 (09:31:40): Snapshot response applied:
+       -> _apply_positions([], is_startup=False, snapshot_boundary=09:31:30).
+    6. T5 (09:32:00): REST recovery recovers both missed fills:
+       -> Sell 10 @ 60c (ts = 09:31:00)
+       -> Buy 10 @ 40c (ts = 09:31:35)
+    7. Invariants:
+       -> Snapshot at 09:31:30 evaluates against state at 09:31:30 (where position was 0). Delta = 0.
+       -> Buy 10 @ 40c (09:31:35) is replayed AFTER the snapshot, remaining an open lot.
+       -> Realized PnL = 100c (from Buy 10 @ 50c and Sell 10 @ 60c). NOT 300c!
+       -> Reconciliation Adjustment = 0c (NOT 200c!).
+       -> Net Position = 10.
+       -> Open lots = 1 lot of 10 contracts @ 40c.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. T0 (09:30:00): Live Buy 10 @ 50c
+    buy_fill_1 = {
+        "fill_id": "live-buy-1",
+        "trade_id": "live-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    pnl.update_mid_price("KXTEST", 60.0)
+    await manager._handle_message({"type": "fill", "msg": buy_fill_1})
+    assert manager.get_position("KXTEST") == 10
+
+    # 2. T2 (09:31:30): Snapshot created on exchange (flat position 0).
+    # Applied with verified creation boundary 09:31:30.
+    t_create = datetime(2026, 11, 23, 9, 31, 30, tzinfo=timezone.utc).timestamp()
+    assert manager._apply_positions([], is_startup=False, snapshot_boundary=t_create) is True
+
+    # 3. T5: REST recovery recovers missed Sell 10 @ 60c (09:31:00) and missed Buy 10 @ 40c (09:31:35)
+    missed_sell = {
+        "fill_id": "missed-sell-1",
+        "trade_id": "missed-t1",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:31:00Z",
+    }
+    missed_buy_2 = {
+        "fill_id": "missed-buy-2",
+        "trade_id": "missed-t2",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.40",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:31:35Z",
+    }
+
+    assert manager.apply_reconciled_fill(missed_sell) is True
+    assert manager.apply_reconciled_fill(missed_buy_2) is True
+
+    # 4. Invariants check
+    s_final = pnl.get_market_summary("KXTEST")
+    assert s_final["realized_pnl_cents"] == 100.0  # NOT 300.0!
+    assert s_final["reconciliation_adjustment_cents"] == 0.0  # NOT 200.0!
+    assert manager.get_position("KXTEST") == 10
+    market = pnl.get_or_create_market("KXTEST")
+    assert len(market.open_lots) == 1
+    assert market.open_lots[0].count == 10
+    assert market.open_lots[0].price_cents == 40.0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_snapshot_discarded_when_fill_occurs_during_in_flight_request():
+    """
+    Verify that if a fill executes during the in-flight HTTP request window [t_req_start, t_req_end],
+    the snapshot ordering relative to the fill is ambiguous, so the rebuild fails closed by
+    discarding the uncertain snapshot and replaying fills cleanly in FIFO order without false adjustments.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Live Buy 10 @ 50c at 09:30:00
+    buy_fill = {
+        "fill_id": "uncert-buy-1",
+        "trade_id": "uncert-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    pnl.update_mid_price("KXTEST", 60.0)
+    await manager._handle_message({"type": "fill", "msg": buy_fill})
+
+    # 2. Snapshot requested at 09:31:30.000 and received at 09:31:31.000 with target_position = 0
+    t_start = datetime(2026, 11, 23, 9, 31, 30, tzinfo=timezone.utc).timestamp()
+    t_end = datetime(2026, 11, 23, 9, 31, 31, tzinfo=timezone.utc).timestamp()
+    assert manager._apply_positions(
+        [],
+        is_startup=False,
+        snapshot_boundary=t_start,
+        snapshot_window=(t_start, t_end),
+    ) is True
+
+    # 3. Recovered Sell 10 @ 60c executed at 09:31:30.500 (inside the in-flight request window!)
+    in_flight_sell = {
+        "fill_id": "uncert-sell-1",
+        "trade_id": "uncert-t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:31:30.500Z",
+    }
+    assert manager.apply_reconciled_fill(in_flight_sell) is True
+
+    # 4. The uncertain snapshot was discarded during replay; fills matched in pure FIFO order
+    s_final = pnl.get_market_summary("KXTEST")
+    assert s_final["realized_pnl_cents"] == 100.0
+    assert s_final["reconciliation_adjustment_cents"] == 0.0
+    assert manager.get_position("KXTEST") == 0
+    assert len(pnl.get_or_create_market("KXTEST").open_lots) == 0
+
+
+
 
 

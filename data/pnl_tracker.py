@@ -167,6 +167,7 @@ class PnLTracker:
         ticker: str,
         target_position: Union[int, float],
         timestamp: Optional[float] = None,
+        snapshot_window: Optional[Tuple[float, float]] = None,
         record_event: bool = True,
     ):
         """
@@ -183,9 +184,13 @@ class PnLTracker:
 
         if record_event:
             event_ts = timestamp if timestamp is not None else time.time()
+            snap_start = snapshot_window[0] if snapshot_window else event_ts
+            snap_end = snapshot_window[1] if snapshot_window else event_ts
             market.reconciliation_events.append({
                 "target_position": target_position,
                 "timestamp": event_ts,
+                "snapshot_start": snap_start,
+                "snapshot_end": snap_end,
                 "rotation_session_id": market.rotation_session_id,
                 "mid_price": market.last_mid_price,
             })
