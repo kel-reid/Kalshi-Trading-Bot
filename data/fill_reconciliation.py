@@ -169,6 +169,7 @@ class FillReconciler:
             params["min_ts"] = math.floor(start.timestamp()) - 1
         if end is not None:
             params["max_ts"] = math.ceil(end.timestamp()) + 1
+        recovered_fills = []
         try:
             for path in (CURRENT, HISTORICAL):
                 self._check_stop(stop)
@@ -212,20 +213,39 @@ class FillReconciler:
                                 report.warnings.append(f"Fill persistence failed: {exc}")
                             continue
                         report.persisted += 1
-                        if self.on_fill is not None:
-                            try:
-                                self.on_fill(fill)
-                            except Exception as exc:
-                                report.failed += 1
-                                if first_persistence_error is None:
-                                    first_persistence_error = exc
-                                    report.warnings.append(f"Fill accounting callback failed: {exc}")
-                                raise
+                        recovered_fills.append(fill)
                     if not next_cursor:
                         break
                     seen.add(next_cursor)
                     cursor = next_cursor
             self._check_stop(stop)
+
+            # Replay recovered fills into accounting callback in chronological order (FIFO)
+            if self.on_fill is not None and recovered_fills:
+                def _fill_sort_key(f):
+                    raw = f.get("created_time")
+                    if raw is None:
+                        raw = f.get("ts")
+                    try:
+                        dt = aware_datetime(raw) if raw is not None else datetime.min.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        dt = datetime.min.replace(tzinfo=timezone.utc)
+                    seq = f.get("exchange_index")
+                    if seq is None or isinstance(seq, bool) or not isinstance(seq, int):
+                        seq = 0
+                    return (dt, seq)
+
+                recovered_fills.sort(key=_fill_sort_key)
+                for fill in recovered_fills:
+                    self._check_stop(stop)
+                    try:
+                        self.on_fill(fill)
+                    except Exception as exc:
+                        report.failed += 1
+                        if first_persistence_error is None:
+                            first_persistence_error = exc
+                            report.warnings.append(f"Fill accounting callback failed: {exc}")
+                        raise
         except Exception as exc:
             raise ReconciliationError(f"fill reconciliation failed: {exc}", report) from exc
         if first_persistence_error is not None:

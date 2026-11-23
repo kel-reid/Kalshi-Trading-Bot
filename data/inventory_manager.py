@@ -39,6 +39,27 @@ from data.websocket_client import FatalIngestionError
 
 logger = logging.getLogger("InventoryManager")
 
+def _normalize_fill(fill: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = fill.get("market_ticker") or fill.get("ticker")
+    action = fill.get("action")
+    action = action.lower() if isinstance(action, str) else None
+    side = fill.get("side")
+    side = side.lower() if isinstance(side, str) else None
+    raw_count = fill.get("count_fp", fill.get("count"))
+    count = None
+    if raw_count is not None and not isinstance(raw_count, bool):
+        try:
+            count = float(raw_count)
+        except (ValueError, TypeError):
+            pass
+    return {
+        "ticker": ticker,
+        "action": action,
+        "side": side,
+        "count": count,
+    }
+
+
 class InventoryManager:
     """
     Maintains real-time tracking of current position sizes and USD balance.
@@ -451,11 +472,145 @@ class InventoryManager:
                     pass
             return False
 
+    def _find_seen_fill(
+        self,
+        fill_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        fill: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Locates an existing seen fill record matching FillStore's identity and aliasing rules.
+        Enforces cross-field identity aliasing between WebSocket and REST fills:
+        1. Direct match on ('fill_id', fill_id) or ('trade_id', trade_id).
+        2. Alias match (when no direct match):
+           - If fill_id is provided: matches existing record with trade_id == fill_id and fill_id is None (WS -> REST).
+           - If fill_id is None and trade_id is provided: matches existing record with fill_id == trade_id (REST -> WS).
+        3. Validates against conflicting identities:
+           - Raises ValueError on conflicting fill_id, order_id, or trade_id (unless aliased).
+           - Raises ValueError on conflicting core execution attributes (ticker, action, side, count).
+           - Raises ValueError on conflicting WebSocket payload content for identical live fill identities.
+        4. Updates and merges aliased identities in self._seen_fill_ids.
+        """
+        records = []
+        if fill_id is not None:
+            rec = self._seen_fill_ids.get(("fill_id", fill_id))
+            if rec is not None and rec not in records:
+                records.append(rec)
+        if trade_id is not None:
+            rec = self._seen_fill_ids.get(("trade_id", trade_id))
+            if rec is not None and rec not in records:
+                records.append(rec)
+
+        # Alias match if no direct match was found
+        if not records:
+            if fill_id is not None:
+                # Incoming fill has fill_id (e.g. from REST). Check if previous WS fill used this as trade_id
+                rec = self._seen_fill_ids.get(("trade_id", fill_id))
+                if rec is not None and rec.get("ids", {}).get("fill_id") is None:
+                    records.append(rec)
+            if not records and fill_id is None and trade_id is not None:
+                # Incoming fill has only trade_id (e.g. from WS). Check if previous REST fill used this as fill_id
+                rec = self._seen_fill_ids.get(("fill_id", trade_id))
+                if rec is not None:
+                    records.append(rec)
+
+        if not records:
+            return None
+
+        if len(records) > 1:
+            raise ValueError("Fill identifiers refer to different existing fills")
+
+        existing = records[0]
+        existing_ids = existing.setdefault("ids", {})
+
+        # Validate order_id conflicts
+        if order_id is not None and existing_ids.get("order_id") is not None and existing_ids["order_id"] != order_id:
+            raise ValueError(f"Conflicting order_id for existing fill: {order_id} != {existing_ids['order_id']}")
+
+        # Validate fill_id conflicts
+        if fill_id is not None and existing_ids.get("fill_id") is not None and existing_ids["fill_id"] != fill_id:
+            raise ValueError(f"Conflicting fill_id for existing fill: {fill_id} != {existing_ids['fill_id']}")
+
+        # Validate trade_id conflicts with aliasing awareness
+        replace_trade_id = False
+        if trade_id is not None and existing_ids.get("trade_id") is not None and existing_ids["trade_id"] != trade_id:
+            if fill_id is not None and fill_id == existing_ids["trade_id"]:
+                replace_trade_id = True
+            elif existing_ids.get("fill_id") == trade_id:
+                pass
+            else:
+                raise ValueError(f"Conflicting trade_id for existing fill: {trade_id} != {existing_ids['trade_id']}")
+
+        # Validate normalized fill execution attributes if fill payload is provided
+        if fill is not None:
+            incoming_norm = _normalize_fill(fill)
+            existing_norm = existing.get("normalized", {})
+            for key in ("ticker", "action", "side", "count"):
+                in_val = incoming_norm.get(key)
+                ex_val = existing_norm.get(key)
+                if in_val is not None and ex_val is not None and in_val != ex_val:
+                    raise ValueError(f"Conflicting fill {key} for existing fill: {in_val} != {ex_val}")
+
+            if existing.get("source") == "websocket" and source == "websocket":
+                content = {k: v for k, v in fill.items() if k not in ("fill_id", "trade_id")}
+                if existing.get("content") is not None and existing["content"] != content:
+                    raise ValueError("Conflicting fill identity")
+
+        # Synchronize and merge aliased identities
+        if replace_trade_id:
+            old_trade_id = existing_ids.get("trade_id")
+            if old_trade_id is not None:
+                self._seen_fill_ids.pop(("trade_id", old_trade_id), None)
+            existing_ids["fill_id"] = fill_id
+            existing_ids["trade_id"] = trade_id
+            self._seen_fill_ids[("fill_id", fill_id)] = existing
+            self._seen_fill_ids[("trade_id", trade_id)] = existing
+        else:
+            if fill_id is not None and existing_ids.get("fill_id") is None:
+                existing_ids["fill_id"] = fill_id
+                self._seen_fill_ids[("fill_id", fill_id)] = existing
+            if trade_id is not None and existing_ids.get("trade_id") is None:
+                existing_ids["trade_id"] = trade_id
+                self._seen_fill_ids[("trade_id", trade_id)] = existing
+
+        if order_id is not None and existing_ids.get("order_id") is None:
+            existing_ids["order_id"] = order_id
+
+        return existing
+
+    def _record_seen_fill(
+        self,
+        fill_id: Optional[str],
+        trade_id: Optional[str],
+        order_id: Optional[str],
+        fill: Dict[str, Any],
+        source: str = "websocket",
+    ) -> Dict[str, Any]:
+        """Records a new unique fill in self._seen_fill_ids."""
+        record = {
+            "ids": {
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "order_id": order_id,
+            },
+            "source": source,
+            "normalized": _normalize_fill(fill),
+            "content": {k: v for k, v in fill.items() if k not in ("fill_id", "trade_id")},
+        }
+        if fill_id is not None:
+            self._seen_fill_ids[("fill_id", fill_id)] = record
+        if trade_id is not None:
+            self._seen_fill_ids[("trade_id", trade_id)] = record
+        return record
+
     def apply_reconciled_fill(self, fill: Dict[str, Any]) -> bool:
         """
         Apply a REST-recovered fill to PnLTracker and inventory if it was not already
         processed by the live WebSocket ingestion path.
-        Deduplicates against self._seen_fill_ids so fills are never double-counted.
+        Deduplicates against self._seen_fill_ids using FillStore's aliasing rules
+        so fills are never double-counted.
         """
         with self._fill_lock:
             if not isinstance(fill, dict):
@@ -475,24 +630,29 @@ class InventoryManager:
                     )
                     return False
 
-            identities = []
-            for key in ("fill_id", "trade_id"):
-                value = fill.get(key)
-                if value is not None and isinstance(value, str) and value.strip():
-                    identities.append((key, value))
-            if not identities:
+            fill_id = fill.get("fill_id")
+            trade_id = fill.get("trade_id")
+            order_id = fill.get("order_id")
+
+            if fill_id is not None and (not isinstance(fill_id, str) or not fill_id.strip()):
+                raise ValueError(f"invalid fill_id: {fill_id!r}")
+            if trade_id is not None and (not isinstance(trade_id, str) or not trade_id.strip()):
+                raise ValueError(f"invalid trade_id: {trade_id!r}")
+            if order_id is not None and (not isinstance(order_id, str) or not order_id.strip()):
+                order_id = None
+
+            if not fill_id and not trade_id:
                 raise ValueError(f"Reconciled fill missing fill_id and trade_id: {fill}")
 
-            # If any identity is already recorded, this fill was already processed
-            if any(identity in self._seen_fill_ids for identity in identities):
+            # Check if fill was already recorded (direct or cross-field alias)
+            existing = self._find_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="rest")
+            if existing is not None:
                 return False
 
-            content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
             count_before = self._fill_count
             self._handle_fill(fill)
             if self._fill_count > count_before:
-                record = {"content": content, "ids": dict(identities)}
-                self._seen_fill_ids.update({identity: record for identity in identities})
+                self._record_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="rest")
                 return True
             raise ValueError(f"Reconciled fill was dropped or invalid: {fill}")
 
@@ -627,32 +787,29 @@ class InventoryManager:
                     with self._fill_lock:
                         if not isinstance(fill, dict):
                             raise ValueError("fill payload must be an object")
-                        identities = []
-                        for key in ("fill_id", "trade_id"):
-                            value = fill.get(key)
-                            if value is not None:
-                                if not isinstance(value, str) or not value.strip():
-                                    raise ValueError(f"invalid {key}")
-                                identities.append((key, value))
-                        if not any(key == "trade_id" for key, _ in identities):
+                        fill_id = fill.get("fill_id")
+                        trade_id = fill.get("trade_id")
+                        order_id = fill.get("order_id")
+
+                        if fill_id is not None and (not isinstance(fill_id, str) or not fill_id.strip()):
+                            raise ValueError(f"invalid fill_id: {fill_id!r}")
+                        if trade_id is not None and (not isinstance(trade_id, str) or not trade_id.strip()):
+                            raise ValueError(f"invalid trade_id: {trade_id!r}")
+                        if order_id is not None and (not isinstance(order_id, str) or not order_id.strip()):
+                            order_id = None
+
+                        if not trade_id:
                             raise ValueError("WebSocket fill requires trade_id")
-                        content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
-                        existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
-                        if existing:
-                            if any(previous["content"] != content or any(
-                                key in previous["ids"] and previous["ids"][key] != value
-                                for key, value in identities
-                            ) for previous in existing) or any(previous is not existing[0] for previous in existing):
-                                raise ValueError("conflicting fill identity")
-                            existing[0]["ids"].update(identities)
-                            self._seen_fill_ids.update({identity: existing[0] for identity in identities})
+
+                        existing = self._find_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="websocket")
+                        if existing is not None:
                             return
+
                         count_before = self._fill_count
                         self._handle_fill(fill)
                         if self._fill_count == count_before:
                             raise ValueError("invalid inventory fill")
-                        record = {"content": content, "ids": dict(identities)}
-                        self._seen_fill_ids.update({identity: record for identity in identities})
+                        self._record_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="websocket")
                 except Exception as exc:
                     self._fill_failure = exc
                     raise FatalIngestionError("failed to process inventory fill") from exc

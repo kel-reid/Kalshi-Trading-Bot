@@ -445,9 +445,19 @@ async def test_concurrent_live_websocket_and_rest_fill_delivery():
     manager = InventoryManager(ws, pnl_tracker=pnl)
     manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
 
-    fill_payload = {
-        "fill_id": "f-race-dual",
-        "trade_id": "t-race-dual",
+    # Use cross-field aliased identifiers (WS trade_id matches REST fill_id)
+    ws_payload = {
+        "trade_id": "cross-race-id",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.10",
+    }
+    rest_payload = {
+        "fill_id": "cross-race-id",
+        "trade_id": "rest-market-trade-race",
         "market_ticker": "KXTEST",
         "action": "buy",
         "side": "yes",
@@ -457,15 +467,35 @@ async def test_concurrent_live_websocket_and_rest_fill_delivery():
         "created_time": "2026-11-22T12:05:00Z",
     }
 
-    # Task 1: Live WebSocket delivery via _handle_message
+    # Barrier forces both threads to synchronize and race concurrently for _fill_lock
+    barrier = threading.Barrier(2)
+    real_lock = manager._fill_lock
+
+    class BarrierLock:
+        def __enter__(self):
+            try:
+                barrier.wait(timeout=3.0)
+            except threading.BrokenBarrierError:
+                pass
+            return real_lock.__enter__()
+
+        def __exit__(self, *args):
+            return real_lock.__exit__(*args)
+
+    manager._fill_lock = BarrierLock()
+
+    # Task 1: Live WebSocket delivery via _handle_message on worker thread
     async def live_delivery():
-        await manager._handle_message({"type": "fill", "msg": dict(fill_payload)})
+        return await asyncio.to_thread(asyncio.run, manager._handle_message({"type": "fill", "msg": dict(ws_payload)}))
 
     # Task 2: REST delivery via apply_reconciled_fill running in a worker thread
     async def rest_delivery():
-        return await asyncio.to_thread(manager.apply_reconciled_fill, dict(fill_payload))
+        return await asyncio.to_thread(manager.apply_reconciled_fill, dict(rest_payload))
 
     results = await asyncio.gather(live_delivery(), rest_delivery(), return_exceptions=True)
+
+    # Restore lock
+    manager._fill_lock = real_lock
 
     # Neither should have raised an exception
     for r in results:
@@ -475,4 +505,210 @@ async def test_concurrent_live_websocket_and_rest_fill_delivery():
     # Accounting invariants: fill applied exactly once
     assert manager._fill_count == 1
     assert pnl.get_total_fees("KXTEST") == 10.0
+    assert manager.get_position("KXTEST") == 10
+
+
+@pytest.mark.asyncio
+async def test_inventory_manager_cross_field_identity_aliasing_websocket_then_rest():
+    """Verify WebSocket fill with trade_id='X' deduplicates REST fill with fill_id='X', trade_id='Y'."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    ws_fill = {
+        "trade_id": "fill-abc",
+        "order_id": "ord-1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.05",
+    }
+    rest_fill = {
+        "fill_id": "fill-abc",
+        "trade_id": "trade-def",
+        "order_id": "ord-1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-22T12:05:00Z",
+    }
+
+    # 1. Live WebSocket arrives first
+    await manager._handle_message({"type": "fill", "msg": ws_fill})
+    assert manager._fill_count == 1
+    assert manager.get_position("KXTEST") == 5
+    assert pnl.get_total_fees("KXTEST") == 5.0
+
+    # 2. Reconciled REST fill arrives later with fill_id='fill-abc' and distinct trade_id='trade-def'
+    applied = manager.apply_reconciled_fill(rest_fill)
+    assert applied is False  # Deduplicated via cross-field aliasing
+    assert manager._fill_count == 1  # Not double counted
+    assert manager.get_position("KXTEST") == 5
+    assert pnl.get_total_fees("KXTEST") == 5.0
+
+
+@pytest.mark.asyncio
+async def test_inventory_manager_cross_field_identity_aliasing_rest_then_websocket():
+    """Verify REST fill with fill_id='X', trade_id='Y' deduplicates WebSocket fill with trade_id='X'."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    rest_fill = {
+        "fill_id": "fill-xyz",
+        "trade_id": "trade-uvw",
+        "order_id": "ord-2",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-22T12:05:00Z",
+    }
+    ws_fill = {
+        "trade_id": "fill-xyz",
+        "order_id": "ord-2",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.05",
+    }
+
+    # 1. REST recovery arrives first
+    applied = manager.apply_reconciled_fill(rest_fill)
+    assert applied is True
+    assert manager._fill_count == 1
+    assert manager.get_position("KXTEST") == 5
+    assert pnl.get_total_fees("KXTEST") == 5.0
+
+    # 2. Live WebSocket arrives later with trade_id matching REST fill_id
+    await manager._handle_message({"type": "fill", "msg": ws_fill})
+    assert manager._fill_count == 1  # Deduplicated, not double counted
+    assert manager.get_position("KXTEST") == 5
+    assert pnl.get_total_fees("KXTEST") == 5.0
+
+
+def test_inventory_manager_conflicting_identities_rejected():
+    """Verify fills with conflicting order_id or conflicting trade_id are rejected."""
+    ws = MagicMock()
+    manager = InventoryManager(ws)
+
+    fill1 = {
+        "fill_id": "f-base",
+        "trade_id": "t-base",
+        "order_id": "o-base",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.01",
+    }
+    assert manager.apply_reconciled_fill(fill1) is True
+
+    # Conflicting order_id on same fill_id
+    fill_bad_order = dict(fill1, order_id="o-different")
+    with pytest.raises(ValueError, match="Conflicting order_id"):
+        manager.apply_reconciled_fill(fill_bad_order)
+
+    # Conflicting trade_id on same fill_id (not an alias match)
+    fill_bad_trade = dict(fill1, trade_id="t-different")
+    with pytest.raises(ValueError, match="Conflicting trade_id"):
+        manager.apply_reconciled_fill(fill_bad_trade)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_replays_multi_page_fills_in_chronological_order():
+    """Verify FillReconciler replays recovered fills in chronological (FIFO) order into on_fill."""
+    store = MagicMock()
+    store.record = MagicMock(return_value=True)
+
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 10, 0, 0, tzinfo=timezone.utc)
+
+    # Three fills:
+    # 1. Buy 10 @ 40c (t=10:00:00)
+    # 2. Sell 10 @ 60c (t=10:01:00) -> Realized PnL = +200c
+    # 3. Buy 10 @ 50c (t=10:02:00) -> New open lot @ 50c
+    fill1 = {
+        "fill_id": "f1",
+        "trade_id": "t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.40",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-22T10:00:00Z",
+    }
+    fill2 = {
+        "fill_id": "f2",
+        "trade_id": "t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-22T10:01:00Z",
+    }
+    fill3 = {
+        "fill_id": "f3",
+        "trade_id": "t3",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-22T10:02:00Z",
+    }
+
+    # Kalshi REST returns fills in reverse chronological order (newest first)
+    # Page 1: fill3, fill2; Page 2: fill1
+    page1 = {"fills": [fill3, fill2], "cursor": "page2"}
+    page2 = {"fills": [fill1], "cursor": None}
+
+    reconciler = FillReconciler(
+        store,
+        "https://example.invalid",
+        lambda m, p: {},
+        min_interval=0,
+        on_fill=manager.apply_reconciled_fill,
+    )
+
+    def mock_get(url, **kwargs):
+        params = kwargs.get("params", {})
+        cursor = params.get("cursor")
+        resp = MagicMock()
+        resp.status_code = 200
+        if "/historical/fills" in url:
+            resp.json.return_value = {"fills": [], "cursor": None}
+        elif cursor == "page2":
+            resp.json.return_value = page2
+        else:
+            resp.json.return_value = page1
+        return resp
+
+    reconciler.session = MagicMock()
+    reconciler.session.get = MagicMock(side_effect=mock_get)
+
+    report = await reconciler.reconcile(start=datetime(2026, 11, 22, 10, 0, 0, tzinfo=timezone.utc))
+
+    assert report.persisted == 3
+    # FIFO Realized PnL: sell 10 @ 60c matches buy 10 @ 40c => +200c ($2.00)
+    # (If replayed in reverse order, sell @ 60c matches buy @ 50c => +100c)
+    assert manager.get_realized_pnl("KXTEST") == 200.0
     assert manager.get_position("KXTEST") == 10
