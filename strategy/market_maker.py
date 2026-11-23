@@ -894,6 +894,7 @@ class AvellanedaStoikovBot:
                 from config import BASE_URL
                 from auth.kalshi_auth import get_auth_headers
                 from data.fill_reconciliation import FillReconciler
+                from datetime import datetime, timezone, timedelta
                 reconciler = FillReconciler(
                     self.inv_manager.fill_store,
                     BASE_URL,
@@ -901,7 +902,11 @@ class AvellanedaStoikovBot:
                     min_interval=0.1,
                     on_fill=self.inv_manager.apply_reconciled_fill,
                 )
-                report = await reconciler.reconcile()
+                recovery_lookback_seconds = 60.0
+                disconnect_time = datetime.now(timezone.utc) - timedelta(seconds=recovery_lookback_seconds)
+                session_start = getattr(self.inv_manager, "_session_start_time", disconnect_time)
+                reconcile_start = max(disconnect_time, session_start)
+                report = await reconciler.reconcile(start=reconcile_start)
                 logger.info(
                     "In-flight fill reconciliation completed: %s pages visited, %s records persisted.",
                     report.pages, report.persisted,

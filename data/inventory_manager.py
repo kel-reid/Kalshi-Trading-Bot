@@ -12,6 +12,8 @@ import asyncio
 import os
 import math
 import time
+import threading
+from datetime import datetime, timezone
 import certifi
 from decimal import Decimal
 from typing import Dict, Any, Optional, List
@@ -54,6 +56,8 @@ class InventoryManager:
         self._fill_worker = None
         self._fill_retry_interval = 1.0
         self._fill_init_task = None
+        self._fill_lock = threading.Lock()
+        self._session_start_time: datetime = datetime.now(timezone.utc)
         self._seen_fill_ids = {}
         self.balance_cents: float = 0.0
         self.positions_value_cents: float = 0.0
@@ -412,7 +416,6 @@ class InventoryManager:
                         BASE_URL,
                         get_auth_headers,
                         min_interval=0.1,
-                        on_fill=self.apply_reconciled_fill,
                     )
 
                 try:
@@ -454,28 +457,44 @@ class InventoryManager:
         processed by the live WebSocket ingestion path.
         Deduplicates against self._seen_fill_ids so fills are never double-counted.
         """
-        if not isinstance(fill, dict):
-            return False
-        identities = []
-        for key in ("fill_id", "trade_id"):
-            value = fill.get(key)
-            if value is not None and isinstance(value, str) and value.strip():
-                identities.append((key, value))
-        if not identities:
-            return False
+        with self._fill_lock:
+            if not isinstance(fill, dict):
+                raise ValueError(f"Reconciled fill payload must be a dict, got {type(fill)}")
 
-        # If any identity is already recorded, this fill was already processed
-        if any(identity in self._seen_fill_ids for identity in identities):
-            return False
+            # Check timestamp against session start time to prevent historical replay
+            raw_ts = fill.get("created_time")
+            if raw_ts is None:
+                raw_ts = fill.get("ts")
+            if raw_ts is not None:
+                from data.fill_reconciliation import aware_datetime
+                fill_dt = aware_datetime(raw_ts)
+                if fill_dt < self._session_start_time:
+                    logger.debug(
+                        "Ignoring historical fill %s from %s before session start %s",
+                        fill.get("fill_id"), fill_dt, self._session_start_time,
+                    )
+                    return False
 
-        content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
-        count_before = self._fill_count
-        self._handle_fill(fill)
-        if self._fill_count > count_before:
-            record = {"content": content, "ids": dict(identities)}
-            self._seen_fill_ids.update({identity: record for identity in identities})
-            return True
-        return False
+            identities = []
+            for key in ("fill_id", "trade_id"):
+                value = fill.get(key)
+                if value is not None and isinstance(value, str) and value.strip():
+                    identities.append((key, value))
+            if not identities:
+                raise ValueError(f"Reconciled fill missing fill_id and trade_id: {fill}")
+
+            # If any identity is already recorded, this fill was already processed
+            if any(identity in self._seen_fill_ids for identity in identities):
+                return False
+
+            content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
+            count_before = self._fill_count
+            self._handle_fill(fill)
+            if self._fill_count > count_before:
+                record = {"content": content, "ids": dict(identities)}
+                self._seen_fill_ids.update({identity: record for identity in identities})
+                return True
+            raise ValueError(f"Reconciled fill was dropped or invalid: {fill}")
 
     async def subscribe(self, auto_reconcile: bool = False):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""
@@ -605,34 +624,35 @@ class InventoryManager:
                         raise FatalIngestionError("failed to durably spool fill") from exc
                     self._fill_wakeup.set()
                 try:
-                    if not isinstance(fill, dict):
-                        raise ValueError("fill payload must be an object")
-                    identities = []
-                    for key in ("fill_id", "trade_id"):
-                        value = fill.get(key)
-                        if value is not None:
-                            if not isinstance(value, str) or not value.strip():
-                                raise ValueError(f"invalid {key}")
-                            identities.append((key, value))
-                    if not any(key == "trade_id" for key, _ in identities):
-                        raise ValueError("WebSocket fill requires trade_id")
-                    content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
-                    existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
-                    if existing:
-                        if any(previous["content"] != content or any(
-                            key in previous["ids"] and previous["ids"][key] != value
-                            for key, value in identities
-                        ) for previous in existing) or any(previous is not existing[0] for previous in existing):
-                            raise ValueError("conflicting fill identity")
-                        existing[0]["ids"].update(identities)
-                        self._seen_fill_ids.update({identity: existing[0] for identity in identities})
-                        return
-                    count_before = self._fill_count
-                    self._handle_fill(fill)
-                    if self._fill_count == count_before:
-                        raise ValueError("invalid inventory fill")
-                    record = {"content": content, "ids": dict(identities)}
-                    self._seen_fill_ids.update({identity: record for identity in identities})
+                    with self._fill_lock:
+                        if not isinstance(fill, dict):
+                            raise ValueError("fill payload must be an object")
+                        identities = []
+                        for key in ("fill_id", "trade_id"):
+                            value = fill.get(key)
+                            if value is not None:
+                                if not isinstance(value, str) or not value.strip():
+                                    raise ValueError(f"invalid {key}")
+                                identities.append((key, value))
+                        if not any(key == "trade_id" for key, _ in identities):
+                            raise ValueError("WebSocket fill requires trade_id")
+                        content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
+                        existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
+                        if existing:
+                            if any(previous["content"] != content or any(
+                                key in previous["ids"] and previous["ids"][key] != value
+                                for key, value in identities
+                            ) for previous in existing) or any(previous is not existing[0] for previous in existing):
+                                raise ValueError("conflicting fill identity")
+                            existing[0]["ids"].update(identities)
+                            self._seen_fill_ids.update({identity: existing[0] for identity in identities})
+                            return
+                        count_before = self._fill_count
+                        self._handle_fill(fill)
+                        if self._fill_count == count_before:
+                            raise ValueError("invalid inventory fill")
+                        record = {"content": content, "ids": dict(identities)}
+                        self._seen_fill_ids.update({identity: record for identity in identities})
                 except Exception as exc:
                     self._fill_failure = exc
                     raise FatalIngestionError("failed to process inventory fill") from exc

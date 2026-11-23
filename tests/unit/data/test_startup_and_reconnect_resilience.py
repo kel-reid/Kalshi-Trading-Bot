@@ -1,11 +1,14 @@
 import asyncio
 import json
 import os
+import threading
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from data.fill_spool import FillSpool
+from data.fill_reconciliation import FillReconciler, ReconciliationError
 from data.inventory_manager import InventoryManager
 from data.pnl_tracker import PnLTracker
 from data.websocket_client import FatalIngestionError
@@ -271,4 +274,139 @@ def test_send_alert_sync_throttling():
 
         # Second identical alert within cooldown is suppressed
         send_alert_sync("Order manager emergency shutdown initiated.", cooldown_seconds=60)
+        assert mock_post.call_count == 1
+
+
+def test_apply_reconciled_fill_ignores_historical_fills_prior_to_session_start():
+    """Verify apply_reconciled_fill ignores historical fills dated before session start."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Historical fill before session start should be dropped
+    historical_fill = {
+        "fill_id": "f-old",
+        "trade_id": "t-old",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.45",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-22T11:59:59Z",
+    }
+    applied_old = manager.apply_reconciled_fill(historical_fill)
+    assert applied_old is False
+    assert pnl.get_total_fees("KXTEST") == 0.0
+    assert manager.get_position("KXTEST") == 0
+
+    # 2. Session fill after session start should be applied
+    session_fill = {
+        "fill_id": "f-new",
+        "trade_id": "t-new",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 5,
+        "price_dollars": "0.45",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-22T12:00:01Z",
+    }
+    applied_new = manager.apply_reconciled_fill(session_fill)
+    assert applied_new is True
+    assert pnl.get_total_fees("KXTEST") == 5.0
+    assert manager.get_position("KXTEST") == 5
+
+
+def test_apply_reconciled_fill_concurrent_delivery_is_threadsafe():
+    """Verify concurrent delivery of identical fill via REST and live threads applies exactly once."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    fill_payload = {
+        "fill_id": "f-race-1",
+        "trade_id": "t-race-1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.10",
+        "created_time": "2026-11-22T12:05:00Z",
+    }
+
+    results = []
+    def runner():
+        try:
+            res = manager.apply_reconciled_fill(dict(fill_payload))
+            results.append(res)
+        except Exception as e:
+            results.append(e)
+
+    threads = [threading.Thread(target=runner) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one thread should successfully apply the fill; others should return False
+    assert results.count(True) == 1
+    assert results.count(False) == 9
+    assert pnl.get_total_fees("KXTEST") == 10.0
+    assert manager.get_position("KXTEST") == 10
+
+
+@pytest.mark.asyncio
+async def test_reconciler_on_fill_failure_escalates_and_fails_closed():
+    """Verify FillReconciler fails closed with ReconciliationError when on_fill callback fails."""
+    store = MagicMock()
+    store.record = MagicMock(return_value=True)
+
+    def failing_callback(fill):
+        raise ValueError("Accounting engine arithmetic overflow")
+
+    reconciler = FillReconciler(
+        store,
+        "https://example.invalid",
+        lambda m, p: {},
+        min_interval=0,
+        on_fill=failing_callback,
+    )
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "fills": [{"fill_id": "f-err", "created_time": "2026-11-22T12:00:00Z"}],
+        "cursor": None,
+    }
+    reconciler.session = MagicMock()
+    reconciler.session.get = MagicMock(return_value=mock_response)
+
+    with pytest.raises(ReconciliationError, match="Accounting engine arithmetic overflow") as exc_info:
+        await reconciler.reconcile()
+
+    assert exc_info.value.report.failed == 1
+    assert any("Fill accounting callback failed" in w for w in exc_info.value.report.warnings)
+
+
+def test_concurrent_alerts_prevent_duplicate_dispatches():
+    """Verify concurrent alert calls across threads synchronize reservation and prevent duplicate posts."""
+    reset_alert_history()
+    with patch("utils.alerting.ALERT_WEBHOOK_URL", "https://mock.webhook.test/alerts"), \
+         patch("requests.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200)
+
+        def send_call():
+            send_alert_sync("Concurrent alert test event", cooldown_seconds=300)
+
+        threads = [threading.Thread(target=send_call) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly 1 HTTP POST should have been dispatched; remaining 9 were throttled
         assert mock_post.call_count == 1

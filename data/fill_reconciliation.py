@@ -215,8 +215,12 @@ class FillReconciler:
                         if self.on_fill is not None:
                             try:
                                 self.on_fill(fill)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                report.failed += 1
+                                if first_persistence_error is None:
+                                    first_persistence_error = exc
+                                    report.warnings.append(f"Fill accounting callback failed: {exc}")
+                                raise
                     if not next_cursor:
                         break
                     seen.add(next_cursor)

@@ -11,6 +11,7 @@ import logging
 import json
 import time
 import re
+import threading
 import requests
 from typing import Dict, Tuple, Optional
 
@@ -20,6 +21,9 @@ logger = logging.getLogger("Alerting")
 
 DEFAULT_ALERT_COOLDOWN_SECONDS: float = 300.0
 
+# Module lock to synchronize throttle check and reservation across concurrent threads / async tasks
+_alert_lock = threading.Lock()
+
 # In-memory map: alert_key -> (last_sent_timestamp, suppressed_count)
 _alert_history: Dict[str, Tuple[float, int]] = {}
 
@@ -27,7 +31,8 @@ _alert_history: Dict[str, Tuple[float, int]] = {}
 def reset_alert_history() -> None:
     """Clear in-memory alert history. Primarily used in unit tests."""
     global _alert_history
-    _alert_history.clear()
+    with _alert_lock:
+        _alert_history.clear()
 
 
 def _normalize_alert_key(message: str) -> str:
@@ -66,22 +71,23 @@ async def send_alert(
     prior_entry: Optional[Tuple[float, int]] = None
 
     if throttle_active:
-        entry = _alert_history.get(key)
-        if entry is not None:
-            last_sent, count = entry
-            elapsed = now - last_sent
-            if elapsed < cooldown_seconds:
-                _alert_history[key] = (last_sent, count + 1)
-                logger.debug(
-                    f"Alert throttled (key='{key}', suppressed {count + 1} times, {elapsed:.1f}s / {cooldown_seconds}s): {message}"
-                )
-                return
-            else:
-                suppressed_count = count
-                prior_entry = (last_sent, count)
+        with _alert_lock:
+            entry = _alert_history.get(key)
+            if entry is not None:
+                last_sent, count = entry
+                elapsed = now - last_sent
+                if elapsed < cooldown_seconds:
+                    _alert_history[key] = (last_sent, count + 1)
+                    logger.debug(
+                        f"Alert throttled (key='{key}', suppressed {count + 1} times, {elapsed:.1f}s / {cooldown_seconds}s): {message}"
+                    )
+                    return
+                else:
+                    suppressed_count = count
+                    prior_entry = (last_sent, count)
 
-        # Atomically reserve the cooldown key before network I/O so concurrent calls are throttled immediately
-        _alert_history[key] = (now, 0)
+            # Atomically reserve the cooldown key before network I/O so concurrent calls are throttled immediately
+            _alert_history[key] = (now, 0)
 
     # Prepend summary if repeating notifications were suppressed during the cooldown window
     delivered_message = message
@@ -133,15 +139,16 @@ async def send_alert(
     finally:
         # If webhook delivery failed, roll back the reservation while preserving any in-flight suppressions
         if throttle_active and not delivery_succeeded:
-            _, in_flight_suppressed = _alert_history.get(key, (now, 0))
-            if prior_entry is None:
-                if in_flight_suppressed > 0:
-                    _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+            with _alert_lock:
+                _, in_flight_suppressed = _alert_history.get(key, (now, 0))
+                if prior_entry is None:
+                    if in_flight_suppressed > 0:
+                        _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+                    else:
+                        _alert_history.pop(key, None)
                 else:
-                    _alert_history.pop(key, None)
-            else:
-                prior_last_sent, _ = prior_entry
-                _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
+                    prior_last_sent, _ = prior_entry
+                    _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
 
 
 def send_alert_sync(
@@ -161,21 +168,22 @@ def send_alert_sync(
     prior_entry: Optional[Tuple[float, int]] = None
 
     if throttle_active:
-        entry = _alert_history.get(key)
-        if entry is not None:
-            last_sent, count = entry
-            elapsed = now - last_sent
-            if elapsed < cooldown_seconds:
-                _alert_history[key] = (last_sent, count + 1)
-                logger.debug(
-                    f"Alert throttled (key='{key}', suppressed {count + 1} times, {elapsed:.1f}s / {cooldown_seconds}s): {message}"
-                )
-                return
-            else:
-                suppressed_count = count
-                prior_entry = (last_sent, count)
+        with _alert_lock:
+            entry = _alert_history.get(key)
+            if entry is not None:
+                last_sent, count = entry
+                elapsed = now - last_sent
+                if elapsed < cooldown_seconds:
+                    _alert_history[key] = (last_sent, count + 1)
+                    logger.debug(
+                        f"Alert throttled (key='{key}', suppressed {count + 1} times, {elapsed:.1f}s / {cooldown_seconds}s): {message}"
+                    )
+                    return
+                else:
+                    suppressed_count = count
+                    prior_entry = (last_sent, count)
 
-        _alert_history[key] = (now, 0)
+            _alert_history[key] = (now, 0)
 
     delivered_message = message
     if suppressed_count > 0:
@@ -208,15 +216,16 @@ def send_alert_sync(
         logger.error(f"Failed to send webhook alert: {e}")
     finally:
         if throttle_active and not delivery_succeeded:
-            _, in_flight_suppressed = _alert_history.get(key, (now, 0))
-            if prior_entry is None:
-                if in_flight_suppressed > 0:
-                    _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+            with _alert_lock:
+                _, in_flight_suppressed = _alert_history.get(key, (now, 0))
+                if prior_entry is None:
+                    if in_flight_suppressed > 0:
+                        _alert_history[key] = (0.0, in_flight_suppressed + suppressed_count)
+                    else:
+                        _alert_history.pop(key, None)
                 else:
-                    _alert_history.pop(key, None)
-            else:
-                prior_last_sent, _ = prior_entry
-                _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
+                    prior_last_sent, _ = prior_entry
+                    _alert_history[key] = (prior_last_sent, in_flight_suppressed + suppressed_count)
 
 
 
