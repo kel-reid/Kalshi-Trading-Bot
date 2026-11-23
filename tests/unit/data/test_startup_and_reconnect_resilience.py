@@ -410,3 +410,95 @@ def test_concurrent_alerts_prevent_duplicate_dispatches():
 
         # Exactly 1 HTTP POST should have been dispatched; remaining 9 were throttled
         assert mock_post.call_count == 1
+
+
+def test_signal_received_while_alert_lock_held_does_not_deadlock():
+    """Verify that a termination signal received while _alert_lock is held does not deadlock."""
+    from utils.alerting import _alert_lock, send_alert_sync
+    import signal
+
+    shutdown_event = asyncio.Event()
+    shutdown_in_progress = False
+
+    def handle_shutdown(signum, frame=None):
+        nonlocal shutdown_in_progress
+        if shutdown_in_progress:
+            return
+        shutdown_in_progress = True
+        shutdown_event.set()
+
+    # Acquire the alert lock simulating the main thread in an active alerting call
+    with _alert_lock:
+        # Simulate signal arrival: handler only marks state and triggers event
+        handle_shutdown(signal.SIGINT)
+        assert shutdown_event.is_set()
+
+        # Because _alert_lock is reentrant (RLock), even re-entering on the same thread succeeds
+        with patch("utils.alerting.ALERT_WEBHOOK_URL", ""):
+            send_alert_sync("Test alert inside lock context", cooldown_seconds=0, bypass_throttle=True)
+
+
+@pytest.mark.asyncio
+async def test_market_maker_reconnect_delayed_recovery_scans_from_session_start():
+    """Verify MarketMaker recovery scans from session start even if recovery is delayed by minutes."""
+    bot = AvellanedaStoikovBot(ticker="TEST")
+    bot.inv_manager.fill_store = MagicMock()
+    bot.inv_manager.fill_store.initialize = MagicMock(return_value=True)
+    bot.ws_client.is_connected = True
+    bot.ws_client.connection_generation = 2
+
+    # Set session start 1 hour in the past
+    session_start = datetime(2026, 11, 22, 10, 0, 0, tzinfo=timezone.utc)
+    bot.inv_manager._session_start_time = session_start
+
+    bot._cancel_all_quotes = AsyncMock(return_value=True)
+    bot.inv_manager.hydrate = AsyncMock(return_value=True)
+    bot.om.sync_and_recover_state = AsyncMock()
+
+    mock_report = MagicMock(pages=1, persisted=0)
+    with patch("data.fill_reconciliation.FillReconciler.reconcile", new_callable=AsyncMock, return_value=mock_report) as mock_reconcile:
+        await bot._handle_connection_change(old_generation=1)
+
+    # Reconciler must be called with start=session_start, NOT truncated to 60 seconds
+    mock_reconcile.assert_awaited_once_with(start=session_start)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_live_websocket_and_rest_fill_delivery():
+    """Verify concurrent delivery of the same fill via live WebSocket and REST recovery is serialized and applied once."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    fill_payload = {
+        "fill_id": "f-race-dual",
+        "trade_id": "t-race-dual",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.10",
+        "created_time": "2026-11-22T12:05:00Z",
+    }
+
+    # Task 1: Live WebSocket delivery via _handle_message
+    async def live_delivery():
+        await manager._handle_message({"type": "fill", "msg": dict(fill_payload)})
+
+    # Task 2: REST delivery via apply_reconciled_fill running in a worker thread
+    async def rest_delivery():
+        return await asyncio.to_thread(manager.apply_reconciled_fill, dict(fill_payload))
+
+    results = await asyncio.gather(live_delivery(), rest_delivery(), return_exceptions=True)
+
+    # Neither should have raised an exception
+    for r in results:
+        if isinstance(r, Exception):
+            raise r
+
+    # Accounting invariants: fill applied exactly once
+    assert manager._fill_count == 1
+    assert pnl.get_total_fees("KXTEST") == 10.0
+    assert manager.get_position("KXTEST") == 10

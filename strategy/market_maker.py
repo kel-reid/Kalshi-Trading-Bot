@@ -902,10 +902,8 @@ class AvellanedaStoikovBot:
                     min_interval=0.1,
                     on_fill=self.inv_manager.apply_reconciled_fill,
                 )
-                recovery_lookback_seconds = 60.0
-                disconnect_time = datetime.now(timezone.utc) - timedelta(seconds=recovery_lookback_seconds)
-                session_start = getattr(self.inv_manager, "_session_start_time", disconnect_time)
-                reconcile_start = max(disconnect_time, session_start)
+                # Scan from session start to guarantee covering the entire disconnect gap regardless of recovery delay
+                reconcile_start = getattr(self.inv_manager, "_session_start_time", None)
                 report = await reconciler.reconcile(start=reconcile_start)
                 logger.info(
                     "In-flight fill reconciliation completed: %s pages visited, %s records persisted.",

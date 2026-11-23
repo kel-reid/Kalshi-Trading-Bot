@@ -22,7 +22,7 @@ logger = logging.getLogger("Alerting")
 DEFAULT_ALERT_COOLDOWN_SECONDS: float = 300.0
 
 # Module lock to synchronize throttle check and reservation across concurrent threads / async tasks
-_alert_lock = threading.Lock()
+_alert_lock = threading.RLock()
 
 # In-memory map: alert_key -> (last_sent_timestamp, suppressed_count)
 _alert_history: Dict[str, Tuple[float, int]] = {}
