@@ -43,6 +43,7 @@ class MarketPnL:
     session_start_open_lots: List[InventoryLot] = field(default_factory=list)
     session_start_reconciliation_adj_cents: float = 0.0  # Reconciliation adjustment baseline at rotation session start
     rotation_count: int = 0  # Number of market rotations (0 = initial session)
+    reconciliation_events: List[Dict[str, Any]] = field(default_factory=list)
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -161,7 +162,13 @@ class PnLTracker:
             gross = 0.0
         return gross - allocated_fee
 
-    def reconcile_inventory(self, ticker: str, target_position: Union[int, float]):
+    def reconcile_inventory(
+        self,
+        ticker: str,
+        target_position: Union[int, float],
+        timestamp: Optional[float] = None,
+        record_event: bool = True,
+    ):
         """
         Reconciles the tracker's lot-based inventory against authoritative REST portfolio positions.
         - Trims or flattens lots if authoritative position is smaller.
@@ -173,6 +180,16 @@ class PnLTracker:
         - Appends an uncosted lot if position has expanded or flipped across zero.
         """
         market = self.get_or_create_market(ticker)
+
+        if record_event:
+            event_ts = timestamp if timestamp is not None else time.time()
+            market.reconciliation_events.append({
+                "target_position": target_position,
+                "timestamp": event_ts,
+                "rotation_session_id": market.rotation_session_id,
+                "mid_price": market.last_mid_price,
+            })
+
         current_position = self.get_open_inventory(ticker)
         delta = round(target_position - current_position, 4)
 

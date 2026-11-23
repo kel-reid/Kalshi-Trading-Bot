@@ -1195,4 +1195,152 @@ async def test_rotation_session_rebuild_does_not_reseed_closed_zero_pnl_startup_
     assert pnl.get_market_summary("KXTEST")["session_realized_pnl_cents"] == 0.0
 
 
+@pytest.mark.asyncio
+async def test_live_fill_periodic_reconciliation_and_subsequent_rest_recovery_accounting():
+    """
+    Verify that when a live fill occurs, periodic position reconciliation closes the lot
+    with a synthetic MTM adjustment due to a missed sell fill, and subsequent REST recovery
+    recovers that missed sell fill, the rebuild supersedes the synthetic reconciliation
+    adjustment so the same position change contributes realized PnL exactly once.
+
+    Scenario:
+    1. Live fill path: Buy 10 @ 50c (fee 0c). Orderbook mid price is 60c.
+       -> Position = 10, open lot = 10 @ 50c, Realized PnL = 0c.
+    2. Missed sell on exchange: Sell 10 @ 60c occurs, but live WebSocket message is missed.
+    3. Periodic hydration / reconciliation:
+       -> Authoritative REST positions shows flat (0 contracts).
+       -> reconcile_inventory(0) closes the 10 contracts @ 50c against mid 60c.
+       -> Realizes +100c reconciliation_adjustment_cents. Realized PnL = 100c.
+    4. Subsequent REST recovery:
+       -> Fill reconciler discovers missed fill: Sell 10 @ 60c (fee 0c).
+       -> Calls apply_reconciled_fill(sell_fill).
+       -> Rebuild accounting runs.
+    5. Invariants:
+       -> Realized PnL must be EXACTLY 100c (NOT 200c!).
+       -> reconciliation_adjustment_cents must be 0c (superseded by actual fill).
+       -> Position must be 0.
+       -> Open lots must be 0.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Live fill: Buy 10 @ 50c
+    buy_fill = {
+        "fill_id": "live-buy-1",
+        "trade_id": "live-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    pnl.update_mid_price("KXTEST", 60.0)
+    await manager._handle_message({"type": "fill", "msg": buy_fill})
+    assert manager.get_position("KXTEST") == 10
+    assert manager.get_realized_pnl("KXTEST") == 0.0
+
+    # 2. Exchange executes Sell 10 @ 60c, but live WS drops.
+    # Periodic position hydration sees position = 0 on exchange at 09:31:30.
+    recon_ts = datetime(2026, 11, 23, 9, 31, 30, tzinfo=timezone.utc).timestamp()
+    assert manager._apply_positions([], is_startup=False, timestamp=recon_ts) is True
+    assert manager.get_position("KXTEST") == 0
+    s_recon = pnl.get_market_summary("KXTEST")
+    assert s_recon["realized_pnl_cents"] == 100.0
+    assert s_recon["reconciliation_adjustment_cents"] == 100.0
+    assert len(pnl.get_or_create_market("KXTEST").open_lots) == 0
+
+    # 3. Subsequent REST recovery delivers the missed sell fill: Sell 10 @ 60c
+    sell_fill = {
+        "fill_id": "rec-sell-1",
+        "trade_id": "rec-t1",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:31:00Z",
+    }
+    assert manager.apply_reconciled_fill(sell_fill) is True
+
+    # 4. Verify invariants: exactly 100c realized PnL, 0c duplicate reconciliation adjustment
+    s_final = pnl.get_market_summary("KXTEST")
+    assert s_final["realized_pnl_cents"] == 100.0  # MUST NOT be 200.0!
+    assert s_final["reconciliation_adjustment_cents"] == 0.0  # Superseded by actual fill!
+    assert s_final["session_realized_pnl_cents"] == 100.0
+    assert manager.get_position("KXTEST") == 0
+    assert len(pnl.get_or_create_market("KXTEST").open_lots) == 0
+
+
+@pytest.mark.asyncio
+async def test_live_fill_periodic_reconciliation_and_partial_rest_recovery_accounting():
+    """
+    Verify that when only a partial fill is recovered via REST after periodic hydration
+    reconciled the full position, the recovered portion contributes fill PnL and the
+    unrecovered portion maintains its residual reconciliation adjustment.
+
+    Scenario:
+    1. Live fill: Buy 10 @ 50c. Mid = 60c.
+    2. Periodic hydration sees flat position (0 contracts). Reconciles 10 contracts -> 100c adj.
+    3. REST recovery only recovers Sell 6 @ 60c (4 contracts remain unrecovered).
+    4. Invariants:
+       -> Realized PnL = 60c (from 6 filled contracts) + 40c (from 4 residual reconciled contracts) = 100c.
+       -> reconciliation_adjustment_cents = 40c (for the 4 unrecovered contracts).
+       -> Position = 0.
+       -> Open lots = 0.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Live fill: Buy 10 @ 50c
+    buy_fill = {
+        "fill_id": "part-buy-1",
+        "trade_id": "part-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    pnl.update_mid_price("KXTEST", 60.0)
+    await manager._handle_message({"type": "fill", "msg": buy_fill})
+    assert manager.get_position("KXTEST") == 10
+
+    # 2. Periodic hydration reconciles position to 0 at 09:31:30
+    recon_ts = datetime(2026, 11, 23, 9, 31, 30, tzinfo=timezone.utc).timestamp()
+    assert manager._apply_positions([], is_startup=False, timestamp=recon_ts) is True
+    assert manager.get_position("KXTEST") == 0
+
+    # 3. REST recovery only recovers Sell 6 @ 60c
+    partial_sell = {
+        "fill_id": "part-sell-1",
+        "trade_id": "part-t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 6,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:31:00Z",
+    }
+    assert manager.apply_reconciled_fill(partial_sell) is True
+
+    # 4. Verify invariants:
+    # 6 contracts closed by fill @ 60c (60c) + 4 contracts closed by residual reconciliation @ 60c (40c) = 100c
+    s_final = pnl.get_market_summary("KXTEST")
+    assert s_final["realized_pnl_cents"] == 100.0
+    assert s_final["reconciliation_adjustment_cents"] == 40.0
+    assert manager.get_position("KXTEST") == 0
+    assert len(pnl.get_or_create_market("KXTEST").open_lots) == 0
+
+
+
 

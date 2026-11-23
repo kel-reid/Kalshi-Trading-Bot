@@ -219,7 +219,12 @@ class InventoryManager:
             logger.error(f"Failed to fetch positions: {response.text}")
             return None
 
-    def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False) -> bool:
+    def _apply_positions(
+        self,
+        market_positions: List[Dict[str, Any]],
+        is_startup: bool = False,
+        timestamp: Optional[float] = None,
+    ) -> bool:
         """Applies REST positions to state, running on the event loop thread."""
         # Atomically validate and parse all entries before mutating state or PnL lots
         validated_entries = []
@@ -251,6 +256,16 @@ class InventoryManager:
                 return False
             validated_entries.append((ticker.strip(), position, pos))
 
+        if timestamp is not None:
+            recon_time = timestamp
+        else:
+            now = time.time()
+            if self._recorded_fills:
+                max_fill_ts = max(f["timestamp"] for f in self._recorded_fills)
+                recon_time = max(now, max_fill_ts + 0.001)
+            else:
+                recon_time = now
+
         new_positions = {}
         for ticker, position, pos in validated_entries:
             if position != 0:
@@ -268,13 +283,13 @@ class InventoryManager:
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
                     self._initial_seeded_inventory[ticker] = (position, cost_basis)
                 else:
-                    self.pnl_tracker.reconcile_inventory(ticker, position)
+                    self.pnl_tracker.reconcile_inventory(ticker, position, timestamp=recon_time)
 
         # For any previously tracked market that is now flat (not in REST active positions)
         if not is_startup:
             for active_ticker in list(self.positions.keys()):
                 if active_ticker not in new_positions:
-                    self.pnl_tracker.reconcile_inventory(active_ticker, 0)
+                    self.pnl_tracker.reconcile_inventory(active_ticker, 0, timestamp=recon_time)
 
         # Identify all tickers affected by this hydration/reconciliation
         all_affected_tickers = set(new_positions.keys()) | (set(self.positions.keys()) if not is_startup else set())
@@ -662,6 +677,9 @@ class InventoryManager:
             self._handle_fill(fill)
             if self._fill_count > count_before:
                 self._record_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="rest")
+                ticker = fill.get("market_ticker", "").strip()
+                if ticker:
+                    self._rebuild_ticker_accounting(ticker)
                 return True
             raise ValueError(f"Reconciled fill was dropped or invalid: {fill}")
 
@@ -669,7 +687,7 @@ class InventoryManager:
         """
         Rebuilds FIFO lot matching and realized PnL for a ticker from scratch in
         strictly chronological order (ts, exchange_index) using recorded fills
-        aligned with the current rotation session baseline.
+        and reconciliation events aligned with the current rotation session baseline.
         """
         market = self.pnl_tracker.get_or_create_market(ticker)
 
@@ -679,9 +697,6 @@ class InventoryManager:
         session_start_fees = market.session_start_fees_cents
         session_start_recon_adj = market.session_start_reconciliation_adj_cents
         last_mid = market.last_mid_price
-
-        # Reconciliation adjustments realized during this specific rotation session
-        session_recon_adj = round(market.reconciliation_adjustment_cents - session_start_recon_adj, 4)
 
         # 2. Reset lot list and accumulators to session baseline
         market.open_lots = [
@@ -697,8 +712,9 @@ class InventoryManager:
             )
             for l in market.session_start_open_lots
         ]
-        market.realized_pnl_cents = round(session_start_realized + session_recon_adj, 4)
+        market.realized_pnl_cents = round(session_start_realized, 4)
         market.total_fees_cents = round(session_start_fees, 4)
+        market.reconciliation_adjustment_cents = round(session_start_recon_adj, 4)
         market.total_volume_contracts = 0
         market.round_trips_count = 0
         market.winning_trades_count = 0
@@ -714,7 +730,7 @@ class InventoryManager:
                 init_pos, init_cost_basis = seeded
                 self.pnl_tracker.seed_initial_inventory(ticker, init_pos, cost_basis_cents=init_cost_basis)
 
-        # 3. Extract and sort recorded fills for THIS ticker and rotation session in ascending chronological order
+        # 3. Extract recorded fills for THIS ticker and rotation session
         ticker_fills = [
             f for f in self._recorded_fills
             if f["ticker"] == ticker and (
@@ -722,21 +738,61 @@ class InventoryManager:
                 (f.get("rotation_session_id") is None and market.rotation_count == 0)
             )
         ]
-        ticker_fills.sort(key=lambda f: (f["timestamp"], f.get("exchange_index", 0)))
 
-        # 4. Replay fills through FIFO matching
+        # 4. Extract recorded reconciliation events for THIS ticker and rotation session
+        ticker_recons = [
+            e for e in market.reconciliation_events
+            if e.get("rotation_session_id") == session_id or
+            (e.get("rotation_session_id") is None and market.rotation_count == 0)
+        ]
+
+        # 5. Build a unified chronological timeline
+        timeline = []
         for f in ticker_fills:
-            self.pnl_tracker.record_fill(
-                ticker=ticker,
-                action=f["action"],
-                side=f["side"],
-                count=f["count"],
-                price_cents=f["price_cents"],
-                fee_cents=f["fee_cents"],
-                timestamp=f["timestamp"],
-            )
+            timeline.append({
+                "type": "fill",
+                "timestamp": f["timestamp"],
+                "exchange_index": f.get("exchange_index", 0),
+                "data": f,
+            })
+        for r in ticker_recons:
+            timeline.append({
+                "type": "reconciliation",
+                "timestamp": r["timestamp"],
+                "exchange_index": float("inf"),
+                "data": r,
+            })
 
-        # 5. Recompute mark-to-market unrealized PnL against last known mid-price
+        timeline.sort(key=lambda ev: (ev["timestamp"], ev["exchange_index"]))
+
+        # 6. Replay timeline in chronological order
+        for ev in timeline:
+            if ev["type"] == "fill":
+                f = ev["data"]
+                self.pnl_tracker.record_fill(
+                    ticker=ticker,
+                    action=f["action"],
+                    side=f["side"],
+                    count=f["count"],
+                    price_cents=f["price_cents"],
+                    fee_cents=f["fee_cents"],
+                    timestamp=f["timestamp"],
+                )
+            elif ev["type"] == "reconciliation":
+                r = ev["data"]
+                if r.get("mid_price") is not None:
+                    market.last_mid_price = r["mid_price"]
+                self.pnl_tracker.reconcile_inventory(
+                    ticker=ticker,
+                    target_position=r["target_position"],
+                    timestamp=r["timestamp"],
+                    record_event=False,
+                )
+
+        # 7. Synchronize manager positions from replayed inventory
+        self.positions[ticker] = self.pnl_tracker.get_open_inventory(ticker)
+
+        # 8. Recompute mark-to-market unrealized PnL against last known mid-price
         if last_mid is not None:
             self.pnl_tracker.update_mid_price(ticker, last_mid)
         else:
@@ -1128,9 +1184,13 @@ class InventoryManager:
         }
         self._recorded_fills.append(fill_entry)
 
-        if is_out_of_order:
+        has_recon_adj = round(market.reconciliation_adjustment_cents - market.session_start_reconciliation_adj_cents, 4) != 0.0
+        has_recon_events = bool(market.reconciliation_events)
+
+        if is_out_of_order or has_recon_adj or has_recon_events:
             logger.info(
-                f"Detected out-of-order fill for {ticker} (ts={fill_time:.3f} < latest recorded). "
+                f"Detected out-of-order fill or reconciliation adjustments for {ticker} "
+                f"(out_of_order={is_out_of_order}, has_recon_adj={has_recon_adj}, has_recon_events={has_recon_events}). "
                 f"Rebuilding FIFO lot accounting in chronological order across {len(self._recorded_fills)} fills."
             )
             self._rebuild_ticker_accounting(ticker)
