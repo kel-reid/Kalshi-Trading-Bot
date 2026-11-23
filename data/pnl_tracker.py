@@ -41,6 +41,8 @@ class MarketPnL:
     session_start_realized_cents: float = 0.0  # Realized PnL baseline at rotation session start
     session_start_fees_cents: float = 0.0  # Total fees baseline at rotation session start
     session_start_open_lots: List[InventoryLot] = field(default_factory=list)
+    session_start_reconciliation_adj_cents: float = 0.0  # Reconciliation adjustment baseline at rotation session start
+    rotation_count: int = 0  # Number of market rotations (0 = initial session)
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -72,8 +74,10 @@ class PnLTracker:
         """
         market = self.get_or_create_market(ticker)
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
+        market.rotation_count += 1
         market.session_start_realized_cents = market.realized_pnl_cents
         market.session_start_fees_cents = market.total_fees_cents
+        market.session_start_reconciliation_adj_cents = market.reconciliation_adjustment_cents
         market.session_start_open_lots = [
             InventoryLot(
                 lot_id=l.lot_id,
@@ -524,6 +528,8 @@ class PnLTracker:
             "total_fees_cents": total_fees,
             "session_fees_cents": session_fees,
             "reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents, 4),
+            "session_reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents - market.session_start_reconciliation_adj_cents, 4),
+            "rotation_count": market.rotation_count,
             "session_realized_pnl_cents": session_realized,
             "net_inventory": net_inventory,
             "open_lots_count": len(market.open_lots),

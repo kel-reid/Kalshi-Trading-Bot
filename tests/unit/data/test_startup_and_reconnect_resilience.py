@@ -1069,3 +1069,130 @@ async def test_rotation_session_accounting_rebuild_prevents_double_counting():
     assert market.open_lots[0].count == 1
 
 
+@pytest.mark.asyncio
+async def test_rotation_session_accounting_rebuild_prevents_reconciliation_adjustment_double_counting():
+    """
+    Verify that reconciliation adjustments made prior to rotation are not double-counted
+    during a reconnect rebuild in a subsequent rotation session.
+
+    Scenario:
+    1. Session 1: Buy 10 @ 50c, update mid to 60c (+100c unrealized).
+    2. Inventory reconciliation adjusts position down to 0, realizing +100c as reconciliation_adjustment_cents.
+       -> Cumulative Realized: 100c, Cumulative Recon Adj: 100c.
+    3. Rotation occurs (reset_market_session):
+       -> Session baseline: session_start_realized = 100c, session_start_recon_adj = 100c.
+       -> Session 2 Realized Delta = 0c.
+    4. Rebuild accounting runs during Session 2:
+       -> Must NOT add cumulative reconciliation adjustment (100c) again on top of session_start_realized (100c).
+       -> Cumulative Realized must remain 100c (NOT 200c).
+       -> Session 2 Realized must remain 0c (NOT 100c).
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Trade and reconcile in Session 1
+    pnl.record_fill("KXTEST", action="buy", side="yes", count=10, price_cents=50.0, fee_cents=0.0)
+    pnl.update_mid_price("KXTEST", 60.0)
+    pnl.reconcile_inventory("KXTEST", target_position=0)
+
+    s1_summary = pnl.get_market_summary("KXTEST")
+    assert s1_summary["realized_pnl_cents"] == 100.0
+    assert s1_summary["reconciliation_adjustment_cents"] == 100.0
+    assert s1_summary["session_realized_pnl_cents"] == 100.0
+
+    # 2. Slate rotation: rotate away and later return to ticker
+    manager.reset_market_session("KXTEST")
+
+    s2_initial = pnl.get_market_summary("KXTEST")
+    assert s2_initial["realized_pnl_cents"] == 100.0
+    assert s2_initial["session_realized_pnl_cents"] == 0.0
+    assert s2_initial["rotation_count"] == 1
+
+    # 3. Rebuild accounting during Session 2
+    manager.rebuild_accounting("KXTEST")
+
+    s2_rebuilt = pnl.get_market_summary("KXTEST")
+    # Must NOT double count the prior 100c reconciliation adjustment!
+    assert s2_rebuilt["realized_pnl_cents"] == 100.0  # NOT 200.0
+    assert s2_rebuilt["session_realized_pnl_cents"] == 0.0  # NOT 100.0
+    assert s2_rebuilt["reconciliation_adjustment_cents"] == 100.0
+    assert s2_rebuilt["session_reconciliation_adjustment_cents"] == 0.0
+    assert manager.get_position("KXTEST") == 0
+
+
+@pytest.mark.asyncio
+async def test_rotation_session_rebuild_does_not_reseed_closed_zero_pnl_startup_position():
+    """
+    Verify that if startup inventory is closed at zero net PnL in session 1,
+    a later rotation session with zero realized PnL does not resurrect/re-seed
+    the closed startup position during a reconnect rebuild.
+
+    Scenario:
+    1. Cold startup: Hydrate 10 contracts @ 50c on KXTEST.
+       -> Initial seeded inventory = 10 @ 50c.
+       -> rotation_count = 0 (initial session).
+    2. Session 1: Close position at scratch (Sell 10 @ 50c, fee 0c).
+       -> Realized PnL = 0.0c.
+       -> Net Position = 0.
+       -> open_lots = [].
+    3. Rotation occurs (reset_market_session):
+       -> rotation_count = 1.
+       -> session_start_realized = 0.0c.
+       -> session_start_open_lots = [].
+    4. Rebuild accounting during Session 2:
+       -> Must NOT re-seed the 10 contracts from startup inventory!
+       -> Position must remain 0 (NOT 10).
+       -> open_lots must remain empty.
+       -> Realized PnL must remain 0.0c.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Startup hydration: Seed 10 contracts @ 50c
+    startup_positions = [
+        {"ticker": "KXTEST", "position": 10, "market_exposure": 500}
+    ]
+    assert manager._apply_positions(startup_positions, is_startup=True) is True
+    assert manager.get_position("KXTEST") == 10
+    market = pnl.get_or_create_market("KXTEST")
+    assert len(market.open_lots) == 1
+    assert market.rotation_count == 0
+
+    # 2. Session 1: Close position at scratch (Sell 10 @ 50c)
+    close_fill = {
+        "fill_id": "close-f1",
+        "trade_id": "close-t1",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    await manager._handle_message({"type": "fill", "msg": close_fill})
+    assert manager.get_position("KXTEST") == 0
+    assert manager.get_realized_pnl("KXTEST") == 0.0
+    assert len(market.open_lots) == 0
+
+    # 3. Rotate away and later return to ticker (Session 2)
+    manager.reset_market_session("KXTEST")
+    assert market.rotation_count == 1
+    assert market.session_start_realized_cents == 0.0
+    assert len(market.session_start_open_lots) == 0
+
+    # 4. Rebuild accounting in Session 2
+    manager.rebuild_accounting("KXTEST")
+
+    # Assert startup position is NOT restored
+    assert manager.get_position("KXTEST") == 0  # NOT 10!
+    assert len(market.open_lots) == 0           # NOT 1!
+    assert manager.get_realized_pnl("KXTEST") == 0.0
+    assert pnl.get_market_summary("KXTEST")["session_realized_pnl_cents"] == 0.0
+
+
+

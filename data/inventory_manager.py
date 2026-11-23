@@ -677,8 +677,11 @@ class InventoryManager:
         session_id = market.rotation_session_id
         session_start_realized = market.session_start_realized_cents
         session_start_fees = market.session_start_fees_cents
-        reconciliation_adj = market.reconciliation_adjustment_cents
+        session_start_recon_adj = market.session_start_reconciliation_adj_cents
         last_mid = market.last_mid_price
+
+        # Reconciliation adjustments realized during this specific rotation session
+        session_recon_adj = round(market.reconciliation_adjustment_cents - session_start_recon_adj, 4)
 
         # 2. Reset lot list and accumulators to session baseline
         market.open_lots = [
@@ -694,7 +697,7 @@ class InventoryManager:
             )
             for l in market.session_start_open_lots
         ]
-        market.realized_pnl_cents = round(session_start_realized + reconciliation_adj, 4)
+        market.realized_pnl_cents = round(session_start_realized + session_recon_adj, 4)
         market.total_fees_cents = round(session_start_fees, 4)
         market.total_volume_contracts = 0
         market.round_trips_count = 0
@@ -703,9 +706,9 @@ class InventoryManager:
         market.scratch_trades_count = 0
         market.unrealized_pnl_cents = 0.0
 
-        # If session_start_open_lots was empty and we are in the initial session (no rotation has occurred),
+        # If session_start_open_lots was empty and we are explicitly in the initial session (rotation_count == 0),
         # re-seed startup inventory if hydrated at startup.
-        if not market.open_lots and session_start_realized == 0.0:
+        if not market.open_lots and market.rotation_count == 0:
             seeded = self._initial_seeded_inventory.get(ticker)
             if seeded is not None:
                 init_pos, init_cost_basis = seeded
@@ -716,7 +719,7 @@ class InventoryManager:
             f for f in self._recorded_fills
             if f["ticker"] == ticker and (
                 f.get("rotation_session_id") == session_id or
-                (f.get("rotation_session_id") is None and session_start_realized == 0.0)
+                (f.get("rotation_session_id") is None and market.rotation_count == 0)
             )
         ]
         ticker_fills.sort(key=lambda f: (f["timestamp"], f.get("exchange_index", 0)))
@@ -1104,7 +1107,7 @@ class InventoryManager:
         is_out_of_order = any(
             f["ticker"] == ticker and (
                 f.get("rotation_session_id") == session_id or
-                (f.get("rotation_session_id") is None and market.session_start_realized_cents == 0.0)
+                (f.get("rotation_session_id") is None and market.rotation_count == 0)
             ) and (
                 f["timestamp"] > fill_time or (f["timestamp"] == fill_time and f.get("exchange_index", 0) > seq)
             )
