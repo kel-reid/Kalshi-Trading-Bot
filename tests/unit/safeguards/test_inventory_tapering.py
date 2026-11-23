@@ -246,3 +246,65 @@ class TestInventoryTapering:
         # and ask price is shifted lower to incentivize exit fills
         assert bid_tap is None
         assert ask_tap <= ask_norm
+
+    def test_calculate_order_size_taper_applied_after_hard_cap(self):
+        """Taper factor must scale the capped baseline rather than the untapered raw count."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-CAP",
+            order_dollars=20.0,  # At 50c mid -> raw_count = 40 contracts
+            max_order_contracts=20,
+        )
+        # Baseline: capped at 20 contracts
+        assert bot.calculate_order_size(50.0, taper_factor=1.0) == 20
+
+        # At 50% taper factor, must scale the 20-contract cap down to 10 contracts (not 20)
+        assert bot.calculate_order_size(50.0, taper_factor=0.5) == 10
+
+        # Fixed order_size fallback also scales the capped baseline
+        bot_fallback = AvellanedaStoikovBot(
+            ticker="KXTEST-FALLBACK",
+            order_dollars=None,
+            order_size=10,
+            max_order_contracts=6,
+        )
+        assert bot_fallback.calculate_order_size(50.0, taper_factor=1.0) == 6
+        assert bot_fallback.calculate_order_size(50.0, taper_factor=0.5) == 3
+
+    @pytest.mark.asyncio
+    async def test_tapering_surviving_quote_capped_at_inventory(self):
+        """Surviving quote in late taper must be capped at abs(inventory) to prevent position flip."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-FLIP",
+            gamma=1.0,
+            min_spread=6,
+            order_size=10,
+            inventory_taper_enabled=True,
+            inventory_taper_window_seconds=1800,
+            expiration_blackout_seconds=1800,
+        )
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        # alpha = 0.25 (< 0.50) -> quote_size = max(1, floor(10 * 0.25)) = 2 contracts
+        bot._market_close_time = now_dt + datetime.timedelta(seconds=2250)
+        bot._refresh_market_metadata = AsyncMock()
+
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_unrealized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={})
+        bot.inv_manager.get_last_fill_time = MagicMock(return_value=0.0)
+        bot.inv_manager.update_orderbook_mid = MagicMock()
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._update_quotes = AsyncMock()
+
+        # 1. Long Inventory (+1 contract):
+        # Even if quote_size is 2, surviving ask size must be capped at 1 contract!
+        bot.inv_manager.get_position = MagicMock(return_value=1)
+        await bot._tick()
+        assert bot._current_ask_quote_size == 1
+
+        # 2. Short Inventory (-1 contract):
+        # Even if quote_size is 2, surviving bid size must be capped at 1 contract!
+        bot.inv_manager.get_position = MagicMock(return_value=-1)
+        await bot._tick()
+        assert bot._current_bid_quote_size == 1

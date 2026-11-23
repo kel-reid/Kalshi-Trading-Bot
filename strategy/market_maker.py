@@ -704,21 +704,20 @@ class AvellanedaStoikovBot:
                 # to prevent runaway contract counts on extreme/sub-cent books (e.g. 0.05c -> 2,000 contracts)
                 effective_price = max(1.0, min(99.0, float(mid_price)))
                 raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
-                if tf < 1.0:
-                    raw_count = max(1, math.floor(raw_count * tf))
                 capped_count = min(self.max_order_contracts, raw_count)
                 # Collateral-constrained ceiling for low-price contracts
                 if self.max_low_price_contracts and self.max_low_price_contracts > 0:
                     if effective_price <= self.low_price_threshold_cents:
-                        low_limit = self.max_low_price_contracts
-                        if tf < 1.0:
-                            low_limit = max(1, math.floor(low_limit * tf))
-                        capped_count = min(capped_count, low_limit)
+                        capped_count = min(capped_count, self.max_low_price_contracts)
+                # Apply taper factor smoothly after establishing the fully capped baseline
+                if tf < 1.0:
+                    capped_count = max(1, math.floor(capped_count * tf))
                 return capped_count
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        capped_fallback = min(self.max_order_contracts, fallback)
         if tf < 1.0:
-            fallback = max(1, math.floor(fallback * tf))
-        return min(self.max_order_contracts, max(1, fallback))
+            capped_fallback = max(1, math.floor(capped_fallback * tf))
+        return max(1, capped_fallback)
 
 
 
@@ -1644,6 +1643,21 @@ class AvellanedaStoikovBot:
                 except Exception:
                     pass
 
+        # Determine target quote sizes for both sides
+        target_bid_size = quote_size
+        target_ask_size = quote_size
+
+        # In late-session reduce-only or active hedging, cap surviving quote size at open inventory
+        # to ensure fills cannot overshoot and flip the position into the opposite direction.
+        if (self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0) or abs(inventory) >= hedge_threshold:
+            if inventory > 0:
+                target_ask_size = max(1, min(quote_size, abs(inventory)))
+            elif inventory < 0:
+                target_bid_size = max(1, min(quote_size, abs(inventory)))
+
+        self._current_bid_quote_size = target_bid_size
+        self._current_ask_quote_size = target_ask_size
+
         realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
         unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
         if optimal_bid is not None and optimal_ask is not None:
@@ -1654,8 +1668,9 @@ class AvellanedaStoikovBot:
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
         else:
+            active_size = target_ask_size if optimal_ask is not None else target_bid_size
             logger.info(
-                f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                 f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged) | "
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
@@ -1670,11 +1685,11 @@ class AvellanedaStoikovBot:
         cancel_ask = False
 
         # Determine target quote sizes for bid and ask
-        target_bid_size = getattr(self, "_current_quote_size", None)
+        target_bid_size = getattr(self, "_current_bid_quote_size", None) or getattr(self, "_current_quote_size", None)
         if not isinstance(target_bid_size, int) or isinstance(target_bid_size, bool) or target_bid_size <= 0:
             target_bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
 
-        target_ask_size = getattr(self, "_current_quote_size", None)
+        target_ask_size = getattr(self, "_current_ask_quote_size", None) or getattr(self, "_current_quote_size", None)
         if not isinstance(target_ask_size, int) or isinstance(target_ask_size, bool) or target_ask_size <= 0:
             target_ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
 
