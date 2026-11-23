@@ -5,6 +5,7 @@ and invariant preservation leading into market expiration.
 """
 
 import datetime
+from decimal import Decimal
 import math
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
@@ -308,3 +309,175 @@ class TestInventoryTapering:
         bot.inv_manager.get_position = MagicMock(return_value=-1)
         await bot._tick()
         assert bot._current_bid_quote_size == 1
+
+    def test_cap_quote_size_to_inventory_direct(self):
+        """Direct unit tests for _cap_quote_size_to_inventory helper across integer and fractional positions."""
+        bot = AvellanedaStoikovBot(ticker="KXTEST-CAP")
+
+        # 1. Integer positions preserve int type and exact min bounds
+        assert bot._cap_quote_size_to_inventory(10, 5) == 5
+        assert isinstance(bot._cap_quote_size_to_inventory(10, 5), int)
+        assert bot._cap_quote_size_to_inventory(2, 5) == 2
+        assert bot._cap_quote_size_to_inventory(10, -3) == 3
+        assert isinstance(bot._cap_quote_size_to_inventory(10, -3), int)
+
+        # 2. Fractional positions return float bounded strictly by abs(inventory)
+        assert bot._cap_quote_size_to_inventory(10, 1.5) == 1.5
+        assert bot._cap_quote_size_to_inventory(10, -1.5) == 1.5
+        assert bot._cap_quote_size_to_inventory(10, 0.5) == 0.5
+        assert bot._cap_quote_size_to_inventory(10, -0.75) == 0.75
+        assert bot._cap_quote_size_to_inventory(10, Decimal("1.5")) == 1.5
+
+        # 3. Precision rounding never overshoots inventory
+        assert bot._cap_quote_size_to_inventory(10, 1.559) <= 1.559
+        assert bot._cap_quote_size_to_inventory(10, 1.551) <= 1.551
+
+        # 4. Zero, negative quote size, or non-finite safe fallback
+        assert bot._cap_quote_size_to_inventory(10, 0) == 10
+        assert bot._cap_quote_size_to_inventory(10, None) == 10
+        assert bot._cap_quote_size_to_inventory(10, float("nan")) == 10
+
+    @pytest.mark.asyncio
+    async def test_fractional_inventory_in_update_quotes(self):
+        """_update_quotes preserves fractional quote sizes and places orders with exact contract count."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-FRAC",
+            order_size=10,
+        )
+        bot.om.place_order = AsyncMock(return_value="order-123")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot._current_ask_quote_size = 1.5
+        bot._current_bid_quote_size = 10
+
+        await bot._update_quotes(None, 52)
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-FRAC",
+            side="yes",
+            action="sell",
+            count=1.5,
+            price=52,
+        )
+        assert bot.current_ask_size == 1.5
+
+        # Test bid side with fractional size
+        bot.om.place_order.reset_mock()
+        bot.current_ask_id = None
+        bot._current_bid_quote_size = 0.5
+        await bot._update_quotes(48, None)
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-FRAC",
+            side="yes",
+            action="buy",
+            count=0.5,
+            price=48,
+        )
+        assert bot.current_bid_size == 0.5
+
+    @pytest.mark.asyncio
+    async def test_session_risk_safeguard_hedge_capped_size(self):
+        """Session-risk safeguard hedge branch caps quote size to open inventory."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-RISK-HEDGE",
+            gamma=1.0,
+            order_size=10,
+            max_hedge_inventory=10,
+            max_session_fees_cents=300,
+        )
+        bot._refresh_market_metadata = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_unrealized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_last_fill_time = MagicMock(return_value=0.0)
+        bot.inv_manager.update_orderbook_mid = MagicMock()
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._update_quotes = AsyncMock()
+
+        # Trigger session risk via fee churn: 500c >= 300c
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={"total_fees_paid_cents": 500, "realized_pnl_cents": 0.0})
+
+        # 1. Long Inventory (6 contracts >= hedge threshold 5): ask size capped at 6, not 10!
+        bot.inv_manager.get_position = MagicMock(return_value=6)
+        await bot._tick()
+        assert bot._current_ask_quote_size == 6
+        bot._update_quotes.assert_called_once_with(None, 48)
+
+        # 2. Fractional Short Inventory (-5.5 contracts <= -5): bid size capped at 5.5, not 10!
+        bot._update_quotes.reset_mock()
+        bot.inv_manager.get_position = MagicMock(return_value=-5.5)
+        await bot._tick()
+        assert bot._current_bid_quote_size == 5.5
+        bot._update_quotes.assert_called_once_with(52, None)
+
+    @pytest.mark.asyncio
+    async def test_extreme_price_collar_safeguard_hedge_capped_size(self):
+        """Extreme price collar safeguard hedge branch caps quote size to open inventory."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-COLLAR-HEDGE",
+            gamma=1.0,
+            order_size=10,
+            max_hedge_inventory=10,
+            min_mid_price=20.0,
+            max_mid_price=80.0,
+        )
+        bot._refresh_market_metadata = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_unrealized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={"total_fees_paid_cents": 0, "realized_pnl_cents": 0.0})
+        bot.inv_manager.get_last_fill_time = MagicMock(return_value=0.0)
+        bot.inv_manager.update_orderbook_mid = MagicMock()
+        bot._update_quotes = AsyncMock()
+
+        # Mid-price = 11.0c, breach below min_mid_price (20.0c)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(10, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(12, 10))
+
+        # 1. Short Inventory (-7 contracts <= -5): bid size capped at 7, not 10!
+        bot.inv_manager.get_position = MagicMock(return_value=-7)
+        await bot._tick()
+        assert bot._current_bid_quote_size == 7
+        bot._update_quotes.assert_called_once_with(12, None)
+
+        # 2. Fractional Long Inventory (6.5 contracts >= 5): ask size capped at 6.5, not 10!
+        bot._update_quotes.reset_mock()
+        bot.inv_manager.get_position = MagicMock(return_value=6.5)
+        await bot._tick()
+        assert bot._current_ask_quote_size == 6.5
+        bot._update_quotes.assert_called_once_with(None, 10)
+
+    @pytest.mark.asyncio
+    async def test_tapering_fractional_position_capped_in_tick(self):
+        """Late taper reduce-only mode caps fractional position properly."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-FRAC-TAPER",
+            gamma=1.0,
+            min_spread=6,
+            order_size=10,
+            inventory_taper_enabled=True,
+            inventory_taper_window_seconds=1800,
+            expiration_blackout_seconds=1800,
+        )
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        # alpha = 0.25 (< 0.50)
+        bot._market_close_time = now_dt + datetime.timedelta(seconds=2250)
+        bot._refresh_market_metadata = AsyncMock()
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_realized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_unrealized_pnl = MagicMock(return_value=0.0)
+        bot.inv_manager.get_pnl_summary = MagicMock(return_value={})
+        bot.inv_manager.get_last_fill_time = MagicMock(return_value=0.0)
+        bot.inv_manager.update_orderbook_mid = MagicMock()
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._update_quotes = AsyncMock()
+
+        # Fractional long inventory of +1.5 contracts
+        bot.inv_manager.get_position = MagicMock(return_value=1.5)
+        await bot._tick()
+        assert bot._current_ask_quote_size == 1.5
+
+        # Fractional short inventory of -0.5 contracts
+        bot.inv_manager.get_position = MagicMock(return_value=-0.5)
+        await bot._tick()
+        assert bot._current_bid_quote_size == 0.5

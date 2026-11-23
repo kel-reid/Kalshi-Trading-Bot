@@ -14,7 +14,7 @@ import os
 import datetime
 from collections import deque
 from decimal import Decimal, InvalidOperation
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Any
 
 from data.websocket_client import KalshiWebsocketClient, FatalIngestionError
 from data.orderbook_manager import OrderbookManager
@@ -344,8 +344,8 @@ class AvellanedaStoikovBot:
         
         self.current_bid_price: Optional[Union[int, float]] = None
         self.current_ask_price: Optional[Union[int, float]] = None
-        self.current_bid_size: Optional[int] = None
-        self.current_ask_size: Optional[int] = None
+        self.current_bid_size: Optional[Union[int, float]] = None
+        self.current_ask_size: Optional[Union[int, float]] = None
         self._last_empty_ob_log: float = 0.0
 
 
@@ -719,7 +719,35 @@ class AvellanedaStoikovBot:
             capped_fallback = max(1, math.floor(capped_fallback * tf))
         return max(1, capped_fallback)
 
+    def _cap_quote_size_to_inventory(
+        self,
+        quote_size: Union[int, float],
+        inventory: Union[int, float, Decimal],
+    ) -> Union[int, float]:
+        """Caps the quote size to available inventory to prevent overshooting or position flips.
 
+        Supports fractional inventory (e.g. 1.5 contracts) down to 0.01 contracts.
+        For strictly integer inventory and integer quote sizes, preserves integer typing.
+        """
+        try:
+            abs_inv = abs(float(inventory))
+            q_size = float(quote_size)
+        except (ValueError, TypeError):
+            return quote_size
+
+        if not math.isfinite(abs_inv) or not math.isfinite(q_size) or abs_inv <= 0 or q_size <= 0:
+            return quote_size
+
+        # Integer fast-path if both are integer values >= 1
+        if (isinstance(quote_size, int) or q_size.is_integer()) and (isinstance(inventory, int) or abs_inv.is_integer()) and abs_inv >= 1:
+            return max(1, min(int(q_size), int(abs_inv)))
+
+        # Fractional path: bounded strictly by abs_inv and floored at 0.01 (exchange precision)
+        capped = min(q_size, abs_inv)
+        rounded = round(capped, 2)
+        if rounded > abs_inv and abs_inv >= 0.01:
+            rounded = round(rounded - 0.01, 2)
+        return max(0.01, rounded)
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -1332,6 +1360,8 @@ class AvellanedaStoikovBot:
                     )
                     optimal_bid = None
                     optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                    self._current_bid_quote_size = quote_size
+                    self._current_ask_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
                 else:
                     logger.warning(
                         f"[{reason.upper()} - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
@@ -1339,11 +1369,14 @@ class AvellanedaStoikovBot:
                     )
                     optimal_ask = None
                     optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+                    self._current_bid_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+                    self._current_ask_quote_size = quote_size
 
                 realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
                 unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                active_size = self._current_ask_quote_size if optimal_ask is not None else self._current_bid_quote_size
                 logger.info(
-                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                     f"→ Bid={optimal_bid}c  Ask={optimal_ask}c ({reason} Hedged) | "
                     f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                 )
@@ -1402,6 +1435,8 @@ class AvellanedaStoikovBot:
                     )
                     optimal_bid = None
                     optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                    self._current_bid_quote_size = quote_size
+                    self._current_ask_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
                 else:
                     logger.warning(
                         f"[COLLAR BREACH - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
@@ -1409,11 +1444,14 @@ class AvellanedaStoikovBot:
                     )
                     optimal_ask = None
                     optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+                    self._current_bid_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+                    self._current_ask_quote_size = quote_size
 
                 realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
                 unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                active_size = self._current_ask_quote_size if optimal_ask is not None else self._current_bid_quote_size
                 logger.info(
-                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                     f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Collar Breach Hedged) | "
                     f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                 )
@@ -1651,9 +1689,9 @@ class AvellanedaStoikovBot:
         # to ensure fills cannot overshoot and flip the position into the opposite direction.
         if (self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0) or abs(inventory) >= hedge_threshold:
             if inventory > 0:
-                target_ask_size = max(1, min(quote_size, abs(inventory)))
+                target_ask_size = self._cap_quote_size_to_inventory(quote_size, inventory)
             elif inventory < 0:
-                target_bid_size = max(1, min(quote_size, abs(inventory)))
+                target_bid_size = self._cap_quote_size_to_inventory(quote_size, inventory)
 
         self._current_bid_quote_size = target_bid_size
         self._current_ask_quote_size = target_ask_size
@@ -1684,14 +1722,29 @@ class AvellanedaStoikovBot:
         cancel_bid = False
         cancel_ask = False
 
-        # Determine target quote sizes for bid and ask
-        target_bid_size = getattr(self, "_current_bid_quote_size", None) or getattr(self, "_current_quote_size", None)
-        if not isinstance(target_bid_size, int) or isinstance(target_bid_size, bool) or target_bid_size <= 0:
-            target_bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        def _is_valid_size(s: Any) -> bool:
+            if isinstance(s, bool):
+                return False
+            if isinstance(s, (int, float, Decimal)):
+                try:
+                    f = float(s)
+                    return math.isfinite(f) and f > 0
+                except (ValueError, TypeError, OverflowError):
+                    return False
+            return False
 
-        target_ask_size = getattr(self, "_current_ask_quote_size", None) or getattr(self, "_current_quote_size", None)
-        if not isinstance(target_ask_size, int) or isinstance(target_ask_size, bool) or target_ask_size <= 0:
-            target_ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        default_size = self.order_size if _is_valid_size(self.order_size) else 1
+
+        # Determine target quote sizes for bid and ask
+        raw_bid_size = getattr(self, "_current_bid_quote_size", None)
+        if raw_bid_size is None:
+            raw_bid_size = getattr(self, "_current_quote_size", None)
+        target_bid_size = raw_bid_size if _is_valid_size(raw_bid_size) else default_size
+
+        raw_ask_size = getattr(self, "_current_ask_quote_size", None)
+        if raw_ask_size is None:
+            raw_ask_size = getattr(self, "_current_quote_size", None)
+        target_ask_size = raw_ask_size if _is_valid_size(raw_ask_size) else default_size
 
         # Check whether quotes need update (price change >= tolerance OR contract size change on active quote)
         bid_price_changed = False
