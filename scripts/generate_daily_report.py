@@ -293,12 +293,14 @@ def fetch_daily_metrics(
                 unrealized_delta = float(last_snap["unrealized_pnl_cents"]) - float(first_snap["unrealized_pnl_cents"])
                 ending_unrealized = float(last_snap["unrealized_pnl_cents"])
                 ending_inventory = int(last_snap["inventory_at_snapshot"])
+                has_inventory_snapshot = True
             else:
                 realized_delta = 0.0
                 fees_delta = 0.0
                 unrealized_delta = 0.0
                 ending_unrealized = 0.0
                 ending_inventory = 0
+                has_inventory_snapshot = False
 
             # 4. Aggregate orders per ticker
             cur.execute(
@@ -353,6 +355,7 @@ def fetch_daily_metrics(
                 "max_inventory": agg.get("max_inventory") if agg.get("max_inventory") is not None else 0,
                 "avg_inventory": float(agg.get("avg_inventory") or 0.0),
                 "ending_inventory": ending_inventory,
+                "has_inventory_snapshot": has_inventory_snapshot,
                 "total_orders": total_orders,
                 "buy_orders": buy_orders,
                 "sell_orders": sell_orders,
@@ -437,21 +440,28 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
             f"({fill_ratio:.1f}% fill conversion rate) and {totals.get('total_cancels', 0):,} cancellations or quote replacements."
         )
 
-    # 2. Drawdown & liquidation attribution
-    liquidated_tickers = []
+    # 2. Drawdown & inventory concentration observation
+    concentrated_drawdowns = []
+    total_drawdown_cents = abs(realized_cents) if realized_cents < 0 else 0.0
     for ticker, t_data in tickers.items():
         t_real = t_data.get("realized_delta_cents", 0.0)
         min_inv = t_data.get("min_inventory", 0)
         max_inv = t_data.get("max_inventory", 0)
         if t_real < -50.0 and (abs(min_inv) >= 4 or abs(max_inv) >= 4):
-            liquidated_tickers.append((ticker, t_real / 100.0))
+            concentrated_drawdowns.append((ticker, t_real / 100.0, min_inv, max_inv, abs(t_real)))
 
-    if liquidated_tickers:
-        details = ", ".join([f"`{t}` (${loss:+.2f})" for t, loss in liquidated_tickers])
-        observations.append(
-            f"Late-game score momentum and de-risking collars triggered significant inventory liquidation in {details}, "
-            "accounting for the majority of the session drawdown."
-        )
+    if concentrated_drawdowns:
+        details = ", ".join([f"`{t}` (${loss:+.2f}, inv [{min_i}, +{max_i}])" for t, loss, min_i, max_i, _ in concentrated_drawdowns])
+        qualifying_loss_sum = sum(raw_cents for _, _, _, _, raw_cents in concentrated_drawdowns)
+        if total_drawdown_cents > 0 and (qualifying_loss_sum / total_drawdown_cents) >= 0.50:
+            pct = (qualifying_loss_sum / total_drawdown_cents * 100.0)
+            observations.append(
+                f"Session drawdown was concentrated in {details}, accounting for {pct:.1f}% of total session realized losses."
+            )
+        else:
+            observations.append(
+                f"Significant drawdown and inventory excursions occurred in {details}."
+            )
 
     # 3. Inventory skew observation
     extreme_skew_tickers = []
@@ -484,16 +494,30 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
             observations.append(f"Kalshi transaction fees totaled ${fees_dlr:.2f} across executed trades.")
 
     # 5. Overnight risk & inventory resolution
-    ending_inv_total = sum(abs(t_data.get("ending_inventory", 0)) for t_data in tickers.values())
-    if ending_inv_total == 0:
+    has_snaps = totals.get("snapshot_count", 0) > 0 or any(
+        t_data.get("has_inventory_snapshot") or t_data.get("snapshot_count", 0) > 0 for t_data in tickers.values()
+    )
+    if not has_snaps:
         observations.append(
-            "All event markets resolved or liquidated to exactly 0 open contracts before session close, "
-            "eliminating overnight directional exposure."
+            "Inventory snapshot telemetry was unavailable for this session; overnight position resolution could not be verified."
         )
     else:
-        observations.append(
-            f"Carried {ending_inv_total} open contracts into session close with active mark-to-market exposure."
-        )
+        ending_inv_total = sum(abs(t_data.get("ending_inventory") or 0) for t_data in tickers.values() if t_data.get("ending_inventory") is not None)
+        untracked = [t for t, d in tickers.items() if not d.get("has_inventory_snapshot") and d.get("snapshot_count", 0) == 0]
+        if ending_inv_total == 0:
+            if untracked:
+                observations.append(
+                    f"Measured markets resolved or liquidated to 0 open contracts before session close ({len(untracked)} market(s) lacked snapshot telemetry)."
+                )
+            else:
+                observations.append(
+                    "All event markets resolved or liquidated to exactly 0 open contracts before session close, "
+                    "eliminating overnight directional exposure."
+                )
+        else:
+            observations.append(
+                f"Carried {ending_inv_total} open contracts into session close with active mark-to-market exposure."
+            )
 
     if not observations:
         observations.append("Session execution proceeded within nominal operating tolerances.")
@@ -551,8 +575,8 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
     extreme_skew = any(abs(d.get("min_inventory", 0)) >= 10 or abs(d.get("max_inventory", 0)) >= 10 for d in tickers.values())
     if extreme_skew:
         recommendations.append(
-            "Inventory Risk Consensus: Increase RISK_GAMMA (from 0.7 to 1.0) to aggressively shade reservation prices away "
-            "from directional momentum and prevent one-sided inventory accumulation during trending market runs."
+            "Inventory Risk Consensus: Increase risk aversion parameter RISK_GAMMA (e.g. scale up by 25%–50%) to aggressively "
+            "shade reservation prices away from directional momentum and prevent one-sided inventory accumulation during trending market runs."
         )
 
     # 5. Quoting velocity tolerance
@@ -834,6 +858,12 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
     avg_loss_dlr = totals.get("avg_loss_cents", 0.0) / 100.0
     profit_factor = totals.get("profit_factor", 0.0)
 
+    has_snaps = totals.get("snapshot_count", 0) > 0 or any(
+        t.get("has_inventory_snapshot") or t.get("snapshot_count", 0) > 0 for t in tickers.values()
+    )
+    ending_inv_total = sum(abs(t.get("ending_inventory") or 0) for t in tickers.values() if t.get("ending_inventory") is not None)
+    ending_inv_str = f"`{ending_inv_total}` contracts" if has_snaps else "`N/A` (no snapshot telemetry)"
+
     lines = [
         f"📊 *Kalshi Trading Bot — Daily Performance Report: {target_date}*",
         f"*Session Timezone*: `{tz_name}` | *Active Markets*: {totals.get('active_market_count', 0)}",
@@ -844,7 +874,7 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
         f"    • *Session Unrealized PnL*: `${unrealized_delta_dlr:+.2f}`",
         f"    • *Net Strategy PnL*: `${net_pnl_dlr:+.2f}` (ΔRealized + ΔUnrealized)",
         f"    • *Total Session Fees Paid*: `${fees_dlr:.2f}`",
-        f"    • *Ending Open Inventory*: `0` contracts",
+        f"    • *Ending Open Inventory*: {ending_inv_str}",
         "",
         "*2. EXECUTION & ROUND-TRIP DYNAMICS*",
         f"    • *Total Orders Quoted*: {orders:,} ({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs)",

@@ -180,6 +180,7 @@ def test_generate_observations_and_recommendations():
                 "min_inventory": -8,
                 "max_inventory": 6,
                 "ending_inventory": 0,
+                "has_inventory_snapshot": True,
             },
         },
     }
@@ -197,6 +198,108 @@ def test_generate_observations_and_recommendations():
         # Ensure recommendations formulate a clear consensus without ambiguous ' or ' options
         assert " or " not in r.lower()
         assert "consensus" in r.lower()
+
+
+def test_drawdown_concentration_majority_vs_minority():
+    # Majority case: qualifying loss is 175 of 200 (87.5% >= 50%)
+    majority_metrics = {
+        "totals": {"total_realized_delta_cents": -200.0, "snapshot_count": 50},
+        "tickers": {
+            "KXTEST-1": {"realized_delta_cents": -175.0, "min_inventory": -8, "max_inventory": 6, "has_inventory_snapshot": True},
+            "KXTEST-2": {"realized_delta_cents": -25.0, "min_inventory": -1, "max_inventory": 1, "has_inventory_snapshot": True},
+        },
+    }
+    obs_maj = generate_observations(majority_metrics)
+    assert any("concentrated in `KXTEST-1`" in o and "87.5%" in o for o in obs_maj)
+    # Ensure unmeasured causal claims are absent
+    for o in obs_maj:
+        assert "score momentum" not in o
+        assert "collars" not in o
+
+    # Minority case: qualifying loss is 60 of 1000 (6.0% < 50%)
+    minority_metrics = {
+        "totals": {"total_realized_delta_cents": -1000.0, "snapshot_count": 50},
+        "tickers": {
+            "KXTEST-A": {"realized_delta_cents": -60.0, "min_inventory": -4, "max_inventory": 4, "has_inventory_snapshot": True},
+            "KXTEST-B": {"realized_delta_cents": -940.0, "min_inventory": -1, "max_inventory": 1, "has_inventory_snapshot": True},
+        },
+    }
+    obs_min = generate_observations(minority_metrics)
+    # Should NOT claim majority
+    assert not any("accounting for" in o and "majority" in o for o in obs_min)
+    assert any("Significant drawdown and inventory excursions occurred in `KXTEST-A`" in o for o in obs_min)
+
+
+def test_ending_inventory_telemetry_availability():
+    # Case 1: No snapshots recorded
+    no_snap_metrics = {
+        "totals": {"snapshot_count": 0, "total_orders": 10},
+        "tickers": {"KXTEST-1": {"ending_inventory": 0, "has_inventory_snapshot": False, "snapshot_count": 0}},
+    }
+    obs_no_snap = generate_observations(no_snap_metrics)
+    assert any("Inventory snapshot telemetry was unavailable" in o for o in obs_no_snap)
+    assert not any("All event markets resolved or liquidated to exactly 0" in o for o in obs_no_snap)
+
+    # Case 2: Snapshots recorded with 5 open contracts
+    open_inv_metrics = {
+        "totals": {"snapshot_count": 50, "total_orders": 10},
+        "tickers": {"KXTEST-1": {"ending_inventory": 5, "has_inventory_snapshot": True, "snapshot_count": 50}},
+    }
+    obs_open = generate_observations(open_inv_metrics)
+    assert any("Carried 5 open contracts into session close" in o for o in obs_open)
+
+
+def test_inventory_risk_consensus_no_incorrect_gamma_baseline():
+    metrics = {
+        "totals": {"total_realized_delta_cents": 0.0, "total_orders": 50, "snapshot_count": 10},
+        "tickers": {"KXTEST-SKEW": {"min_inventory": -12, "max_inventory": 2}},
+    }
+    recs = generate_recommendations(metrics)
+    assert any("Inventory Risk Consensus" in r for r in recs)
+    for r in recs:
+        # Assert no hardcoded obsolete baseline
+        assert "from 0.7 to 1.0" not in r
+        assert "0.7" not in r
+
+
+def test_slack_summary_ending_inventory_consistency():
+    # Case 1: Open contracts carried
+    metrics_open = {
+        "date": "2026-11-22",
+        "timezone": "America/New_York",
+        "totals": {
+            "total_realized_delta_cents": 0.0,
+            "total_unrealized_delta_cents": 0.0,
+            "total_fees_delta_cents": 0.0,
+            "net_strategy_pnl_cents": 0.0,
+            "snapshot_count": 20,
+            "total_orders": 10,
+        },
+        "tickers": {
+            "KXTEST-1": {"ending_inventory": 5, "has_inventory_snapshot": True, "net_pnl_cents": 0, "fees_delta_cents": 0},
+        },
+    }
+    report_open = format_slack_report(metrics_open)
+    assert "• *Ending Open Inventory*: `5` contracts" in report_open
+
+    # Case 2: No snapshot telemetry
+    metrics_no_snap = {
+        "date": "2026-11-22",
+        "timezone": "America/New_York",
+        "totals": {
+            "total_realized_delta_cents": 0.0,
+            "total_unrealized_delta_cents": 0.0,
+            "total_fees_delta_cents": 0.0,
+            "net_strategy_pnl_cents": 0.0,
+            "snapshot_count": 0,
+            "total_orders": 10,
+        },
+        "tickers": {
+            "KXTEST-1": {"ending_inventory": 0, "has_inventory_snapshot": False, "net_pnl_cents": 0, "fees_delta_cents": 0},
+        },
+    }
+    report_no_snap = format_slack_report(metrics_no_snap)
+    assert "• *Ending Open Inventory*: `N/A` (no snapshot telemetry)" in report_no_snap
 
 
 def test_send_slack_report_success():
