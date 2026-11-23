@@ -412,32 +412,6 @@ def test_concurrent_alerts_prevent_duplicate_dispatches():
         assert mock_post.call_count == 1
 
 
-def test_signal_received_while_alert_lock_held_does_not_deadlock():
-    """Verify that a termination signal received while _alert_lock is held does not deadlock."""
-    from utils.alerting import _alert_lock, send_alert_sync
-    import signal
-
-    shutdown_event = asyncio.Event()
-    shutdown_in_progress = False
-
-    def handle_shutdown(signum, frame=None):
-        nonlocal shutdown_in_progress
-        if shutdown_in_progress:
-            return
-        shutdown_in_progress = True
-        shutdown_event.set()
-
-    # Acquire the alert lock simulating the main thread in an active alerting call
-    with _alert_lock:
-        # Simulate signal arrival: handler only marks state and triggers event
-        handle_shutdown(signal.SIGINT)
-        assert shutdown_event.is_set()
-
-        # Because _alert_lock is reentrant (RLock), even re-entering on the same thread succeeds
-        with patch("utils.alerting.ALERT_WEBHOOK_URL", ""):
-            send_alert_sync("Test alert inside lock context", cooldown_seconds=0, bypass_throttle=True)
-
-
 @pytest.mark.asyncio
 async def test_market_maker_reconnect_delayed_recovery_scans_from_session_start():
     """Verify MarketMaker recovery scans from session start even if recovery is delayed by minutes."""

@@ -336,5 +336,71 @@ async def test_main_shutdown_interrupts_in_flight_discovery():
     assert discovery_cancelled is True
 
 
+@pytest.mark.asyncio
+async def test_main_shutdown_when_signal_received_while_alert_lock_held():
+    """Verify that main.py shutdown path cancels orders and completes without deadlocking when a signal arrives while _alert_lock is held."""
+    import signal
+    from utils.alerting import _alert_lock, reset_alert_history
+    from execution.kill_switch import KillSwitch
+
+    reset_alert_history()
+    mock_bot = MagicMock()
+    mock_bot.ticker = "KXNFLGAME-TEST"
+    mock_bot.stop = AsyncMock(return_value=True)
+
+    # Use a real KillSwitch instance backed by mock OrderManager to verify order cancellation and alert reentrancy
+    mock_om = MagicMock()
+    mock_om.active_orders = {
+        "client-ord-1": {
+            "kalshi_order_id": "k-ord-1",
+            "exchange_index": 0,
+            "ticker": "KXNFLGAME-TEST",
+        }
+    }
+    real_killer = KillSwitch(mock_om)
+    real_killer._delete_order_sync = MagicMock(return_value=True)
+    real_killer._fetch_resting_orders_sync = MagicMock(return_value=[])
+
+    signal_handlers = {}
+
+    def mock_signal(sig, handler):
+        signal_handlers[sig] = handler
+
+    # When bot starts, simulate the main thread holding _alert_lock with active throttling when a signal is received
+    async def mock_start():
+        handler = signal_handlers.get(signal.SIGINT)
+        assert handler is not None
+        # Hold _alert_lock on the main thread and trigger the registered signal handler
+        with _alert_lock:
+            handler(signal.SIGINT, None)
+            # Simulate work inside the lock
+            await asyncio.sleep(0.01)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            pass
+
+    mock_bot.start = AsyncMock(side_effect=mock_start)
+
+    with patch("utils.market_discovery.discover_active_market_async", new_callable=AsyncMock, return_value="KXNFLGAME-TEST"), \
+         patch("main.AvellanedaStoikovBot", return_value=mock_bot), \
+         patch("main.KillSwitch", return_value=real_killer), \
+         patch("main.signal.signal", side_effect=mock_signal), \
+         patch("utils.alerting.ALERT_WEBHOOK_URL", ""):
+
+        # Bounded wait verifying execution completes cleanly within timeout without deadlock
+        await asyncio.wait_for(main(), timeout=3.0)
+
+    # Verify that order cancellation was dispatched on exchange
+    real_killer._delete_order_sync.assert_called_once_with(
+        "k-ord-1",
+        "client-ord-1",
+        exchange_index=0,
+        ticker="KXNFLGAME-TEST",
+    )
+    # Verify that bot.stop was awaited for cleanup
+    mock_bot.stop.assert_awaited_once()
+
+
 
 
