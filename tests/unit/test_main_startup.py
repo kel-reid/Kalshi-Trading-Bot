@@ -336,5 +336,95 @@ async def test_main_shutdown_interrupts_in_flight_discovery():
     assert discovery_cancelled is True
 
 
+def test_main_shutdown_when_signal_received_while_alert_lock_held():
+    """
+    Verify in a separate subprocess with parent-enforced timeout that main.py shutdown
+    cancels orders and completes without deadlock when a signal arrives while _alert_lock is held,
+    and assert that _alert_lock is held when shutdown reaches the alert.
+    """
+    import subprocess
+    import sys
+    import os
+
+    child_code = """
+import asyncio
+import signal
+import sys
+from unittest.mock import MagicMock, AsyncMock, patch
+
+from utils.alerting import _alert_lock, send_alert_sync, reset_alert_history
+from execution.kill_switch import KillSwitch
+from main import main
+
+reset_alert_history()
+
+mock_om = MagicMock()
+mock_om.active_orders = {
+    "c-1": {"kalshi_order_id": "k-1", "exchange_index": 0, "ticker": "KXTEST"}
+}
+killer = KillSwitch(mock_om)
+delete_order_calls = []
+killer._delete_order_sync = lambda *args, **kwargs: (delete_order_calls.append((args, kwargs)), True)[1]
+killer._fetch_resting_orders_sync = lambda *args, **kwargs: []
+
+signal_handlers = {}
+def mock_signal(sig, handler):
+    signal_handlers[sig] = handler
+
+alert_called = asyncio.Event()
+lock_held_when_alert_reached = False
+
+orig_send_alert_sync = send_alert_sync
+def wrapping_send_alert_sync(*args, **kwargs):
+    global lock_held_when_alert_reached
+    if _alert_lock._is_owned():
+        lock_held_when_alert_reached = True
+    alert_called.set()
+    return orig_send_alert_sync(*args, **kwargs)
+
+async def mock_start():
+    handler = signal_handlers[signal.SIGINT]
+    with _alert_lock:
+        handler(signal.SIGINT, None)
+        await alert_called.wait()
+    try:
+        await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        pass
+
+mock_bot = MagicMock()
+mock_bot.ticker = "KXTEST"
+mock_bot.start = AsyncMock(side_effect=mock_start)
+mock_bot.stop = AsyncMock(return_value=True)
+
+with patch("utils.market_discovery.discover_active_market_async", new_callable=AsyncMock, return_value="KXTEST"), \
+     patch("main.AvellanedaStoikovBot", return_value=mock_bot), \
+     patch("main.KillSwitch", return_value=killer), \
+     patch("main.signal.signal", side_effect=mock_signal), \
+     patch("utils.alerting.ALERT_WEBHOOK_URL", ""), \
+     patch("utils.alerting.send_alert_sync", side_effect=wrapping_send_alert_sync):
+    asyncio.run(main())
+
+assert lock_held_when_alert_reached is True, "Lock was not held when alert was reached!"
+assert len(delete_order_calls) == 1, "Order deletion was not called!"
+print("SUBPROCESS_TEST_SUCCESS")
+"""
+
+    env = dict(os.environ)
+    env["KALSHI_API_KEY"] = "mock-key"
+    env["KALSHI_PRIVATE_KEY"] = "mock-key"
+
+    result = subprocess.run(
+        [sys.executable, "-c", child_code],
+        env=env,
+        timeout=5.0,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"Subprocess failed (code {result.returncode}):\n{result.stderr}\n{result.stdout}"
+    assert "SUBPROCESS_TEST_SUCCESS" in result.stdout
+
+
 
 

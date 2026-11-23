@@ -40,6 +40,10 @@ class MarketPnL:
     reconciliation_adjustment_cents: float = 0.0  # MTM adjustments realized during REST inventory reconciliation
     session_start_realized_cents: float = 0.0  # Realized PnL baseline at rotation session start
     session_start_fees_cents: float = 0.0  # Total fees baseline at rotation session start
+    session_start_open_lots: List[InventoryLot] = field(default_factory=list)
+    session_start_reconciliation_adj_cents: float = 0.0  # Reconciliation adjustment baseline at rotation session start
+    rotation_count: int = 0  # Number of market rotations (0 = initial session)
+    reconciliation_events: List[Dict[str, Any]] = field(default_factory=list)
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -71,8 +75,23 @@ class PnLTracker:
         """
         market = self.get_or_create_market(ticker)
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
+        market.rotation_count += 1
         market.session_start_realized_cents = market.realized_pnl_cents
         market.session_start_fees_cents = market.total_fees_cents
+        market.session_start_reconciliation_adj_cents = market.reconciliation_adjustment_cents
+        market.session_start_open_lots = [
+            InventoryLot(
+                lot_id=l.lot_id,
+                ticker=l.ticker,
+                action=l.action,
+                price_cents=l.price_cents,
+                count=l.count,
+                timestamp=l.timestamp,
+                is_uncosted=l.is_uncosted,
+                entry_fee_per_contract=l.entry_fee_per_contract,
+            )
+            for l in market.open_lots
+        ]
         return market.rotation_session_id
 
     def seed_initial_inventory(self, ticker: str, position: Union[int, float], cost_basis_cents: Optional[float] = None):
@@ -105,6 +124,18 @@ class PnLTracker:
                 is_uncosted=is_uncosted,
             )
             market.open_lots.append(lot)
+            market.session_start_open_lots = [
+                InventoryLot(
+                    lot_id=lot.lot_id,
+                    ticker=lot.ticker,
+                    action=lot.action,
+                    price_cents=lot.price_cents,
+                    count=lot.count,
+                    timestamp=lot.timestamp,
+                    is_uncosted=lot.is_uncosted,
+                    entry_fee_per_contract=lot.entry_fee_per_contract,
+                )
+            ]
             if is_uncosted:
                 logger.warning(
                     f"Seeded uncosted initial lot for {ticker}: {lot_count} {action.upper()}. "
@@ -131,7 +162,14 @@ class PnLTracker:
             gross = 0.0
         return gross - allocated_fee
 
-    def reconcile_inventory(self, ticker: str, target_position: Union[int, float]):
+    def reconcile_inventory(
+        self,
+        ticker: str,
+        target_position: Union[int, float],
+        timestamp: Optional[float] = None,
+        snapshot_window: Optional[Tuple[float, float]] = None,
+        record_event: bool = True,
+    ):
         """
         Reconciles the tracker's lot-based inventory against authoritative REST portfolio positions.
         - Trims or flattens lots if authoritative position is smaller.
@@ -143,6 +181,20 @@ class PnLTracker:
         - Appends an uncosted lot if position has expanded or flipped across zero.
         """
         market = self.get_or_create_market(ticker)
+
+        if record_event:
+            event_ts = timestamp if timestamp is not None else time.time()
+            snap_start = snapshot_window[0] if snapshot_window else event_ts
+            snap_end = snapshot_window[1] if snapshot_window else event_ts
+            market.reconciliation_events.append({
+                "target_position": target_position,
+                "timestamp": event_ts,
+                "snapshot_start": snap_start,
+                "snapshot_end": snap_end,
+                "rotation_session_id": market.rotation_session_id,
+                "mid_price": market.last_mid_price,
+            })
+
         current_position = self.get_open_inventory(ticker)
         delta = round(target_position - current_position, 4)
 
@@ -498,6 +550,8 @@ class PnLTracker:
             "total_fees_cents": total_fees,
             "session_fees_cents": session_fees,
             "reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents, 4),
+            "session_reconciliation_adjustment_cents": round(market.reconciliation_adjustment_cents - market.session_start_reconciliation_adj_cents, 4),
+            "rotation_count": market.rotation_count,
             "session_realized_pnl_cents": session_realized,
             "net_inventory": net_inventory,
             "open_lots_count": len(market.open_lots),

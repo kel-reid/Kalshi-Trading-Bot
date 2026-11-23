@@ -12,9 +12,11 @@ import asyncio
 import os
 import math
 import time
+import threading
+from datetime import datetime, timezone
 import certifi
 from decimal import Decimal
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 # Provide required imports from our new module
 
@@ -31,11 +33,32 @@ from utils.metrics import (
     KALSHI_PORTFOLIO_VALUE_CENTS,
     KALSHI_POSITIONS_VALUE_CENTS,
 )
-from data.pnl_tracker import PnLTracker
+from data.pnl_tracker import PnLTracker, InventoryLot
 from data.fill_spool import FillSpool
 from data.websocket_client import FatalIngestionError
 
 logger = logging.getLogger("InventoryManager")
+
+def _normalize_fill(fill: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = fill.get("market_ticker") or fill.get("ticker")
+    action = fill.get("action")
+    action = action.lower() if isinstance(action, str) else None
+    side = fill.get("side")
+    side = side.lower() if isinstance(side, str) else None
+    raw_count = fill.get("count_fp", fill.get("count"))
+    count = None
+    if raw_count is not None and not isinstance(raw_count, bool):
+        try:
+            count = float(raw_count)
+        except (ValueError, TypeError):
+            pass
+    return {
+        "ticker": ticker,
+        "action": action,
+        "side": side,
+        "count": count,
+    }
+
 
 class InventoryManager:
     """
@@ -54,6 +77,8 @@ class InventoryManager:
         self._fill_worker = None
         self._fill_retry_interval = 1.0
         self._fill_init_task = None
+        self._fill_lock = threading.Lock()
+        self._session_start_time: datetime = datetime.now(timezone.utc)
         self._seen_fill_ids = {}
         self.balance_cents: float = 0.0
         self.positions_value_cents: float = 0.0
@@ -66,6 +91,14 @@ class InventoryManager:
         self._pending_fills: int = 0
         self._last_fill_time: float = 0.0
         self._last_fill_times: Dict[str, float] = {}
+        self._recorded_fills: List[Dict[str, Any]] = []
+        self._initial_seeded_inventory: Dict[str, Tuple[Union[int, float], Optional[float]]] = {}
+        if pnl_tracker is not None:
+            for t, mkt in pnl_tracker.markets.items():
+                if mkt.open_lots:
+                    net_pos = sum(l.count if l.action == "buy" else -l.count for l in mkt.open_lots)
+                    first_lot = mkt.open_lots[0]
+                    self._initial_seeded_inventory[t] = (net_pos, first_lot.price_cents)
         
         self.ws_client.add_message_handler(self._handle_message)
 
@@ -186,7 +219,14 @@ class InventoryManager:
             logger.error(f"Failed to fetch positions: {response.text}")
             return None
 
-    def _apply_positions(self, market_positions: List[Dict[str, Any]], is_startup: bool = False) -> bool:
+    def _apply_positions(
+        self,
+        market_positions: List[Dict[str, Any]],
+        is_startup: bool = False,
+        timestamp: Optional[float] = None,
+        snapshot_boundary: Optional[float] = None,
+        snapshot_window: Optional[Tuple[float, float]] = None,
+    ) -> bool:
         """Applies REST positions to state, running on the event loop thread."""
         # Atomically validate and parse all entries before mutating state or PnL lots
         validated_entries = []
@@ -218,6 +258,13 @@ class InventoryManager:
                 return False
             validated_entries.append((ticker.strip(), position, pos))
 
+        if snapshot_boundary is not None:
+            recon_time = snapshot_boundary
+        elif timestamp is not None:
+            recon_time = timestamp
+        else:
+            recon_time = time.time()
+
         new_positions = {}
         for ticker, position, pos in validated_entries:
             if position != 0:
@@ -233,14 +280,25 @@ class InventoryManager:
                         except (ValueError, TypeError):
                             cost_basis = None
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
+                    self._initial_seeded_inventory[ticker] = (position, cost_basis)
                 else:
-                    self.pnl_tracker.reconcile_inventory(ticker, position)
+                    self.pnl_tracker.reconcile_inventory(
+                        ticker,
+                        position,
+                        timestamp=recon_time,
+                        snapshot_window=snapshot_window,
+                    )
 
         # For any previously tracked market that is now flat (not in REST active positions)
         if not is_startup:
             for active_ticker in list(self.positions.keys()):
                 if active_ticker not in new_positions:
-                    self.pnl_tracker.reconcile_inventory(active_ticker, 0)
+                    self.pnl_tracker.reconcile_inventory(
+                        active_ticker,
+                        0,
+                        timestamp=recon_time,
+                        snapshot_window=snapshot_window,
+                    )
 
         # Identify all tickers affected by this hydration/reconciliation
         all_affected_tickers = set(new_positions.keys()) | (set(self.positions.keys()) if not is_startup else set())
@@ -273,17 +331,26 @@ class InventoryManager:
 
     def _hydrate_positions(self, is_startup: bool = False):
         """Fetch initial positions via REST synchronously."""
+        t_req_start = time.time()
         market_positions = self._fetch_positions()
+        t_req_end = time.time()
         if market_positions is not None:
-            self._apply_positions(market_positions, is_startup=is_startup)
+            self._apply_positions(
+                market_positions,
+                is_startup=is_startup,
+                snapshot_boundary=t_req_start,
+                snapshot_window=(t_req_start, t_req_end),
+            )
 
-    async def hydrate(self, is_startup: bool = False) -> bool:
+    async def hydrate(self, is_startup: bool = False, require_complete: bool = False) -> bool:
         """Run hydration asynchronously to avoid blocking the event loop."""
-        logger.info(f"Hydrating inventory state from REST API (startup={is_startup})...")
+        logger.info(f"Hydrating inventory state from REST API (startup={is_startup}, require_complete={require_complete})...")
         start_fill_count = self._fill_count
         start_pending_fills = self._pending_fills
+        t_req_start = time.time()
         bal = await asyncio.to_thread(self._fetch_balance)
         market_positions = await asyncio.to_thread(self._fetch_positions)
+        t_req_end = time.time()
 
         # Concurrency guard: if a fill arrived while REST requests were in-flight,
         # or if fill ingestion was pending when hydration started or finished,
@@ -300,12 +367,13 @@ class InventoryManager:
             )
             return False
 
-        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # On startup or strict recovery mode, verified ground truth for BOTH balance and positions is mandatory.
         # Boundary precondition check: reject immediately without mutating state if either is missing.
-        if is_startup:
+        must_be_complete = is_startup or require_complete
+        if must_be_complete:
             if bal is None or market_positions is None:
                 logger.error(
-                    f"Startup portfolio hydration failed: missing required ground truth "
+                    f"Portfolio hydration failed: missing required ground truth "
                     f"(balance={'ok' if bal is not None else 'failed'}, "
                     f"positions={'ok' if market_positions is not None else 'failed'}). "
                     f"Aborting without mutating portfolio state."
@@ -314,13 +382,18 @@ class InventoryManager:
 
         positions_applied = True
         if market_positions is not None:
-            positions_applied = self._apply_positions(market_positions, is_startup=is_startup)
+            positions_applied = self._apply_positions(
+                market_positions,
+                is_startup=is_startup,
+                snapshot_boundary=t_req_start,
+                snapshot_window=(t_req_start, t_req_end),
+            )
 
-        # On startup, verified ground truth for BOTH balance and positions is mandatory.
+        # On startup or strict recovery, verified ground truth for BOTH balance and positions is mandatory.
         # Commit balance only after positions validate successfully to ensure atomic hydration.
-        if is_startup:
+        if must_be_complete:
             if not positions_applied:
-                logger.error("Startup portfolio hydration failed: positions validation rejected payload.")
+                logger.error("Portfolio hydration failed: positions validation rejected payload.")
                 return False
             self.balance_cents = bal
             logger.info(f"Hydrated Balance: {self.balance_cents} cents.")
@@ -348,12 +421,461 @@ class InventoryManager:
             except Exception as e:
                 logger.error(f"Error during periodic inventory reconciliation: {e}")
 
-    async def subscribe(self):
+    async def reconcile_dirty_spool(self, reconciler=None) -> bool:
+        """
+        If the write-ahead fill spool is flagged dirty from a prior ungraceful shutdown,
+        drain any pending spooled fills into the fill store, run REST reconciliation
+        against Kalshi to ingest any missed exchange fills, and clear the dirty latch.
+        Returns True if the spool is clean (or was reconciled cleanly), False if reconciliation failed.
+        """
+        path = os.environ.get("FILL_SPOOL_PATH", "data/fill_spool.sqlite3")
+        if not os.path.exists(path):
+            return True
+
+        spool = None
+        try:
+            spool = await asyncio.to_thread(FillSpool, path)
+            is_dirty = await asyncio.to_thread(spool.dirty)
+            if not is_dirty:
+                await asyncio.to_thread(spool.close)
+                return True
+
+            logger.warning(
+                "Fill spool at %s is marked dirty from a previous shutdown; initiating automatic startup reconciliation...",
+                path,
+            )
+
+            # If a fill store is present, drain spooled fills and run REST reconciliation
+            if self.fill_store is not None:
+                # 1. Ensure fill store is initialized
+                if not await asyncio.to_thread(self.fill_store.initialize):
+                    logger.error("Failed to initialize fill store during startup reconciliation; spool remains dirty.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+                # 2. Drain any pending spooled fills into the fill store
+                cursor = 0
+                while True:
+                    row = await asyncio.to_thread(spool.pending, cursor)
+                    if row is None:
+                        break
+                    row_id, fill = row
+                    success = await asyncio.to_thread(self.fill_store.record, fill, "websocket")
+                    if success:
+                        await asyncio.to_thread(spool.acknowledge, row_id)
+                    else:
+                        logger.error("Failed to persist spooled fill %s during startup reconciliation; aborting.", row_id)
+                        await asyncio.to_thread(spool.close)
+                        return False
+                    cursor = row_id
+
+                # Verify no fills remain in spool
+                remaining = await asyncio.to_thread(spool.pending)
+                if remaining is not None:
+                    logger.error("Spool still contains unpersisted fills; spool remains dirty.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+                # 3. Run REST reconciliation against Kalshi fills API
+                if reconciler is None:
+                    from data.fill_reconciliation import FillReconciler
+                    reconciler = FillReconciler(
+                        self.fill_store,
+                        BASE_URL,
+                        get_auth_headers,
+                        min_interval=0.1,
+                    )
+
+                try:
+                    report = await reconciler.reconcile()
+                    logger.info(
+                        "Startup fill reconciliation completed: %s pages visited, %s records persisted.",
+                        report.pages, report.persisted,
+                    )
+                except Exception as e:
+                    logger.error("REST fill reconciliation failed during startup reconciliation: %s", e)
+                    await asyncio.to_thread(spool.close)
+                    return False
+            else:
+                # If no fill store is configured, check if spool has pending fills
+                pending_fill = await asyncio.to_thread(spool.pending)
+                if pending_fill is not None:
+                    logger.error("Spool has pending fills but no fill_store configured; cannot safely clear dirty latch.")
+                    await asyncio.to_thread(spool.close)
+                    return False
+
+            # 4. Clear dirty latch
+            await asyncio.to_thread(spool.clear_dirty)
+            logger.info("Startup fill reconciliation successful; dirty latch cleared.")
+            await asyncio.to_thread(spool.close)
+            return True
+
+        except Exception as e:
+            logger.error("Error during startup spool reconciliation: %s", e, exc_info=True)
+            if spool is not None:
+                try:
+                    await asyncio.to_thread(spool.close)
+                except Exception:
+                    pass
+            return False
+
+    def _find_seen_fill(
+        self,
+        fill_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        fill: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Locates an existing seen fill record matching FillStore's identity and aliasing rules.
+        Enforces cross-field identity aliasing between WebSocket and REST fills:
+        1. Direct match on ('fill_id', fill_id) or ('trade_id', trade_id).
+        2. Alias match (when no direct match):
+           - If fill_id is provided: matches existing record with trade_id == fill_id and fill_id is None (WS -> REST).
+           - If fill_id is None and trade_id is provided: matches existing record with fill_id == trade_id (REST -> WS).
+        3. Validates against conflicting identities:
+           - Raises ValueError on conflicting fill_id, order_id, or trade_id (unless aliased).
+           - Raises ValueError on conflicting core execution attributes (ticker, action, side, count).
+           - Raises ValueError on conflicting WebSocket payload content for identical live fill identities.
+        4. Updates and merges aliased identities in self._seen_fill_ids.
+        """
+        records = []
+        if fill_id is not None:
+            rec = self._seen_fill_ids.get(("fill_id", fill_id))
+            if rec is not None and rec not in records:
+                records.append(rec)
+        if trade_id is not None:
+            rec = self._seen_fill_ids.get(("trade_id", trade_id))
+            if rec is not None and rec not in records:
+                records.append(rec)
+
+        # Alias match if no direct match was found
+        if not records:
+            if fill_id is not None:
+                # Incoming fill has fill_id (e.g. from REST). Check if previous WS fill used this as trade_id
+                rec = self._seen_fill_ids.get(("trade_id", fill_id))
+                if rec is not None and rec.get("ids", {}).get("fill_id") is None:
+                    records.append(rec)
+            if not records and fill_id is None and trade_id is not None:
+                # Incoming fill has only trade_id (e.g. from WS). Check if previous REST fill used this as fill_id
+                rec = self._seen_fill_ids.get(("fill_id", trade_id))
+                if rec is not None:
+                    records.append(rec)
+
+        if not records:
+            return None
+
+        if len(records) > 1:
+            raise ValueError("Fill identifiers refer to different existing fills")
+
+        existing = records[0]
+        existing_ids = existing.setdefault("ids", {})
+
+        # Validate order_id conflicts
+        if order_id is not None and existing_ids.get("order_id") is not None and existing_ids["order_id"] != order_id:
+            raise ValueError(f"Conflicting order_id for existing fill: {order_id} != {existing_ids['order_id']}")
+
+        # Validate fill_id conflicts
+        if fill_id is not None and existing_ids.get("fill_id") is not None and existing_ids["fill_id"] != fill_id:
+            raise ValueError(f"Conflicting fill_id for existing fill: {fill_id} != {existing_ids['fill_id']}")
+
+        # Validate trade_id conflicts with aliasing awareness
+        replace_trade_id = False
+        if trade_id is not None and existing_ids.get("trade_id") is not None and existing_ids["trade_id"] != trade_id:
+            if fill_id is not None and fill_id == existing_ids["trade_id"]:
+                replace_trade_id = True
+            elif existing_ids.get("fill_id") == trade_id:
+                pass
+            else:
+                raise ValueError(f"Conflicting trade_id for existing fill: {trade_id} != {existing_ids['trade_id']}")
+
+        # Validate normalized fill execution attributes if fill payload is provided
+        if fill is not None:
+            incoming_norm = _normalize_fill(fill)
+            existing_norm = existing.get("normalized", {})
+            for key in ("ticker", "action", "side", "count"):
+                in_val = incoming_norm.get(key)
+                ex_val = existing_norm.get(key)
+                if in_val is not None and ex_val is not None and in_val != ex_val:
+                    raise ValueError(f"Conflicting fill {key} for existing fill: {in_val} != {ex_val}")
+
+            if existing.get("source") == "websocket" and source == "websocket":
+                content = {k: v for k, v in fill.items() if k not in ("fill_id", "trade_id")}
+                if existing.get("content") is not None and existing["content"] != content:
+                    raise ValueError("Conflicting fill identity")
+
+        # Synchronize and merge aliased identities
+        if replace_trade_id:
+            old_trade_id = existing_ids.get("trade_id")
+            if old_trade_id is not None:
+                self._seen_fill_ids.pop(("trade_id", old_trade_id), None)
+            existing_ids["fill_id"] = fill_id
+            existing_ids["trade_id"] = trade_id
+            self._seen_fill_ids[("fill_id", fill_id)] = existing
+            self._seen_fill_ids[("trade_id", trade_id)] = existing
+        else:
+            if fill_id is not None and existing_ids.get("fill_id") is None:
+                existing_ids["fill_id"] = fill_id
+                self._seen_fill_ids[("fill_id", fill_id)] = existing
+            if trade_id is not None and existing_ids.get("trade_id") is None:
+                existing_ids["trade_id"] = trade_id
+                self._seen_fill_ids[("trade_id", trade_id)] = existing
+
+        if order_id is not None and existing_ids.get("order_id") is None:
+            existing_ids["order_id"] = order_id
+
+        return existing
+
+    def _record_seen_fill(
+        self,
+        fill_id: Optional[str],
+        trade_id: Optional[str],
+        order_id: Optional[str],
+        fill: Dict[str, Any],
+        source: str = "websocket",
+    ) -> Dict[str, Any]:
+        """Records a new unique fill in self._seen_fill_ids."""
+        record = {
+            "ids": {
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "order_id": order_id,
+            },
+            "source": source,
+            "normalized": _normalize_fill(fill),
+            "content": {k: v for k, v in fill.items() if k not in ("fill_id", "trade_id")},
+        }
+        if fill_id is not None:
+            self._seen_fill_ids[("fill_id", fill_id)] = record
+        if trade_id is not None:
+            self._seen_fill_ids[("trade_id", trade_id)] = record
+        return record
+
+    def apply_reconciled_fill(self, fill: Dict[str, Any]) -> bool:
+        """
+        Apply a REST-recovered fill to PnLTracker and inventory if it was not already
+        processed by the live WebSocket ingestion path.
+        Deduplicates against self._seen_fill_ids using FillStore's aliasing rules
+        so fills are never double-counted.
+        """
+        with self._fill_lock:
+            if not isinstance(fill, dict):
+                raise ValueError(f"Reconciled fill payload must be a dict, got {type(fill)}")
+
+            # Check timestamp against session start time to prevent historical replay
+            raw_ts = fill.get("created_time")
+            if raw_ts is None:
+                raw_ts = fill.get("ts")
+            if raw_ts is not None:
+                from data.fill_reconciliation import aware_datetime
+                fill_dt = aware_datetime(raw_ts)
+                if fill_dt < self._session_start_time:
+                    logger.debug(
+                        "Ignoring historical fill %s from %s before session start %s",
+                        fill.get("fill_id"), fill_dt, self._session_start_time,
+                    )
+                    return False
+
+            fill_id = fill.get("fill_id")
+            trade_id = fill.get("trade_id")
+            order_id = fill.get("order_id")
+
+            if fill_id is not None and (not isinstance(fill_id, str) or not fill_id.strip()):
+                raise ValueError(f"invalid fill_id: {fill_id!r}")
+            if trade_id is not None and (not isinstance(trade_id, str) or not trade_id.strip()):
+                raise ValueError(f"invalid trade_id: {trade_id!r}")
+            if order_id is not None and (not isinstance(order_id, str) or not order_id.strip()):
+                order_id = None
+
+            if not fill_id and not trade_id:
+                raise ValueError(f"Reconciled fill missing fill_id and trade_id: {fill}")
+
+            # Check if fill was already recorded (direct or cross-field alias)
+            existing = self._find_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="rest")
+            if existing is not None:
+                return False
+
+            count_before = self._fill_count
+            self._handle_fill(fill)
+            if self._fill_count > count_before:
+                self._record_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="rest")
+                ticker = fill.get("market_ticker", "").strip()
+                if ticker:
+                    self._rebuild_ticker_accounting(ticker)
+                return True
+            raise ValueError(f"Reconciled fill was dropped or invalid: {fill}")
+
+    def _rebuild_ticker_accounting(self, ticker: str):
+        """
+        Rebuilds FIFO lot matching and realized PnL for a ticker from scratch in
+        strictly chronological order (ts, exchange_index) using recorded fills
+        and reconciliation events aligned with the current rotation session baseline.
+        """
+        market = self.pnl_tracker.get_or_create_market(ticker)
+
+        # 1. Capture session baseline and configuration
+        session_id = market.rotation_session_id
+        session_start_realized = market.session_start_realized_cents
+        session_start_fees = market.session_start_fees_cents
+        session_start_recon_adj = market.session_start_reconciliation_adj_cents
+        last_mid = market.last_mid_price
+
+        # 2. Reset lot list and accumulators to session baseline
+        market.open_lots = [
+            InventoryLot(
+                lot_id=l.lot_id,
+                ticker=l.ticker,
+                action=l.action,
+                price_cents=l.price_cents,
+                count=l.count,
+                timestamp=l.timestamp,
+                is_uncosted=l.is_uncosted,
+                entry_fee_per_contract=l.entry_fee_per_contract,
+            )
+            for l in market.session_start_open_lots
+        ]
+        market.realized_pnl_cents = round(session_start_realized, 4)
+        market.total_fees_cents = round(session_start_fees, 4)
+        market.reconciliation_adjustment_cents = round(session_start_recon_adj, 4)
+        market.total_volume_contracts = 0
+        market.round_trips_count = 0
+        market.winning_trades_count = 0
+        market.losing_trades_count = 0
+        market.scratch_trades_count = 0
+        market.unrealized_pnl_cents = 0.0
+
+        # If session_start_open_lots was empty and we are explicitly in the initial session (rotation_count == 0),
+        # re-seed startup inventory if hydrated at startup.
+        if not market.open_lots and market.rotation_count == 0:
+            seeded = self._initial_seeded_inventory.get(ticker)
+            if seeded is not None:
+                init_pos, init_cost_basis = seeded
+                self.pnl_tracker.seed_initial_inventory(ticker, init_pos, cost_basis_cents=init_cost_basis)
+
+        # 3. Extract recorded fills for THIS ticker and rotation session
+        ticker_fills = [
+            f for f in self._recorded_fills
+            if f["ticker"] == ticker and (
+                f.get("rotation_session_id") == session_id or
+                (f.get("rotation_session_id") is None and market.rotation_count == 0)
+            )
+        ]
+
+        # 4. Extract recorded reconciliation events for THIS ticker and rotation session
+        ticker_recons = [
+            e for e in market.reconciliation_events
+            if e.get("rotation_session_id") == session_id or
+            (e.get("rotation_session_id") is None and market.rotation_count == 0)
+        ]
+
+        # 5. Build a unified chronological timeline
+        timeline = []
+        for f in ticker_fills:
+            timeline.append({
+                "type": "fill",
+                "timestamp": f["timestamp"],
+                "exchange_index": f.get("exchange_index", 0),
+                "data": f,
+            })
+        for r in ticker_recons:
+            timeline.append({
+                "type": "reconciliation",
+                "timestamp": r["timestamp"],
+                "exchange_index": float("inf"),
+                "data": r,
+            })
+
+        timeline.sort(key=lambda ev: (ev["timestamp"], ev["exchange_index"]))
+
+        # 6. Replay timeline in chronological order
+        for ev in timeline:
+            if ev["type"] == "fill":
+                f = ev["data"]
+                self.pnl_tracker.record_fill(
+                    ticker=ticker,
+                    action=f["action"],
+                    side=f["side"],
+                    count=f["count"],
+                    price_cents=f["price_cents"],
+                    fee_cents=f["fee_cents"],
+                    timestamp=f["timestamp"],
+                )
+            elif ev["type"] == "reconciliation":
+                r = ev["data"]
+                # Fail closed on uncertain snapshot ordering: if any session fill occurred within
+                # the in-flight HTTP request window [snapshot_start, snapshot_end], the exchange state
+                # relative to the fill is ambiguous. Discard the uncertain snapshot to prevent
+                # fabricating erroneous MTM adjustments.
+                snap_start = r.get("snapshot_start")
+                snap_end = r.get("snapshot_end")
+                is_uncertain = False
+                if snap_start is not None and snap_end is not None and snap_end > snap_start:
+                    for f in ticker_fills:
+                        if snap_start <= f["timestamp"] <= snap_end:
+                            is_uncertain = True
+                            logger.warning(
+                                f"Discarding uncertain reconciliation snapshot for {ticker} at {r['timestamp']:.3f}: "
+                                f"fill {f.get('fill', {}).get('fill_id')} executed during in-flight request window "
+                                f"[{snap_start:.3f}, {snap_end:.3f}]."
+                            )
+                            break
+                if is_uncertain:
+                    continue
+
+                if r.get("mid_price") is not None:
+                    market.last_mid_price = r["mid_price"]
+                self.pnl_tracker.reconcile_inventory(
+                    ticker=ticker,
+                    target_position=r["target_position"],
+                    timestamp=r["timestamp"],
+                    record_event=False,
+                )
+
+        # 7. Synchronize manager positions from replayed inventory
+        self.positions[ticker] = self.pnl_tracker.get_open_inventory(ticker)
+
+        # 8. Recompute mark-to-market unrealized PnL against last known mid-price
+        if last_mid is not None:
+            self.pnl_tracker.update_mid_price(ticker, last_mid)
+        else:
+            unrealized = 0.0
+            for lot in market.open_lots:
+                if not lot.is_uncosted and lot.price_cents is not None:
+                    unrealized -= lot.entry_fee_per_contract * lot.count
+            market.unrealized_pnl_cents = round(unrealized, 4)
+
+        logger.info(
+            f"Rebuilt accounting for {ticker} (session={session_id[:8]}): {len(ticker_fills)} fills replayed | "
+            f"Cumulative Realized PnL: {market.realized_pnl_cents:+.2f}c | "
+            f"Session Realized PnL: {market.realized_pnl_cents - session_start_realized:+.2f}c | "
+            f"Open Lots: {len(market.open_lots)} ({sum(l.count for l in market.open_lots)} contracts)"
+        )
+
+    def reset_market_session(self, ticker: str, new_session_id: Optional[str] = None) -> str:
+        """
+        Resets session-level attribution for a market ticker across rotations.
+        """
+        return self.pnl_tracker.reset_market_session(ticker, new_session_id=new_session_id)
+
+    def rebuild_accounting(self, ticker: Optional[str] = None):
+        """
+        Public interface to rebuild FIFO accounting across all recorded fills in the session.
+        Serializes under _fill_lock.
+        """
+        with self._fill_lock:
+            tickers = [ticker] if ticker else list(set(f["ticker"] for f in self._recorded_fills) | set(self.positions.keys()))
+            for t in tickers:
+                self._rebuild_ticker_accounting(t)
+
+    async def subscribe(self, auto_reconcile: bool = False):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""
         if self.fill_store is not None:
             if self._fill_spool is not None:
                 raise RuntimeError("fill ingestion already started")
             path = os.environ.get("FILL_SPOOL_PATH", "data/fill_spool.sqlite3")
+            if auto_reconcile:
+                await self.reconcile_dirty_spool()
             try:
                 self._fill_spool = await asyncio.to_thread(FillSpool, path)
                 if await self._spool_call(self._fill_spool.dirty):
@@ -474,34 +996,32 @@ class InventoryManager:
                         raise FatalIngestionError("failed to durably spool fill") from exc
                     self._fill_wakeup.set()
                 try:
-                    if not isinstance(fill, dict):
-                        raise ValueError("fill payload must be an object")
-                    identities = []
-                    for key in ("fill_id", "trade_id"):
-                        value = fill.get(key)
-                        if value is not None:
-                            if not isinstance(value, str) or not value.strip():
-                                raise ValueError(f"invalid {key}")
-                            identities.append((key, value))
-                    if not any(key == "trade_id" for key, _ in identities):
-                        raise ValueError("WebSocket fill requires trade_id")
-                    content = {key: value for key, value in fill.items() if key not in ("fill_id", "trade_id")}
-                    existing = [self._seen_fill_ids[identity] for identity in identities if identity in self._seen_fill_ids]
-                    if existing:
-                        if any(previous["content"] != content or any(
-                            key in previous["ids"] and previous["ids"][key] != value
-                            for key, value in identities
-                        ) for previous in existing) or any(previous is not existing[0] for previous in existing):
-                            raise ValueError("conflicting fill identity")
-                        existing[0]["ids"].update(identities)
-                        self._seen_fill_ids.update({identity: existing[0] for identity in identities})
-                        return
-                    count_before = self._fill_count
-                    self._handle_fill(fill)
-                    if self._fill_count == count_before:
-                        raise ValueError("invalid inventory fill")
-                    record = {"content": content, "ids": dict(identities)}
-                    self._seen_fill_ids.update({identity: record for identity in identities})
+                    with self._fill_lock:
+                        if not isinstance(fill, dict):
+                            raise ValueError("fill payload must be an object")
+                        fill_id = fill.get("fill_id")
+                        trade_id = fill.get("trade_id")
+                        order_id = fill.get("order_id")
+
+                        if fill_id is not None and (not isinstance(fill_id, str) or not fill_id.strip()):
+                            raise ValueError(f"invalid fill_id: {fill_id!r}")
+                        if trade_id is not None and (not isinstance(trade_id, str) or not trade_id.strip()):
+                            raise ValueError(f"invalid trade_id: {trade_id!r}")
+                        if order_id is not None and (not isinstance(order_id, str) or not order_id.strip()):
+                            order_id = None
+
+                        if not trade_id:
+                            raise ValueError("WebSocket fill requires trade_id")
+
+                        existing = self._find_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="websocket")
+                        if existing is not None:
+                            return
+
+                        count_before = self._fill_count
+                        self._handle_fill(fill)
+                        if self._fill_count == count_before:
+                            raise ValueError("invalid inventory fill")
+                        self._record_seen_fill(fill_id=fill_id, trade_id=trade_id, order_id=order_id, fill=fill, source="websocket")
                 except Exception as exc:
                     self._fill_failure = exc
                     raise FatalIngestionError("failed to process inventory fill") from exc
@@ -642,6 +1162,25 @@ class InventoryManager:
         self._last_fill_times[ticker] = now
         fee = round(fee, 4)
 
+        # Parse timestamp and sequence index for chronological ordering
+        raw_ts = fill_msg.get("created_time")
+        if raw_ts is None:
+            raw_ts = fill_msg.get("ts")
+        fill_time = None
+        if raw_ts is not None:
+            from data.fill_reconciliation import aware_datetime
+            try:
+                fill_dt = aware_datetime(raw_ts)
+                fill_time = fill_dt.timestamp()
+            except Exception:
+                fill_time = None
+        if fill_time is None:
+            fill_time = now
+
+        seq = fill_msg.get("exchange_index")
+        if seq is None or isinstance(seq, bool) or not isinstance(seq, int):
+            seq = 0
+
         # Adjust balance based on action, preserving sub-cent precision to reconcile with PnLTracker
         if action == "buy":
             self.balance_cents = round(self.balance_cents - (price * count + fee), 4)
@@ -660,15 +1199,60 @@ class InventoryManager:
         new_pos = round(current_pos + delta, 4)
         self.positions[ticker] = int(new_pos) if new_pos.is_integer() else new_pos
         
-        # Track Realized and Unrealized PnL via FIFO lot matching
-        pnl_impact = self.pnl_tracker.record_fill(
-            ticker=ticker,
-            action=action,
-            side=side,
-            count=count,
-            price_cents=price,
-            fee_cents=fee
+        market = self.pnl_tracker.get_or_create_market(ticker)
+        session_id = market.rotation_session_id
+
+        # Check if fill arrived out of chronological order relative to already-recorded fills in this session
+        is_out_of_order = any(
+            f["ticker"] == ticker and (
+                f.get("rotation_session_id") == session_id or
+                (f.get("rotation_session_id") is None and market.rotation_count == 0)
+            ) and (
+                f["timestamp"] > fill_time or (f["timestamp"] == fill_time and f.get("exchange_index", 0) > seq)
+            )
+            for f in self._recorded_fills
         )
+
+        fill_entry = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "price_cents": price,
+            "fee_cents": fee,
+            "timestamp": fill_time,
+            "exchange_index": seq,
+            "rotation_session_id": session_id,
+            "fill": fill_msg,
+        }
+        self._recorded_fills.append(fill_entry)
+
+        has_recon_adj = round(market.reconciliation_adjustment_cents - market.session_start_reconciliation_adj_cents, 4) != 0.0
+        has_recon_events = bool(market.reconciliation_events)
+
+        if is_out_of_order or has_recon_adj or has_recon_events:
+            logger.info(
+                f"Detected out-of-order fill or reconciliation adjustments for {ticker} "
+                f"(out_of_order={is_out_of_order}, has_recon_adj={has_recon_adj}, has_recon_events={has_recon_events}). "
+                f"Rebuilding FIFO lot accounting in chronological order across {len(self._recorded_fills)} fills."
+            )
+            self._rebuild_ticker_accounting(ticker)
+        else:
+            # In-order execution: record directly into FIFO tracker
+            pnl_impact = self.pnl_tracker.record_fill(
+                ticker=ticker,
+                action=action,
+                side=side,
+                count=count,
+                price_cents=price,
+                fee_cents=fee,
+                timestamp=fill_time,
+            )
+            try:
+                for outcome in pnl_impact.get("matched_outcomes", []):
+                    KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
+            except Exception as e:
+                logger.debug(f"Prometheus round trip counter update skipped: {e}")
 
         # Update Prometheus metrics
         try:
@@ -679,9 +1263,6 @@ class InventoryManager:
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
             KALSHI_PORTFOLIO_VALUE_CENTS.set(self.get_portfolio_value(ticker))
             KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
-
-            for outcome in pnl_impact.get("matched_outcomes", []):
-                KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
         except Exception as e:
             logger.debug(f"Prometheus metric update skipped: {e}")
 
