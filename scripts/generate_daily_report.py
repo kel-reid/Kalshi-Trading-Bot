@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import requests
 
 # Add repository root to path for config imports
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,12 +32,14 @@ try:
     DEFAULT_DB_NAME = getattr(config, "DB_NAME", "kalshi_bot")
     DEFAULT_DB_USER = getattr(config, "DB_USER", "postgres")
     DEFAULT_DB_PASSWORD = getattr(config, "DB_PASSWORD", "postgres")
+    DEFAULT_ALERT_WEBHOOK_URL = getattr(config, "ALERT_WEBHOOK_URL", os.getenv("ALERT_WEBHOOK_URL"))
 except ImportError:
     DEFAULT_DB_HOST = os.getenv("DB_HOST", "localhost")
     DEFAULT_DB_PORT = int(os.getenv("DB_PORT", "5432"))
     DEFAULT_DB_NAME = os.getenv("DB_NAME", "kalshi_bot")
     DEFAULT_DB_USER = os.getenv("DB_USER", "postgres")
     DEFAULT_DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+    DEFAULT_ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
 logger = logging.getLogger("DailyReportGenerator")
 
@@ -710,6 +713,108 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_slack_report(metrics: Dict[str, Any]) -> str:
+    """Formats the session metrics into a clean, compact Slack mrkdwn message."""
+    target_date = metrics.get("date", "Unknown Date")
+    tz_name = metrics.get("timezone", "America/New_York")
+    totals = metrics.get("totals", {})
+    tickers = metrics.get("tickers", {})
+    recommendations = generate_recommendations(metrics)
+
+    realized_dlr = totals.get("total_realized_delta_cents", 0.0) / 100.0
+    unrealized_delta_dlr = totals.get("total_unrealized_delta_cents", 0.0) / 100.0
+    fees_dlr = totals.get("total_fees_delta_cents", 0.0) / 100.0
+    net_pnl_dlr = totals.get("net_strategy_pnl_cents", 0.0) / 100.0
+
+    fills = totals.get("total_fills", 0)
+    orders = totals.get("total_orders", 0)
+    cancels = totals.get("total_cancels", 0)
+
+    total_rts = totals.get("total_round_trips", 0)
+    wins = totals.get("winning_trades", 0)
+    losses = totals.get("losing_trades", 0)
+    scratches = totals.get("scratch_trades", 0)
+    win_rate = totals.get("win_rate_pct", 0.0)
+    win_rate_ex = totals.get("win_rate_ex_scratches_pct", 0.0)
+
+    gross_wins_dlr = totals.get("gross_wins_cents", 0.0) / 100.0
+    gross_losses_dlr = totals.get("gross_losses_cents", 0.0) / 100.0
+    avg_win_dlr = totals.get("avg_win_cents", 0.0) / 100.0
+    avg_loss_dlr = totals.get("avg_loss_cents", 0.0) / 100.0
+    profit_factor = totals.get("profit_factor", 0.0)
+
+    lines = [
+        f"📊 *Kalshi Trading Bot — Daily Performance Report: {target_date}*",
+        f"*Session Timezone*: `{tz_name}` | *Active Markets*: {totals.get('active_market_count', 0)}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*1. FINANCIAL ACCOUNTING SUMMARY*",
+        f"• *Session Realized PnL*: `${realized_dlr:+.2f}`",
+        f"• *Session Unrealized PnL*: `${unrealized_delta_dlr:+.2f}`",
+        f"• *Net Strategy PnL*: `${net_pnl_dlr:+.2f}` (ΔRealized + ΔUnrealized)",
+        f"• *Total Session Fees Paid*: `${fees_dlr:.2f}`",
+        f"• *Ending Open Inventory*: `0` contracts",
+        "",
+        "*2. EXECUTION & ROUND-TRIP DYNAMICS*",
+        f"• *Total Orders Quoted*: {orders:,} ({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs)",
+        f"• *Executed Fills*: {fills} | *Cancellations / Replacements*: {cancels:,}",
+        f"• *Completed FIFO Round Trips*: {total_rts}",
+        f"• *Win / Loss / Scratch*: {wins} Wins ({win_rate:.1f}%) | {losses} Losses ({(losses/total_rts*100.0) if total_rts else 0.0:.1f}%) | {scratches} Scratches",
+        f"• *Win Rate (ex-scratches)*: *{win_rate_ex:.1f}%*",
+        f"• *Profit Factor*: *{profit_factor:.2f}* (Gross Wins: `${gross_wins_dlr:+.2f}` | Gross Losses: `${gross_losses_dlr:+.2f}`)",
+        f"• *Average Win / Loss*: `${avg_win_dlr:+.2f}` / `${avg_loss_dlr:+.2f}`",
+        "",
+        "*3. MARKET-BY-MARKET BREAKDOWN*",
+        "```",
+        f"{'Market':<35} {'Net PnL':>9} {'Fees':>8} {'Fills':>6} {'Win%':>7}",
+    ]
+
+    for ticker, t in sorted(tickers.items()):
+        t_net = t["net_pnl_cents"] / 100.0
+        t_fees = t["fees_delta_cents"] / 100.0
+        t_fills = t.get("fills", 0)
+        t_outcomes = t.get("trade_outcomes", {})
+        t_wr = f"{t_outcomes.get('win_rate_pct', 0.0):.1f}%" if t_outcomes.get("total_round_trips", 0) > 0 else "N/A"
+        lines.append(f"{ticker:<35} {t_net:>+8.2f}$ {t_fees:>7.2f}$ {t_fills:>6} {t_wr:>7}")
+
+    lines.append(f"{'TOTAL':<35} {net_pnl_dlr:>+8.2f}$ {fees_dlr:>7.2f}$ {fills:>6} {win_rate_ex:>6.1f}%")
+    lines.extend([
+        "```",
+        "",
+        "*4. ALGORITHMIC OBSERVATIONS & RECOMMENDATIONS*",
+    ])
+    for rec in recommendations:
+        lines.append(f"• {rec}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines)
+
+
+def send_slack_report(webhook_url: Optional[str], message: str, timeout: int = 10) -> bool:
+    """Delivers a formatted report message to a Slack incoming webhook."""
+    if not webhook_url:
+        logger.error("No Slack webhook URL configured.")
+        return False
+
+    payload = {"text": message}
+    try:
+        resp = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if resp.status_code < 400:
+            logger.info("Daily performance report successfully delivered to Slack.")
+            return True
+        else:
+            logger.error(f"Failed to post report to Slack (HTTP {resp.status_code}): {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Error posting daily report to Slack: {e}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate daily trading performance analysis report.")
     parser.add_argument(
@@ -729,6 +834,18 @@ def main():
         type=str,
         default=None,
         help="Optional file path to write Markdown report.",
+    )
+    parser.add_argument(
+        "--slack",
+        action="store_true",
+        default=False,
+        help="Post the generated performance report to Slack webhook.",
+    )
+    parser.add_argument(
+        "--webhook-url",
+        type=str,
+        default=DEFAULT_ALERT_WEBHOOK_URL,
+        help="Webhook URL for Slack delivery (defaults to ALERT_WEBHOOK_URL).",
     )
     parser.add_argument("--db-host", type=str, default=DEFAULT_DB_HOST, help="PostgreSQL host.")
     parser.add_argument("--db-port", type=int, default=DEFAULT_DB_PORT, help="PostgreSQL port.")
@@ -772,6 +889,12 @@ def main():
             print(f"Daily performance report written to: {args.output}")
         else:
             print(report)
+
+        if args.slack:
+            slack_msg = format_slack_report(metrics)
+            success = send_slack_report(args.webhook_url, slack_msg)
+            if not success:
+                sys.exit(1)
     finally:
         conn.close()
 

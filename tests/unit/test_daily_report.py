@@ -6,10 +6,15 @@ Validates:
 """
 
 import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 
-from scripts.generate_daily_report import compute_fifo_round_trips, fetch_daily_metrics
+from scripts.generate_daily_report import (
+    compute_fifo_round_trips,
+    fetch_daily_metrics,
+    format_slack_report,
+    send_slack_report,
+)
 
 
 def test_compute_fifo_round_trips_matched():
@@ -89,3 +94,87 @@ def test_fetch_daily_metrics_queries_verified_executed_and_filled_404():
 
     assert "KXTEST-TICKER" in metrics["tickers"]
     assert metrics["tickers"]["KXTEST-TICKER"]["fills"] == 2
+
+
+def test_format_slack_report():
+    metrics = {
+        "date": "2026-11-22",
+        "timezone": "America/New_York",
+        "totals": {
+            "total_realized_delta_cents": -258.0,
+            "total_unrealized_delta_cents": -15.0,
+            "total_fees_delta_cents": 73.0,
+            "net_strategy_pnl_cents": -273.0,
+            "total_orders": 707,
+            "total_buy_orders": 343,
+            "total_sell_orders": 364,
+            "total_fills": 55,
+            "total_cancels": 642,
+            "active_market_count": 2,
+            "total_round_trips": 39,
+            "winning_trades": 12,
+            "losing_trades": 26,
+            "scratch_trades": 1,
+            "win_rate_pct": 30.8,
+            "win_rate_ex_scratches_pct": 31.6,
+            "gross_wins_cents": 388.0,
+            "gross_losses_cents": -609.0,
+            "avg_win_cents": 32.0,
+            "avg_loss_cents": -23.0,
+            "profit_factor": 0.64,
+        },
+        "tickers": {
+            "KXTEST-1": {
+                "net_pnl_cents": -175.0,
+                "fees_delta_cents": 51.0,
+                "fills": 15,
+                "trade_outcomes": {"win_rate_pct": 10.0, "total_round_trips": 10},
+            },
+            "KXTEST-2": {
+                "net_pnl_cents": 0.0,
+                "fees_delta_cents": 69.0,
+                "fills": 36,
+                "trade_outcomes": {"win_rate_pct": 39.1, "total_round_trips": 20},
+            },
+        },
+    }
+
+    report = format_slack_report(metrics)
+    assert "*Kalshi Trading Bot — Daily Performance Report: 2026-11-22*" in report
+    assert "• *Session Realized PnL*: `$-2.58`" in report
+    assert "• *Net Strategy PnL*: `$-2.73`" in report
+    assert "• *Total Session Fees Paid*: `$0.73`" in report
+    assert "• *Win Rate (ex-scratches)*: *31.6%*" in report
+    assert "• *Profit Factor*: *0.64*" in report
+    assert "KXTEST-1" in report
+    assert "KXTEST-2" in report
+
+
+def test_send_slack_report_success():
+    with patch("requests.post") as mock_post:
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.text = "ok"
+
+        success = send_slack_report("https://hooks.slack.com/services/TEST", "Test Report")
+        assert success is True
+        mock_post.assert_called_once_with(
+            "https://hooks.slack.com/services/TEST",
+            json={"text": "Test Report"},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+
+
+def test_send_slack_report_failure_status():
+    with patch("requests.post") as mock_post:
+        mock_post.return_value.status_code = 404
+        mock_post.return_value.text = "Not Found"
+
+        success = send_slack_report("https://hooks.slack.com/services/TEST", "Test Report")
+        assert success is False
+
+
+def test_send_slack_report_no_url():
+    success = send_slack_report(None, "Test Report")
+    assert success is False
+
