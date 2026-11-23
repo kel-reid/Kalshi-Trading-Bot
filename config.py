@@ -123,7 +123,7 @@ TARGET_PREFERENCE = _raw_target
 # bounded from below by the exact round-trip Kalshi fee floor + target edge.
 DYNAMIC_SPREAD_ENABLED = os.getenv("DYNAMIC_SPREAD_ENABLED", "true").lower() in ("true", "1", "yes")
 TARGET_EDGE_CENTS = _get_float_env("TARGET_EDGE_CENTS", 1.5, allow_zero=True)
-MIN_DYNAMIC_SPREAD_CENTS = _get_int_env("MIN_DYNAMIC_SPREAD_CENTS", 2)
+MIN_DYNAMIC_SPREAD_CENTS = _get_int_env("MIN_DYNAMIC_SPREAD_CENTS", MIN_SPREAD)
 MAX_DYNAMIC_SPREAD_CENTS = _get_int_env("MAX_DYNAMIC_SPREAD_CENTS", 15)
 VOLATILITY_WINDOW_SECONDS = _get_float_env("VOLATILITY_WINDOW_SECONDS", 30.0)
 KALSHI_FEE_RATE = _get_float_env("KALSHI_FEE_RATE", 0.07)
@@ -189,6 +189,12 @@ BLACKOUT_ENABLED = os.getenv("BLACKOUT_ENABLED", "true").lower() in ("true", "1"
 EXPIRATION_BLACKOUT_SECONDS = _get_int_env("EXPIRATION_BLACKOUT_SECONDS", 1800, allow_zero=True)
 BLACKOUT_DANGER_PRICE_LOW = _get_int_env("BLACKOUT_DANGER_PRICE_LOW", 20, allow_zero=True)
 BLACKOUT_DANGER_PRICE_HIGH = _get_int_env("BLACKOUT_DANGER_PRICE_HIGH", 80, allow_zero=True)
+
+# Late-Session Dynamic Inventory Tapering Safeguards
+# Progressively steps down order sizes and position limits ahead of expiration blackout,
+# and enforces reduce-only quoting to prevent toxic settlement cliff inventory accumulation.
+INVENTORY_TAPER_ENABLED = os.getenv("INVENTORY_TAPER_ENABLED", "true").lower() in ("true", "1", "yes")
+INVENTORY_TAPER_WINDOW_SECONDS = _get_int_env("INVENTORY_TAPER_WINDOW_SECONDS", 1800, allow_zero=True)
 
 # Fee Churn & Session Stop-Loss Safeguards (Cents)
 # Cease quoting, liquidate inventory, and rotate away if fees or net loss on a single market session exceed these thresholds.

@@ -80,6 +80,8 @@ from config import (
     EXPIRATION_BLACKOUT_SECONDS,
     BLACKOUT_DANGER_PRICE_LOW,
     BLACKOUT_DANGER_PRICE_HIGH,
+    INVENTORY_TAPER_ENABLED,
+    INVENTORY_TAPER_WINDOW_SECONDS,
 )
 from strategy.dynamic_spread import (
     RollingVolatilityEstimator,
@@ -146,6 +148,8 @@ class AvellanedaStoikovBot:
         expiration_blackout_seconds: Optional[int] = None,
         blackout_danger_price_low: Optional[int] = None,
         blackout_danger_price_high: Optional[int] = None,
+        inventory_taper_enabled: Optional[bool] = None,
+        inventory_taper_window_seconds: Optional[int] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -296,6 +300,16 @@ class AvellanedaStoikovBot:
             min(99, int(blackout_danger_price_high))
             if blackout_danger_price_high is not None
             else BLACKOUT_DANGER_PRICE_HIGH
+        )
+        self.inventory_taper_enabled = (
+            bool(inventory_taper_enabled)
+            if inventory_taper_enabled is not None
+            else INVENTORY_TAPER_ENABLED
+        )
+        self.inventory_taper_window_seconds = (
+            max(0, int(inventory_taper_window_seconds))
+            if inventory_taper_window_seconds is not None
+            else INVENTORY_TAPER_WINDOW_SECONDS
         )
         self._market_close_time: Optional[datetime.datetime] = None
         self._in_expiration_blackout: bool = False
@@ -629,7 +643,43 @@ class AvellanedaStoikovBot:
         except Exception as e:
             logger.debug(f"Failed to refresh market metadata for {self.ticker}: {e}")
 
-    def calculate_order_size(self, mid_price: Optional[float]) -> int:
+    def get_inventory_taper_factor(self, now_dt: Optional[datetime.datetime] = None) -> float:
+        """
+        Calculates dynamic inventory tapering factor alpha in [0.0, 1.0] as the market approaches
+        expiration blackout:
+            alpha = max(0.0, min(1.0, (remaining_to_close - blackout_seconds) / taper_window_seconds))
+
+        When alpha == 1.0, market is outside tapering window (full sizing and normal limits).
+        When 0.0 < alpha < 1.0, market is within the pre-blackout tapering window:
+            - Order sizing scales down smoothly towards 1 contract.
+            - Maximum inventory limits taper down.
+            - Reservation price gamma skew increases to favor flattening open exposure.
+        When alpha == 0.0, market has reached or passed the blackout threshold.
+        """
+        if not self.inventory_taper_enabled or self._market_close_time is None or self.inventory_taper_window_seconds <= 0:
+            return 1.0
+
+        now_utc = now_dt if (now_dt is not None and isinstance(now_dt, datetime.datetime)) else datetime.datetime.now(datetime.timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=datetime.timezone.utc)
+
+        close_time = self._market_close_time
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=datetime.timezone.utc)
+
+        remaining_to_close = (close_time - now_utc).total_seconds()
+        if remaining_to_close <= self.expiration_blackout_seconds:
+            return 0.0
+
+        taper_start = self.expiration_blackout_seconds + self.inventory_taper_window_seconds
+        if remaining_to_close >= taper_start:
+            return 1.0
+
+        time_into_taper = remaining_to_close - self.expiration_blackout_seconds
+        alpha = time_into_taper / float(self.inventory_taper_window_seconds)
+        return max(0.0, min(1.0, alpha))
+
+    def calculate_order_size(self, mid_price: Optional[float], taper_factor: float = 1.0) -> int:
         """
         Calculates the order size (contract count) for the current quoting cycle.
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
@@ -641,21 +691,33 @@ class AvellanedaStoikovBot:
         Additionally enforces a collateral-constrained ceiling (self.max_low_price_contracts)
         when contract prices fall below low_price_threshold_cents (< 25c) to prevent
         collateral exhaustion on the short/NO leg.
+        When taper_factor in [0.0, 1.0) is supplied (pre-blackout tapering), contract count
+        and low-price caps scale down smoothly towards 1 contract.
         Otherwise falls back to fixed order_size (also capped by max_order_contracts).
         """
+        tf = float(taper_factor) if (isinstance(taper_factor, (int, float)) and not isinstance(taper_factor, bool) and math.isfinite(taper_factor) and taper_factor >= 0.0) else 1.0
+        tf = min(1.0, tf)
+
         if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
             if isinstance(mid_price, (int, float)) and not isinstance(mid_price, bool) and math.isfinite(mid_price) and mid_price > 0:
                 # Bound midpoint to Kalshi's valid exchange quoting limits [1c, 99c]
                 # to prevent runaway contract counts on extreme/sub-cent books (e.g. 0.05c -> 2,000 contracts)
                 effective_price = max(1.0, min(99.0, float(mid_price)))
                 raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
+                if tf < 1.0:
+                    raw_count = max(1, math.floor(raw_count * tf))
                 capped_count = min(self.max_order_contracts, raw_count)
                 # Collateral-constrained ceiling for low-price contracts
                 if self.max_low_price_contracts and self.max_low_price_contracts > 0:
                     if effective_price <= self.low_price_threshold_cents:
-                        capped_count = min(capped_count, self.max_low_price_contracts)
+                        low_limit = self.max_low_price_contracts
+                        if tf < 1.0:
+                            low_limit = max(1, math.floor(low_limit * tf))
+                        capped_count = min(capped_count, low_limit)
                 return capped_count
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        if tf < 1.0:
+            fallback = max(1, math.floor(fallback * tf))
         return min(self.max_order_contracts, max(1, fallback))
 
 
@@ -1235,10 +1297,15 @@ class AvellanedaStoikovBot:
             rec_task.add_done_callback(self._background_tasks.discard)
 
         # 3. Determine dynamic quote size and hedge threshold for current market price
-        quote_size = self.calculate_order_size(mid_price)
+        taper_factor = self.get_inventory_taper_factor()
+        quote_size = self.calculate_order_size(mid_price, taper_factor=taper_factor)
         self._current_quote_size = quote_size
         base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
-        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
+        if taper_factor < 1.0:
+            tapered_hedge = max(1, math.ceil(base_hedge_threshold * taper_factor))
+            hedge_threshold = min(self.max_hedge_inventory, tapered_hedge)
+        else:
+            hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
 
         # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
         pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
@@ -1445,10 +1512,15 @@ class AvellanedaStoikovBot:
         normalized_q = (inventory / quote_size) if (self.order_dollars and quote_size > 0) else inventory
 
         effective_gamma = self.gamma
+        if taper_factor < 1.0:
+            # Pre-blackout de-risking: smoothly boost gamma up to 2.5x as we approach blackout
+            taper_gamma_multiplier = 1.0 + (1.0 - taper_factor) * 1.5
+            effective_gamma = self.gamma * taper_gamma_multiplier
+
         if self.momentum_skew_enabled and abs(normalized_q) > 1.0:
             excess_q = abs(normalized_q) - 1.0
             gamma_scale = min(self.max_gamma_multiplier, 1.0 + (self.momentum_gamma_factor * excess_q))
-            effective_gamma = self.gamma * gamma_scale
+            effective_gamma = effective_gamma * gamma_scale
 
         # Adverse Momentum / Drift Skew:
         # If orderbook mid price has drifted adversely against current inventory position,
@@ -1543,6 +1615,32 @@ class AvellanedaStoikovBot:
                 optimal_ask = None
                 try:
                     SAFEGUARD_EVENTS_TOTAL.labels(safeguard="blackout_danger_zone", ticker=self.ticker).inc()
+                except Exception:
+                    pass
+
+        # Late-Session Dynamic Inventory Tapering (Pre-Blackout De-risking Safeguard):
+        # Progressively steps down position risk in the window leading up to expiration blackout.
+        # When within the latter half of the taper window (taper_factor < 0.50) and holding open inventory,
+        # suppress quotes on the accumulating side to guarantee that remaining resting orders can ONLY reduce inventory.
+        if self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0:
+            if inventory > 0 and optimal_bid is not None:
+                logger.info(
+                    f"[INVENTORY TAPER - REDUCE ONLY] Taper factor {taper_factor:.2f} < 0.50. "
+                    f"Suppressing BUY YES quote to unwind long inventory ({inventory})."
+                )
+                optimal_bid = None
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="inventory_taper", ticker=self.ticker).inc()
+                except Exception:
+                    pass
+            elif inventory < 0 and optimal_ask is not None:
+                logger.info(
+                    f"[INVENTORY TAPER - REDUCE ONLY] Taper factor {taper_factor:.2f} < 0.50. "
+                    f"Suppressing SELL YES quote to unwind short inventory ({inventory})."
+                )
+                optimal_ask = None
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="inventory_taper", ticker=self.ticker).inc()
                 except Exception:
                     pass
 
