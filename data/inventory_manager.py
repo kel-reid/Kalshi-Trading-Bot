@@ -33,7 +33,7 @@ from utils.metrics import (
     KALSHI_PORTFOLIO_VALUE_CENTS,
     KALSHI_POSITIONS_VALUE_CENTS,
 )
-from data.pnl_tracker import PnLTracker
+from data.pnl_tracker import PnLTracker, InventoryLot
 from data.fill_spool import FillSpool
 from data.websocket_client import FatalIngestionError
 
@@ -668,19 +668,32 @@ class InventoryManager:
     def _rebuild_ticker_accounting(self, ticker: str):
         """
         Rebuilds FIFO lot matching and realized PnL for a ticker from scratch in
-        strictly chronological order (ts, exchange_index) using all recorded fills.
+        strictly chronological order (ts, exchange_index) using recorded fills
+        aligned with the current rotation session baseline.
         """
         market = self.pnl_tracker.get_or_create_market(ticker)
 
-        # 1. Preserve session baseline and configuration
+        # 1. Capture session baseline and configuration
+        session_id = market.rotation_session_id
         session_start_realized = market.session_start_realized_cents
         session_start_fees = market.session_start_fees_cents
         reconciliation_adj = market.reconciliation_adjustment_cents
         last_mid = market.last_mid_price
-        session_id = market.rotation_session_id
 
         # 2. Reset lot list and accumulators to session baseline
-        market.open_lots = []
+        market.open_lots = [
+            InventoryLot(
+                lot_id=l.lot_id,
+                ticker=l.ticker,
+                action=l.action,
+                price_cents=l.price_cents,
+                count=l.count,
+                timestamp=l.timestamp,
+                is_uncosted=l.is_uncosted,
+                entry_fee_per_contract=l.entry_fee_per_contract,
+            )
+            for l in market.session_start_open_lots
+        ]
         market.realized_pnl_cents = round(session_start_realized + reconciliation_adj, 4)
         market.total_fees_cents = round(session_start_fees, 4)
         market.total_volume_contracts = 0
@@ -690,17 +703,25 @@ class InventoryManager:
         market.scratch_trades_count = 0
         market.unrealized_pnl_cents = 0.0
 
-        # 3. Re-seed initial inventory lot if hydrated at startup
-        seeded = self._initial_seeded_inventory.get(ticker)
-        if seeded is not None:
-            init_pos, init_cost_basis = seeded
-            self.pnl_tracker.seed_initial_inventory(ticker, init_pos, cost_basis_cents=init_cost_basis)
+        # If session_start_open_lots was empty and we are in the initial session (no rotation has occurred),
+        # re-seed startup inventory if hydrated at startup.
+        if not market.open_lots and session_start_realized == 0.0:
+            seeded = self._initial_seeded_inventory.get(ticker)
+            if seeded is not None:
+                init_pos, init_cost_basis = seeded
+                self.pnl_tracker.seed_initial_inventory(ticker, init_pos, cost_basis_cents=init_cost_basis)
 
-        # 4. Extract and sort all recorded session fills for this ticker in ascending chronological order
-        ticker_fills = [f for f in self._recorded_fills if f["ticker"] == ticker]
+        # 3. Extract and sort recorded fills for THIS ticker and rotation session in ascending chronological order
+        ticker_fills = [
+            f for f in self._recorded_fills
+            if f["ticker"] == ticker and (
+                f.get("rotation_session_id") == session_id or
+                (f.get("rotation_session_id") is None and session_start_realized == 0.0)
+            )
+        ]
         ticker_fills.sort(key=lambda f: (f["timestamp"], f.get("exchange_index", 0)))
 
-        # 5. Replay fills through FIFO matching
+        # 4. Replay fills through FIFO matching
         for f in ticker_fills:
             self.pnl_tracker.record_fill(
                 ticker=ticker,
@@ -712,7 +733,7 @@ class InventoryManager:
                 timestamp=f["timestamp"],
             )
 
-        # 6. Recompute mark-to-market unrealized PnL against last known mid-price
+        # 5. Recompute mark-to-market unrealized PnL against last known mid-price
         if last_mid is not None:
             self.pnl_tracker.update_mid_price(ticker, last_mid)
         else:
@@ -723,10 +744,17 @@ class InventoryManager:
             market.unrealized_pnl_cents = round(unrealized, 4)
 
         logger.info(
-            f"Rebuilt accounting for {ticker}: {len(ticker_fills)} fills replayed | "
-            f"Realized PnL: {market.realized_pnl_cents:+.2f}c | "
+            f"Rebuilt accounting for {ticker} (session={session_id[:8]}): {len(ticker_fills)} fills replayed | "
+            f"Cumulative Realized PnL: {market.realized_pnl_cents:+.2f}c | "
+            f"Session Realized PnL: {market.realized_pnl_cents - session_start_realized:+.2f}c | "
             f"Open Lots: {len(market.open_lots)} ({sum(l.count for l in market.open_lots)} contracts)"
         )
+
+    def reset_market_session(self, ticker: str, new_session_id: Optional[str] = None) -> str:
+        """
+        Resets session-level attribution for a market ticker across rotations.
+        """
+        return self.pnl_tracker.reset_market_session(ticker, new_session_id=new_session_id)
 
     def rebuild_accounting(self, ticker: Optional[str] = None):
         """
@@ -1069,9 +1097,15 @@ class InventoryManager:
         new_pos = round(current_pos + delta, 4)
         self.positions[ticker] = int(new_pos) if new_pos.is_integer() else new_pos
         
-        # Check if fill arrived out of chronological order relative to already-recorded fills
+        market = self.pnl_tracker.get_or_create_market(ticker)
+        session_id = market.rotation_session_id
+
+        # Check if fill arrived out of chronological order relative to already-recorded fills in this session
         is_out_of_order = any(
             f["ticker"] == ticker and (
+                f.get("rotation_session_id") == session_id or
+                (f.get("rotation_session_id") is None and market.session_start_realized_cents == 0.0)
+            ) and (
                 f["timestamp"] > fill_time or (f["timestamp"] == fill_time and f.get("exchange_index", 0) > seq)
             )
             for f in self._recorded_fills
@@ -1086,6 +1120,7 @@ class InventoryManager:
             "fee_cents": fee,
             "timestamp": fill_time,
             "exchange_index": seq,
+            "rotation_session_id": session_id,
             "fill": fill_msg,
         }
         self._recorded_fills.append(fill_entry)

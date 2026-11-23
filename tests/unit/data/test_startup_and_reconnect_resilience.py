@@ -922,3 +922,150 @@ def test_arbitrary_arrival_permutations_yield_identical_fifo_realized_pnl():
         assert market.open_lots[0].price_cents == 50.0
         assert market.open_lots[0].count == 1
 
+
+@pytest.mark.asyncio
+async def test_rotation_session_accounting_rebuild_prevents_double_counting():
+    """
+    Verify that rotating away from and returning to a traded ticker preserves the
+    session accounting baseline without double-counting prior realized PnL or fees
+    during a reconnect rebuild.
+
+    Scenario:
+    1. Session 1: Buy 1 @ 40c, Sell 1 @ 60c (fees 5c each).
+       -> Cumulative Realized: +10c net ($0.10), Total Fees: 10c ($0.10).
+       -> Session 1 Realized: +10c, Session 1 Fees: 10c.
+    2. Slate rotation: rotate away and later return to ticker (reset_market_session).
+       -> Session baseline saved at Realized = 10c, Fees = 10c.
+       -> Session 2 Realized Delta = 0c, Session 2 Fees = 0c.
+    3. Reconnect occurs -> rebuild_accounting() runs.
+       -> Must NOT double-count: Cumulative Realized must remain 10c (NOT 20c).
+       -> Session 2 Realized must remain 0c (NOT 10c).
+       -> Total Fees must remain 10c (NOT 20c).
+    4. Session 2 trading with out-of-order fills:
+       -> Live fill: Buy 1 @ 50c (fee 5c, t=10:02:00) arrives first.
+       -> REST recovery: Buy 1 @ 30c (fee 5c, t=10:00:00) & Sell 1 @ 70c (fee 5c, t=10:01:00).
+       -> Net Session 2 Realized: (70 - 30) - 10 = +30c.
+       -> Cumulative Realized: 10c + 30c = 40c.
+       -> Session 2 Realized: 40c - 10c = 30c.
+       -> Total Fees: 10c + 15c = 25c.
+       -> Session 2 Fees: 25c - 10c = 15c.
+       -> Open lot: 1 contract @ 50c.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Session 1 trades
+    fill1 = {
+        "fill_id": "s1-f1",
+        "trade_id": "s1-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.40",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-23T09:30:00Z",
+    }
+    fill2 = {
+        "fill_id": "s1-f2",
+        "trade_id": "s1-t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-23T09:31:00Z",
+    }
+    await manager._handle_message({"type": "fill", "msg": fill1})
+    await manager._handle_message({"type": "fill", "msg": fill2})
+
+    s1_summary = pnl.get_market_summary("KXTEST")
+    assert s1_summary["realized_pnl_cents"] == 10.0  # (60 - 40) - 5 (entry) - 5 (exit)
+    assert s1_summary["total_fees_cents"] == 10.0
+    assert s1_summary["session_realized_pnl_cents"] == 10.0
+    assert s1_summary["session_fees_cents"] == 10.0
+    assert manager.get_position("KXTEST") == 0
+
+    # 2. Slate rotation: rotate away and later return to ticker
+    manager.reset_market_session("KXTEST")
+
+    s2_initial = pnl.get_market_summary("KXTEST")
+    assert s2_initial["realized_pnl_cents"] == 10.0
+    assert s2_initial["total_fees_cents"] == 10.0
+    assert s2_initial["session_realized_pnl_cents"] == 0.0
+    assert s2_initial["session_fees_cents"] == 0.0
+
+    # 3. Reconnect occurs -> rebuild_accounting()
+    manager.rebuild_accounting("KXTEST")
+
+    s2_rebuilt = pnl.get_market_summary("KXTEST")
+    assert s2_rebuilt["realized_pnl_cents"] == 10.0  # MUST NOT be 20c
+    assert s2_rebuilt["total_fees_cents"] == 10.0     # MUST NOT be 20c
+    assert s2_rebuilt["session_realized_pnl_cents"] == 0.0  # MUST NOT be 10c
+    assert s2_rebuilt["session_fees_cents"] == 0.0          # MUST NOT be 10c
+    assert manager.get_position("KXTEST") == 0
+
+    # 4. Session 2 trading with out-of-order fill arrivals
+    s2_fill3 = {
+        "fill_id": "s2-f3",
+        "trade_id": "s2-t3",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-23T10:02:00Z",
+    }
+    s2_fill1 = {
+        "fill_id": "s2-f1",
+        "trade_id": "s2-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.30",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-23T10:00:00Z",
+    }
+    s2_fill2 = {
+        "fill_id": "s2-f2",
+        "trade_id": "s2-t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.70",
+        "fee_dollars": "0.05",
+        "created_time": "2026-11-23T10:01:00Z",
+    }
+
+    # Live fill 3 arrives first
+    await manager._handle_message({"type": "fill", "msg": s2_fill3})
+
+    # REST recovery delivers fill 1 and fill 2 out-of-order afterward
+    assert manager.apply_reconciled_fill(s2_fill1) is True
+    assert manager.apply_reconciled_fill(s2_fill2) is True
+
+    s2_final = pnl.get_market_summary("KXTEST")
+    # Gross PnL in session 2: 70 - 30 = 40c. Net of fees (5c entry + 5c exit): 30c.
+    # Cumulative Realized PnL: 10c (session 1) + 30c (session 2) = 40c
+    assert s2_final["realized_pnl_cents"] == 40.0
+    # Session 2 Realized PnL: 40c - 10c (baseline) = 30c
+    assert s2_final["session_realized_pnl_cents"] == 30.0
+    # Total Fees: 10c (session 1) + 15c (session 2) = 25c
+    assert s2_final["total_fees_cents"] == 25.0
+    # Session 2 Fees: 25c - 10c (baseline) = 15c
+    assert s2_final["session_fees_cents"] == 15.0
+    # Net position is 1 contract
+    assert manager.get_position("KXTEST") == 1
+    # Open lot is the unclosed 50c buy
+    market = pnl.get_or_create_market("KXTEST")
+    assert len(market.open_lots) == 1
+    assert market.open_lots[0].price_cents == 50.0
+    assert market.open_lots[0].count == 1
+
+

@@ -40,6 +40,7 @@ class MarketPnL:
     reconciliation_adjustment_cents: float = 0.0  # MTM adjustments realized during REST inventory reconciliation
     session_start_realized_cents: float = 0.0  # Realized PnL baseline at rotation session start
     session_start_fees_cents: float = 0.0  # Total fees baseline at rotation session start
+    session_start_open_lots: List[InventoryLot] = field(default_factory=list)
     round_trips_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
@@ -73,6 +74,19 @@ class PnLTracker:
         market.rotation_session_id = new_session_id or str(uuid.uuid4())
         market.session_start_realized_cents = market.realized_pnl_cents
         market.session_start_fees_cents = market.total_fees_cents
+        market.session_start_open_lots = [
+            InventoryLot(
+                lot_id=l.lot_id,
+                ticker=l.ticker,
+                action=l.action,
+                price_cents=l.price_cents,
+                count=l.count,
+                timestamp=l.timestamp,
+                is_uncosted=l.is_uncosted,
+                entry_fee_per_contract=l.entry_fee_per_contract,
+            )
+            for l in market.open_lots
+        ]
         return market.rotation_session_id
 
     def seed_initial_inventory(self, ticker: str, position: Union[int, float], cost_basis_cents: Optional[float] = None):
@@ -105,6 +119,18 @@ class PnLTracker:
                 is_uncosted=is_uncosted,
             )
             market.open_lots.append(lot)
+            market.session_start_open_lots = [
+                InventoryLot(
+                    lot_id=lot.lot_id,
+                    ticker=lot.ticker,
+                    action=lot.action,
+                    price_cents=lot.price_cents,
+                    count=lot.count,
+                    timestamp=lot.timestamp,
+                    is_uncosted=lot.is_uncosted,
+                    entry_fee_per_contract=lot.entry_fee_per_contract,
+                )
+            ]
             if is_uncosted:
                 logger.warning(
                     f"Seeded uncosted initial lot for {ticker}: {lot_count} {action.upper()}. "
