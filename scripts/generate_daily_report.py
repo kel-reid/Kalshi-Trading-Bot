@@ -456,7 +456,7 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
             concentrated_drawdowns.append((ticker, t_real / 100.0, min_inv, max_inv, abs(t_real)))
 
     if concentrated_drawdowns:
-        details = ", ".join([f"`{t}` (${loss:+.2f}, inv [{min_i}, +{max_i}])" for t, loss, min_i, max_i, _ in concentrated_drawdowns])
+        details = ", ".join([f"`{t}` (${loss:+.2f}, inv [{min_i}, {max_i:+}])" for t, loss, min_i, max_i, _ in concentrated_drawdowns])
         qualifying_loss_sum = sum(raw_cents for _, _, _, _, raw_cents in concentrated_drawdowns)
         if total_ticker_losses_cents > 0 and (qualifying_loss_sum / total_ticker_losses_cents) >= 0.50:
             pct = (qualifying_loss_sum / total_ticker_losses_cents * 100.0)
@@ -477,7 +477,7 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
             extreme_skew_tickers.append((ticker, min_inv, max_inv))
 
     if extreme_skew_tickers:
-        details = ", ".join([f"`{t}` [{low}, +{high}]" for t, low, high in extreme_skew_tickers])
+        details = ", ".join([f"`{t}` [{low}, {high:+}]" for t, low, high in extreme_skew_tickers])
         observations.append(
             f"Substantial inventory accumulation occurred in {details}, indicating persistent one-sided flow "
             "during directional trending phases."
@@ -803,7 +803,7 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
             t_net_dlr = t["net_pnl_cents"] / 100.0
             t_outcomes = t.get("trade_outcomes", {})
             t_wr = f"{t_outcomes.get('win_rate_pct', 0.0):.1f}%" if t_outcomes.get("total_round_trips", 0) > 0 else "N/A"
-            inv_str = f"[{t['min_inventory']}, +{t['max_inventory']}]"
+            inv_str = f"[{t['min_inventory']}, {t['max_inventory']:+}]"
             lines.append(
                 f"| `{ticker}` | `${t_real_dlr:+.2f}` | `${t_fees_dlr:.2f}` | `${t_net_dlr:+.2f}` | `{inv_str}` | {t['total_orders']:,} | {t.get('fills', 0)} | {t_wr} |"
             )

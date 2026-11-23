@@ -244,6 +244,18 @@ def test_drawdown_concentration_majority_vs_minority():
     assert not any("accounting for" in o for o in obs_offset)
     assert any("Significant drawdown and inventory excursions occurred in `KXTEST-A`" in o for o in obs_offset)
 
+    # All-negative inventory range case: min -8, max -4
+    # Must format as `[-8, -4]` and NOT `[-8, +-4]`
+    all_neg_metrics = {
+        "totals": {"total_realized_delta_cents": -200.0, "snapshot_count": 50},
+        "tickers": {
+            "KXTEST-NEG": {"realized_delta_cents": -175.0, "min_inventory": -8, "max_inventory": -4, "has_inventory_snapshot": True},
+        },
+    }
+    obs_all_neg = generate_observations(all_neg_metrics)
+    assert any("`KXTEST-NEG` ($-1.75, inv [-8, -4])" in o for o in obs_all_neg)
+    assert not any("+-4" in o for o in obs_all_neg)
+
 
 def test_ending_inventory_telemetry_availability():
     # Case 1: No snapshots recorded
