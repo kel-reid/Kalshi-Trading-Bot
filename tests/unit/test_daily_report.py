@@ -194,6 +194,9 @@ def test_generate_observations_and_recommendations():
     for r in recs:
         assert not r.strip().startswith("•")
         assert not r.strip().startswith("- ")
+        # Ensure recommendations formulate a clear consensus without ambiguous ' or ' options
+        assert " or " not in r.lower()
+        assert "consensus" in r.lower()
 
 
 def test_send_slack_report_success():

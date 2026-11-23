@@ -516,7 +516,7 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
     # 1. Zero orders check
     if orders_total == 0 and snapshots_total > 0:
         recommendations.append(
-            "Verify market discovery criteria, market status (e.g. open vs closed), and collar boundaries "
+            "Primary Consensus: Verify market discovery filters, event status (open vs closed), and collar boundaries "
             "to ensure the quoting engine enters active order placement."
         )
 
@@ -527,37 +527,45 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
     ]
     if liquidated_tickers:
         recommendations.append(
-            "Widen the expiration cutoff (MIN_TIME_TO_CLOSE_SECONDS) or tighten maximum inventory limits "
-            "during late quarters to prevent inventory accumulation ahead of final settlement cliffs."
+            "Primary Consensus: Implement late-session dynamic inventory tapering. Progressively step down maximum position "
+            "limits and order sizes as the market approaches expiration rather than shutting down quoting prematurely. "
+            "This eliminates large inventory exposure ahead of binary settlement cliffs while maintaining spread-capture "
+            "volume during peak late-game liquidity."
         )
 
     # 3. Fee drag reduction
     if fees_cents > 0:
         if (realized_cents > 0 and (fees_cents / realized_cents) > 0.40) or (realized_cents < 0 and fees_cents > abs(realized_cents) * 0.25):
             recommendations.append(
-                "Consider widening MIN_SPREAD (e.g., from 4¢ to 6¢–8¢) or slightly increasing POST_FILL_PAUSE_SECONDS "
-                "to allow post-trade orderbooks to re-aggregate and reduce maker/taker fee churn."
+                "Secondary Consensus: Raise the minimum dynamic spread floor (MIN_DYNAMIC_SPREAD_CENTS) from 2¢ to 6¢. "
+                "This guarantees that all executed half-spreads maintain positive mathematical expectancy after absorbing "
+                f"Kalshi exchange transaction costs, directly resolving the ${fees_cents/100.0:.2f} fee drag that represented "
+                f"{(fees_cents / abs(realized_cents) * 100):.1f}% of the session drawdown."
+                if realized_cents < 0 else
+                "Secondary Consensus: Raise the minimum dynamic spread floor (MIN_DYNAMIC_SPREAD_CENTS) from 2¢ to 6¢. "
+                "This guarantees that all executed half-spreads maintain positive mathematical expectancy after absorbing "
+                f"Kalshi exchange transaction costs, preserving gross trading profits against fee erosion."
             )
 
     # 4. Inventory skew mitigation
     extreme_skew = any(abs(d.get("min_inventory", 0)) >= 10 or abs(d.get("max_inventory", 0)) >= 10 for d in tickers.values())
     if extreme_skew:
         recommendations.append(
-            "Consider increasing RISK_GAMMA (e.g., from 0.7 to 0.8–1.0) to shade reservation prices more "
-            "aggressively away from directional runaway and prevent deep inventory traps."
+            "Inventory Risk Consensus: Increase RISK_GAMMA (from 0.7 to 1.0) to aggressively shade reservation prices away "
+            "from directional momentum and prevent one-sided inventory accumulation during trending market runs."
         )
 
     # 5. Quoting velocity tolerance
     if orders_total > 5000 or (fills_total > 0 and orders_total > 0 and (fills_total / orders_total * 100.0) < 2.0):
         recommendations.append(
-            "Add midpoint deadband filtering or quote replacement tolerance to reduce exchange API churn "
-            "and eliminate unnecessary cancel/replace cycles when prices move by less than $0.01."
+            "API Efficiency Consensus: Enable midpoint deadband filtering to eliminate redundant quote replacement cycles "
+            "when price adjustments are smaller than $0.01."
         )
 
     if not recommendations:
         recommendations.append(
-            "Order quoting velocity, inventory distribution, and fee drag remained well-calibrated; "
-            "maintain current algorithmic parameters."
+            "Consensus Recommendation: Operational metrics, quoting velocity, and inventory distribution remained within "
+            "target parameters; maintain current algorithmic configuration."
         )
 
     return recommendations
