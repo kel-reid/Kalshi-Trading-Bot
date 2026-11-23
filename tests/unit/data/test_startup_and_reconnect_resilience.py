@@ -712,3 +712,213 @@ async def test_reconciler_replays_multi_page_fills_in_chronological_order():
     # (If replayed in reverse order, sell @ 60c matches buy @ 50c => +100c)
     assert manager.get_realized_pnl("KXTEST") == 200.0
     assert manager.get_position("KXTEST") == 10
+
+
+@pytest.mark.asyncio
+async def test_interleaved_live_and_recovered_fills_rebuilds_chronological_fifo_accounting():
+    """
+    Verify that when a later live fill is applied before earlier missed fills are recovered,
+    accounting is rebuilt in chronological order across both live and recovered fills.
+
+    Exchange chronological fills:
+    1. Buy 1 @ 40c (t=10:00:00)
+    2. Sell 1 @ 60c (t=10:01:00) -> Realized PnL = +20c ($0.20)
+    3. Buy 1 @ 50c (t=10:02:00) -> Open lot @ 50c
+
+    Delivery order:
+    1. Fill 3 arrives live first via WebSocket.
+    2. Fill 1 and Fill 2 are recovered via REST afterward.
+
+    Expected result:
+    - Realized PnL must be 20c (NOT 10c).
+    - Open inventory must be 1 contract with cost basis 50c (NOT 40c).
+    - Net position must be 1.
+    """
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # Fill 3 (t=10:02:00) - arrives live first
+    fill3 = {
+        "fill_id": "f3",
+        "trade_id": "t3",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T10:02:00Z",
+    }
+    # Fill 1 (t=10:00:00) - recovered later
+    fill1 = {
+        "fill_id": "f1",
+        "trade_id": "t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.40",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T10:00:00Z",
+    }
+    # Fill 2 (t=10:01:00) - recovered later
+    fill2 = {
+        "fill_id": "f2",
+        "trade_id": "t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 1,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.00",
+        "created_time": "2026-11-23T10:01:00Z",
+    }
+
+    # Step 1: Live fill 3 arrives first
+    await manager._handle_message({"type": "fill", "msg": fill3})
+    assert manager.get_position("KXTEST") == 1
+    assert manager.get_realized_pnl("KXTEST") == 0.0
+
+    # Step 2: REST recovery delivers earlier fills fill1 and fill2
+    assert manager.apply_reconciled_fill(fill1) is True
+    assert manager.apply_reconciled_fill(fill2) is True
+
+    # Assert FIFO accounting reflects true chronological execution:
+    # Sell @ 60c matches Buy @ 40c => Realized PnL = +20c ($0.20)
+    assert manager.get_realized_pnl("KXTEST") == 20.0
+    assert manager.get_position("KXTEST") == 1
+
+    # Assert remaining open lot is the 50c buy, NOT the 40c buy
+    market = pnl.get_or_create_market("KXTEST")
+    assert len(market.open_lots) == 1
+    assert market.open_lots[0].price_cents == 50.0
+    assert market.open_lots[0].count == 1
+
+
+@pytest.mark.asyncio
+async def test_interleaved_live_and_recovered_fills_multi_contract_and_fees():
+    """Verify chronological replay with multi-contract fills and allocated fees."""
+    ws = MagicMock()
+    pnl = PnLTracker()
+    manager = InventoryManager(ws, pnl_tracker=pnl)
+    manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Buy 10 @ 40c, fee 0.10 ($0.10) (t=10:00:00)
+    fill1 = {
+        "fill_id": "multi-f1",
+        "trade_id": "multi-t1",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.40",
+        "fee_dollars": "0.10",
+        "created_time": "2026-11-23T10:00:00Z",
+    }
+    # 2. Sell 10 @ 60c, fee 0.10 ($0.10) (t=10:01:00)
+    fill2 = {
+        "fill_id": "multi-f2",
+        "trade_id": "multi-t2",
+        "market_ticker": "KXTEST",
+        "action": "sell",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.60",
+        "fee_dollars": "0.10",
+        "created_time": "2026-11-23T10:01:00Z",
+    }
+    # 3. Buy 10 @ 50c, fee 0.10 ($0.10) (t=10:02:00)
+    fill3 = {
+        "fill_id": "multi-f3",
+        "trade_id": "multi-t3",
+        "market_ticker": "KXTEST",
+        "action": "buy",
+        "side": "yes",
+        "count": 10,
+        "price_dollars": "0.50",
+        "fee_dollars": "0.10",
+        "created_time": "2026-11-23T10:02:00Z",
+    }
+
+    # Live fill 3 arrives first
+    await manager._handle_message({"type": "fill", "msg": fill3})
+
+    # REST recovery delivers fill1 and fill2 afterward
+    assert manager.apply_reconciled_fill(fill1) is True
+    assert manager.apply_reconciled_fill(fill2) is True
+
+    # Gross PnL = 10 * (60c - 40c) = 200c ($2.00)
+    # Net Realized PnL = 200c - 10c (entry fee) - 10c (exit fee) = 180c ($1.80)
+    assert manager.get_realized_pnl("KXTEST") == 180.0
+    assert manager.get_position("KXTEST") == 10
+    assert pnl.get_total_fees("KXTEST") == 30.0
+
+    market = pnl.get_or_create_market("KXTEST")
+    assert len(market.open_lots) == 1
+    assert market.open_lots[0].price_cents == 50.0
+    assert market.open_lots[0].count == 10
+    assert market.open_lots[0].entry_fee_per_contract == 1.0
+
+
+def test_arbitrary_arrival_permutations_yield_identical_fifo_realized_pnl():
+    """Verify all 6 arrival permutations of 3 trades yield identical chronological realized PnL and inventory."""
+    import itertools
+
+    trades = [
+        {
+            "fill_id": "perm-f1",
+            "trade_id": "perm-t1",
+            "market_ticker": "KXTEST",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "price_dollars": "0.40",
+            "fee_dollars": "0.00",
+            "created_time": "2026-11-23T10:00:00Z",
+        },
+        {
+            "fill_id": "perm-f2",
+            "trade_id": "perm-t2",
+            "market_ticker": "KXTEST",
+            "action": "sell",
+            "side": "yes",
+            "count": 1,
+            "price_dollars": "0.60",
+            "fee_dollars": "0.00",
+            "created_time": "2026-11-23T10:01:00Z",
+        },
+        {
+            "fill_id": "perm-f3",
+            "trade_id": "perm-t3",
+            "market_ticker": "KXTEST",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "price_dollars": "0.50",
+            "fee_dollars": "0.00",
+            "created_time": "2026-11-23T10:02:00Z",
+        },
+    ]
+
+    for perm in itertools.permutations(trades):
+        ws = MagicMock()
+        pnl = PnLTracker()
+        manager = InventoryManager(ws, pnl_tracker=pnl)
+        manager._session_start_time = datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone.utc)
+
+        for trade in perm:
+            applied = manager.apply_reconciled_fill(dict(trade))
+            assert applied is True
+
+        # In all permutations:
+        # Trade 1 (Buy @ 40c) and Trade 2 (Sell @ 60c) offset for +20c realized PnL.
+        # Trade 3 (Buy @ 50c) remains open.
+        assert manager.get_realized_pnl("KXTEST") == 20.0
+        assert manager.get_position("KXTEST") == 1
+        market = pnl.get_or_create_market("KXTEST")
+        assert len(market.open_lots) == 1
+        assert market.open_lots[0].price_cents == 50.0
+        assert market.open_lots[0].count == 1
+

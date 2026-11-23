@@ -909,6 +909,7 @@ class AvellanedaStoikovBot:
                     "In-flight fill reconciliation completed: %s pages visited, %s records persisted.",
                     report.pages, report.persisted,
                 )
+                self.inv_manager.rebuild_accounting(ticker=self.ticker)
             except Exception as e:
                 logger.error("In-flight fill reconciliation failed during connection recovery: %s", e)
                 raise FatalIngestionError("Failed to reconcile fills during WebSocket recovery; reconciliation required") from e

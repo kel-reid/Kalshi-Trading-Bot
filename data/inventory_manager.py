@@ -91,6 +91,14 @@ class InventoryManager:
         self._pending_fills: int = 0
         self._last_fill_time: float = 0.0
         self._last_fill_times: Dict[str, float] = {}
+        self._recorded_fills: List[Dict[str, Any]] = []
+        self._initial_seeded_inventory: Dict[str, Tuple[Union[int, float], Optional[float]]] = {}
+        if pnl_tracker is not None:
+            for t, mkt in pnl_tracker.markets.items():
+                if mkt.open_lots:
+                    net_pos = sum(l.count if l.action == "buy" else -l.count for l in mkt.open_lots)
+                    first_lot = mkt.open_lots[0]
+                    self._initial_seeded_inventory[t] = (net_pos, first_lot.price_cents)
         
         self.ws_client.add_message_handler(self._handle_message)
 
@@ -258,6 +266,7 @@ class InventoryManager:
                         except (ValueError, TypeError):
                             cost_basis = None
                     self.pnl_tracker.seed_initial_inventory(ticker, position, cost_basis_cents=cost_basis)
+                    self._initial_seeded_inventory[ticker] = (position, cost_basis)
                 else:
                     self.pnl_tracker.reconcile_inventory(ticker, position)
 
@@ -656,6 +665,79 @@ class InventoryManager:
                 return True
             raise ValueError(f"Reconciled fill was dropped or invalid: {fill}")
 
+    def _rebuild_ticker_accounting(self, ticker: str):
+        """
+        Rebuilds FIFO lot matching and realized PnL for a ticker from scratch in
+        strictly chronological order (ts, exchange_index) using all recorded fills.
+        """
+        market = self.pnl_tracker.get_or_create_market(ticker)
+
+        # 1. Preserve session baseline and configuration
+        session_start_realized = market.session_start_realized_cents
+        session_start_fees = market.session_start_fees_cents
+        reconciliation_adj = market.reconciliation_adjustment_cents
+        last_mid = market.last_mid_price
+        session_id = market.rotation_session_id
+
+        # 2. Reset lot list and accumulators to session baseline
+        market.open_lots = []
+        market.realized_pnl_cents = round(session_start_realized + reconciliation_adj, 4)
+        market.total_fees_cents = round(session_start_fees, 4)
+        market.total_volume_contracts = 0
+        market.round_trips_count = 0
+        market.winning_trades_count = 0
+        market.losing_trades_count = 0
+        market.scratch_trades_count = 0
+        market.unrealized_pnl_cents = 0.0
+
+        # 3. Re-seed initial inventory lot if hydrated at startup
+        seeded = self._initial_seeded_inventory.get(ticker)
+        if seeded is not None:
+            init_pos, init_cost_basis = seeded
+            self.pnl_tracker.seed_initial_inventory(ticker, init_pos, cost_basis_cents=init_cost_basis)
+
+        # 4. Extract and sort all recorded session fills for this ticker in ascending chronological order
+        ticker_fills = [f for f in self._recorded_fills if f["ticker"] == ticker]
+        ticker_fills.sort(key=lambda f: (f["timestamp"], f.get("exchange_index", 0)))
+
+        # 5. Replay fills through FIFO matching
+        for f in ticker_fills:
+            self.pnl_tracker.record_fill(
+                ticker=ticker,
+                action=f["action"],
+                side=f["side"],
+                count=f["count"],
+                price_cents=f["price_cents"],
+                fee_cents=f["fee_cents"],
+                timestamp=f["timestamp"],
+            )
+
+        # 6. Recompute mark-to-market unrealized PnL against last known mid-price
+        if last_mid is not None:
+            self.pnl_tracker.update_mid_price(ticker, last_mid)
+        else:
+            unrealized = 0.0
+            for lot in market.open_lots:
+                if not lot.is_uncosted and lot.price_cents is not None:
+                    unrealized -= lot.entry_fee_per_contract * lot.count
+            market.unrealized_pnl_cents = round(unrealized, 4)
+
+        logger.info(
+            f"Rebuilt accounting for {ticker}: {len(ticker_fills)} fills replayed | "
+            f"Realized PnL: {market.realized_pnl_cents:+.2f}c | "
+            f"Open Lots: {len(market.open_lots)} ({sum(l.count for l in market.open_lots)} contracts)"
+        )
+
+    def rebuild_accounting(self, ticker: Optional[str] = None):
+        """
+        Public interface to rebuild FIFO accounting across all recorded fills in the session.
+        Serializes under _fill_lock.
+        """
+        with self._fill_lock:
+            tickers = [ticker] if ticker else list(set(f["ticker"] for f in self._recorded_fills) | set(self.positions.keys()))
+            for t in tickers:
+                self._rebuild_ticker_accounting(t)
+
     async def subscribe(self, auto_reconcile: bool = False):
         """Subscribe to the 'fill' channel to listen for my own execution updates."""
         if self.fill_store is not None:
@@ -950,6 +1032,25 @@ class InventoryManager:
         self._last_fill_times[ticker] = now
         fee = round(fee, 4)
 
+        # Parse timestamp and sequence index for chronological ordering
+        raw_ts = fill_msg.get("created_time")
+        if raw_ts is None:
+            raw_ts = fill_msg.get("ts")
+        fill_time = None
+        if raw_ts is not None:
+            from data.fill_reconciliation import aware_datetime
+            try:
+                fill_dt = aware_datetime(raw_ts)
+                fill_time = fill_dt.timestamp()
+            except Exception:
+                fill_time = None
+        if fill_time is None:
+            fill_time = now
+
+        seq = fill_msg.get("exchange_index")
+        if seq is None or isinstance(seq, bool) or not isinstance(seq, int):
+            seq = 0
+
         # Adjust balance based on action, preserving sub-cent precision to reconcile with PnLTracker
         if action == "buy":
             self.balance_cents = round(self.balance_cents - (price * count + fee), 4)
@@ -968,15 +1069,49 @@ class InventoryManager:
         new_pos = round(current_pos + delta, 4)
         self.positions[ticker] = int(new_pos) if new_pos.is_integer() else new_pos
         
-        # Track Realized and Unrealized PnL via FIFO lot matching
-        pnl_impact = self.pnl_tracker.record_fill(
-            ticker=ticker,
-            action=action,
-            side=side,
-            count=count,
-            price_cents=price,
-            fee_cents=fee
+        # Check if fill arrived out of chronological order relative to already-recorded fills
+        is_out_of_order = any(
+            f["ticker"] == ticker and (
+                f["timestamp"] > fill_time or (f["timestamp"] == fill_time and f.get("exchange_index", 0) > seq)
+            )
+            for f in self._recorded_fills
         )
+
+        fill_entry = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "price_cents": price,
+            "fee_cents": fee,
+            "timestamp": fill_time,
+            "exchange_index": seq,
+            "fill": fill_msg,
+        }
+        self._recorded_fills.append(fill_entry)
+
+        if is_out_of_order:
+            logger.info(
+                f"Detected out-of-order fill for {ticker} (ts={fill_time:.3f} < latest recorded). "
+                f"Rebuilding FIFO lot accounting in chronological order across {len(self._recorded_fills)} fills."
+            )
+            self._rebuild_ticker_accounting(ticker)
+        else:
+            # In-order execution: record directly into FIFO tracker
+            pnl_impact = self.pnl_tracker.record_fill(
+                ticker=ticker,
+                action=action,
+                side=side,
+                count=count,
+                price_cents=price,
+                fee_cents=fee,
+                timestamp=fill_time,
+            )
+            try:
+                for outcome in pnl_impact.get("matched_outcomes", []):
+                    KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
+            except Exception as e:
+                logger.debug(f"Prometheus round trip counter update skipped: {e}")
 
         # Update Prometheus metrics
         try:
@@ -987,9 +1122,6 @@ class InventoryManager:
             KALSHI_FEES_PAID_CENTS.labels(ticker=ticker).set(self.pnl_tracker.get_total_fees(ticker))
             KALSHI_PORTFOLIO_VALUE_CENTS.set(self.get_portfolio_value(ticker))
             KALSHI_POSITIONS_VALUE_CENTS.labels(ticker=ticker).set(self.get_positions_value(ticker))
-
-            for outcome in pnl_impact.get("matched_outcomes", []):
-                KALSHI_ROUND_TRIPS_TOTAL.labels(ticker=ticker, outcome=outcome).inc()
         except Exception as e:
             logger.debug(f"Prometheus metric update skipped: {e}")
 
