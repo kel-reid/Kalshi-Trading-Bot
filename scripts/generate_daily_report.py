@@ -408,10 +408,11 @@ def fetch_daily_metrics(
     return metrics
 
 
-def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
-    """Generates algorithmic diagnostic recommendations based on session statistics."""
-    recommendations: List[str] = []
+def generate_observations(metrics: Dict[str, Any]) -> List[str]:
+    """Generates factual diagnostic observations based on session statistics."""
+    observations: List[str] = []
     totals = metrics.get("totals", {})
+    tickers = metrics.get("tickers", {})
 
     realized_cents = totals.get("total_realized_delta_cents", 0.0)
     fees_cents = totals.get("total_fees_delta_cents", 0.0)
@@ -422,77 +423,141 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
     realized_dlr = realized_cents / 100.0
     fees_dlr = fees_cents / 100.0
 
-    # 1. Zero order quiesce check
+    # 1. Order execution & velocity observation
     if orders_total == 0 and snapshots_total > 0:
-        recommendations.append(
-            "**No Order Placement Recorded**: The bot completed quoting snapshots but placed 0 orders. "
-            "Verify market discovery criteria, market status (e.g. open vs closed), and collar boundaries."
+        observations.append(
+            "The bot completed quoting snapshots across active markets but recorded zero placed orders, "
+            "indicating restrictive market discovery criteria or collar boundary gating."
+        )
+    elif orders_total > 0:
+        fill_ratio = (fills_total / orders_total * 100.0) if orders_total > 0 else 0.0
+        observations.append(
+            f"The bot quoted {orders_total:,} orders ({totals.get('total_buy_orders', 0):,} BIDs, "
+            f"{totals.get('total_sell_orders', 0):,} ASKs), yielding {fills_total} fills "
+            f"({fill_ratio:.1f}% fill conversion rate) and {totals.get('total_cancels', 0):,} cancellations or quote replacements."
         )
 
-    # 2. Fee drag analysis
-    if fees_cents > 0:
-        if realized_cents > 0 and (fees_cents / realized_cents) > 0.40:
-            recommendations.append(
-                f"**High Fee Drag (${fees_dlr:.2f} fees vs ${realized_dlr:.2f} realized)**: "
-                "Exchange fees consumed over 40% of gross realized profits. Consider widening `MIN_SPREAD` "
-                "(e.g., from $0.02 to $0.03–$0.04) or slightly increasing `POST_FILL_PAUSE_SECONDS` to reduce rapid fee churn."
-            )
-        elif realized_cents < 0 and fees_cents > abs(realized_cents) * 0.5:
-            recommendations.append(
-                f"**Fee-Dominated Drawdown (${fees_dlr:.2f} fees)**: Fees represented a majority component "
-                f"({(fees_cents / abs(realized_cents) * 100):.1f}%) of session drawdown. Review quoting frequency and "
-                "avoid quoting tightly in contracts where maker fees exceed edge."
-            )
-
-    # 3. Inventory skew and liquidation drag
-    extreme_skew_tickers = []
+    # 2. Drawdown & liquidation attribution
     liquidated_tickers = []
-    for ticker, t_data in metrics.get("tickers", {}).items():
+    for ticker, t_data in tickers.items():
+        t_real = t_data.get("realized_delta_cents", 0.0)
         min_inv = t_data.get("min_inventory", 0)
         max_inv = t_data.get("max_inventory", 0)
-        t_real = t_data.get("realized_delta_cents", 0.0)
-        if abs(min_inv) >= 10 or abs(max_inv) >= 10:
-            extreme_skew_tickers.append((ticker, min_inv, max_inv))
         if t_real < -50.0 and (abs(min_inv) >= 4 or abs(max_inv) >= 4):
             liquidated_tickers.append((ticker, t_real / 100.0))
 
-    if extreme_skew_tickers:
-        details = ", ".join([f"`{t}` (range: [{low}, +{high}])" for t, low, high in extreme_skew_tickers])
-        recommendations.append(
-            f"**Substantial Inventory Skew Detected**: The following markets accumulated high one-sided exposure: {details}. "
-            "Consider increasing `RISK_GAMMA` (e.g. from 0.7 to 0.8–1.0) to shade reservation prices more aggressively "
-            "away from directional runaway and prevent deep inventory traps."
-        )
-
     if liquidated_tickers:
         details = ", ".join([f"`{t}` (${loss:+.2f})" for t, loss in liquidated_tickers])
-        recommendations.append(
-            f"**Late-Game / Cutoff Liquidation Drawdown**: Heavy drawdowns occurred in {details}. "
-            "In live sporting events where the underlying score changes rapidly, inventory accumulated during mid-game swings "
-            "can suffer sharp liquidation penalties at market close. Consider widening the expiration cutoff "
-            "(`MIN_TIME_TO_CLOSE_SECONDS`) or tightening max inventory thresholds during the 4th quarter."
+        observations.append(
+            f"Late-game score momentum and de-risking collars triggered significant inventory liquidation in {details}, "
+            "accounting for the majority of the session drawdown."
         )
 
-    # 4. Order velocity & fill ratio
-    if orders_total > 5000:
-        recommendations.append(
-            f"**High Order Velocity ({orders_total:,} orders)**: Extremely high order cancel/replace rate. "
-            "Add midpoint deadband filtering to reduce exchange API churn."
+    # 3. Inventory skew observation
+    extreme_skew_tickers = []
+    for ticker, t_data in tickers.items():
+        min_inv = t_data.get("min_inventory", 0)
+        max_inv = t_data.get("max_inventory", 0)
+        if abs(min_inv) >= 10 or abs(max_inv) >= 10:
+            extreme_skew_tickers.append((ticker, min_inv, max_inv))
+
+    if extreme_skew_tickers:
+        details = ", ".join([f"`{t}` [{low}, +{high}]" for t, low, high in extreme_skew_tickers])
+        observations.append(
+            f"Substantial inventory accumulation occurred in {details}, indicating persistent one-sided flow "
+            "during directional trending phases."
         )
-    elif fills_total > 0 and orders_total > 0:
-        fill_ratio = (fills_total / orders_total) * 100.0
-        if fill_ratio < 2.0:
+
+    # 4. Fee drag observation
+    if fees_cents > 0:
+        if realized_cents > 0 and (fees_cents / realized_cents) > 0.40:
+            observations.append(
+                f"Exchange fees totaled ${fees_dlr:.2f}, consuming {(fees_cents / realized_cents * 100):.1f}% "
+                f"of gross realized profits (${realized_dlr:.2f})."
+            )
+        elif realized_cents < 0 and fees_cents > abs(realized_cents) * 0.25:
+            observations.append(
+                f"Exchange fees of ${fees_dlr:.2f} represented {(fees_cents / abs(realized_cents) * 100):.1f}% "
+                f"of the total realized drawdown."
+            )
+        else:
+            observations.append(f"Kalshi transaction fees totaled ${fees_dlr:.2f} across executed trades.")
+
+    # 5. Overnight risk & inventory resolution
+    ending_inv_total = sum(abs(t_data.get("ending_inventory", 0)) for t_data in tickers.values())
+    if ending_inv_total == 0:
+        observations.append(
+            "All event markets resolved or liquidated to exactly 0 open contracts before session close, "
+            "eliminating overnight directional exposure."
+        )
+    else:
+        observations.append(
+            f"Carried {ending_inv_total} open contracts into session close with active mark-to-market exposure."
+        )
+
+    if not observations:
+        observations.append("Session execution proceeded within nominal operating tolerances.")
+
+    return observations
+
+
+def generate_recommendations(metrics: Dict[str, Any]) -> List[str]:
+    """Generates actionable algorithmic tuning recommendations based on session statistics."""
+    recommendations: List[str] = []
+    totals = metrics.get("totals", {})
+    tickers = metrics.get("tickers", {})
+
+    realized_cents = totals.get("total_realized_delta_cents", 0.0)
+    fees_cents = totals.get("total_fees_delta_cents", 0.0)
+    orders_total = totals.get("total_orders", 0)
+    fills_total = totals.get("total_fills", 0)
+    snapshots_total = totals.get("snapshot_count", 0)
+
+    # 1. Zero orders check
+    if orders_total == 0 and snapshots_total > 0:
+        recommendations.append(
+            "Verify market discovery criteria, market status (e.g. open vs closed), and collar boundaries "
+            "to ensure the quoting engine enters active order placement."
+        )
+
+    # 2. Late-game liquidation mitigation
+    liquidated_tickers = [
+        t for t, d in tickers.items()
+        if d.get("realized_delta_cents", 0.0) < -50.0 and (abs(d.get("min_inventory", 0)) >= 4 or abs(d.get("max_inventory", 0)) >= 4)
+    ]
+    if liquidated_tickers:
+        recommendations.append(
+            "Widen the expiration cutoff (MIN_TIME_TO_CLOSE_SECONDS) or tighten maximum inventory limits "
+            "during late quarters to prevent inventory accumulation ahead of final settlement cliffs."
+        )
+
+    # 3. Fee drag reduction
+    if fees_cents > 0:
+        if (realized_cents > 0 and (fees_cents / realized_cents) > 0.40) or (realized_cents < 0 and fees_cents > abs(realized_cents) * 0.25):
             recommendations.append(
-                f"**Low Fill-to-Quote Ratio ({fill_ratio:.1f}%: {fills_total} fills / {orders_total:,} orders)**: "
-                "The bot is generating a large volume of quote updates per executed fill. Consider adding quote replacement "
-                "tolerance (e.g., skip cancel/replace if midpoint moved by < $0.01) to preserve API rate limits and reduce noise."
+                "Consider widening MIN_SPREAD (e.g., from 4¢ to 6¢–8¢) or slightly increasing POST_FILL_PAUSE_SECONDS "
+                "to allow post-trade orderbooks to re-aggregate and reduce maker/taker fee churn."
             )
 
-    # 5. Default healthy state
+    # 4. Inventory skew mitigation
+    extreme_skew = any(abs(d.get("min_inventory", 0)) >= 10 or abs(d.get("max_inventory", 0)) >= 10 for d in tickers.values())
+    if extreme_skew:
+        recommendations.append(
+            "Consider increasing RISK_GAMMA (e.g., from 0.7 to 0.8–1.0) to shade reservation prices more "
+            "aggressively away from directional runaway and prevent deep inventory traps."
+        )
+
+    # 5. Quoting velocity tolerance
+    if orders_total > 5000 or (fills_total > 0 and orders_total > 0 and (fills_total / orders_total * 100.0) < 2.0):
+        recommendations.append(
+            "Add midpoint deadband filtering or quote replacement tolerance to reduce exchange API churn "
+            "and eliminate unnecessary cancel/replace cycles when prices move by less than $0.01."
+        )
+
     if not recommendations:
         recommendations.append(
-            "**Well-Calibrated Execution**: Order quoting velocity, inventory distribution, and fee drag remained "
-            "within expected risk boundaries throughout the session."
+            "Order quoting velocity, inventory distribution, and fee drag remained well-calibrated; "
+            "maintain current algorithmic parameters."
         )
 
     return recommendations
@@ -504,6 +569,7 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
     tz_name = metrics.get("timezone", "America/New_York")
     totals = metrics.get("totals", {})
     tickers = metrics.get("tickers", {})
+    observations = generate_observations(metrics)
     recommendations = generate_recommendations(metrics)
 
     realized_cents = totals.get("total_realized_delta_cents", 0.0)
@@ -706,12 +772,24 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
         "",
         "---",
         "",
-        "## 5. Actionable Algorithmic Recommendations",
+        "## 5. Algorithmic Observations",
+        "",
+    ])
+
+    for obs in observations:
+        lines.append(obs)
+        lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        "## 6. Actionable Algorithmic Recommendations",
         "",
     ])
 
     for rec in recommendations:
-        lines.append(f"- {rec}")
+        lines.append(rec)
+        lines.append("")
 
     lines.append("")
     return "\n".join(lines)
@@ -723,6 +801,7 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
     tz_name = metrics.get("timezone", "America/New_York")
     totals = metrics.get("totals", {})
     tickers = metrics.get("tickers", {})
+    observations = generate_observations(metrics)
     recommendations = generate_recommendations(metrics)
 
     realized_dlr = totals.get("total_realized_delta_cents", 0.0) / 100.0
@@ -753,25 +832,29 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
         "",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "*1. FINANCIAL ACCOUNTING SUMMARY*",
-        f"• *Session Realized PnL*: `${realized_dlr:+.2f}`",
-        f"• *Session Unrealized PnL*: `${unrealized_delta_dlr:+.2f}`",
-        f"• *Net Strategy PnL*: `${net_pnl_dlr:+.2f}` (ΔRealized + ΔUnrealized)",
-        f"• *Total Session Fees Paid*: `${fees_dlr:.2f}`",
-        f"• *Ending Open Inventory*: `0` contracts",
+        f"    • *Session Realized PnL*: `${realized_dlr:+.2f}`",
+        f"    • *Session Unrealized PnL*: `${unrealized_delta_dlr:+.2f}`",
+        f"    • *Net Strategy PnL*: `${net_pnl_dlr:+.2f}` (ΔRealized + ΔUnrealized)",
+        f"    • *Total Session Fees Paid*: `${fees_dlr:.2f}`",
+        f"    • *Ending Open Inventory*: `0` contracts",
         "",
         "*2. EXECUTION & ROUND-TRIP DYNAMICS*",
-        f"• *Total Orders Quoted*: {orders:,} ({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs)",
-        f"• *Executed Fills*: {fills} | *Cancellations / Replacements*: {cancels:,}",
-        f"• *Completed FIFO Round Trips*: {total_rts}",
-        f"• *Win / Loss / Scratch*: {wins} Wins ({win_rate:.1f}%) | {losses} Losses ({(losses/total_rts*100.0) if total_rts else 0.0:.1f}%) | {scratches} Scratches",
-        f"• *Win Rate (ex-scratches)*: *{win_rate_ex:.1f}%*",
-        f"• *Profit Factor*: *{profit_factor:.2f}* (Gross Wins: `${gross_wins_dlr:+.2f}` | Gross Losses: `${gross_losses_dlr:+.2f}`)",
-        f"• *Average Win / Loss*: `${avg_win_dlr:+.2f}` / `${avg_loss_dlr:+.2f}`",
+        f"    • *Total Orders Quoted*: {orders:,} ({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs)",
+        f"    • *Executed Fills*: {fills} | *Cancellations / Replacements*: {cancels:,}",
+        f"    • *Completed FIFO Round Trips*: {total_rts}",
+        f"    • *Win / Loss / Scratch*: {wins} Wins ({win_rate:.1f}%) | {losses} Losses ({(losses/total_rts*100.0) if total_rts else 0.0:.1f}%) | {scratches} Scratches",
+        f"    • *Win Rate (ex-scratches)*: *{win_rate_ex:.1f}%*",
+        f"    • *Profit Factor*: *{profit_factor:.2f}* (Gross Wins: `${gross_wins_dlr:+.2f}` | Gross Losses: `${gross_losses_dlr:+.2f}`)",
+        f"    • *Average Win / Loss*: `${avg_win_dlr:+.2f}` / `${avg_loss_dlr:+.2f}`",
         "",
         "*3. MARKET-BY-MARKET BREAKDOWN*",
         "```",
         f"{'Market':<35} {'Net PnL':>9} {'Fees':>8} {'Fills':>6} {'Win%':>7}",
     ]
+
+    def _fmt_net_pnl(val: float) -> str:
+        sign = "-" if val < 0 else ("+" if val > 0 else " ")
+        return f"{sign}${abs(val):.2f}"
 
     for ticker, t in sorted(tickers.items()):
         t_net = t["net_pnl_cents"] / 100.0
@@ -779,16 +862,25 @@ def format_slack_report(metrics: Dict[str, Any]) -> str:
         t_fills = t.get("fills", 0)
         t_outcomes = t.get("trade_outcomes", {})
         t_wr = f"{t_outcomes.get('win_rate_pct', 0.0):.1f}%" if t_outcomes.get("total_round_trips", 0) > 0 else "N/A"
-        lines.append(f"{ticker:<35} {t_net:>+8.2f}$ {t_fees:>7.2f}$ {t_fills:>6} {t_wr:>7}")
+        lines.append(f"{ticker:<35} {_fmt_net_pnl(t_net):>9} {f'${t_fees:.2f}':>8} {t_fills:>6} {t_wr:>7}")
 
-    lines.append(f"{'TOTAL':<35} {net_pnl_dlr:>+8.2f}$ {fees_dlr:>7.2f}$ {fills:>6} {win_rate_ex:>6.1f}%")
+    lines.append(f"{'TOTAL':<35} {_fmt_net_pnl(net_pnl_dlr):>9} {f'${fees_dlr:.2f}':>8} {fills:>6} {win_rate_ex:>6.1f}%")
     lines.extend([
         "```",
         "",
-        "*4. ALGORITHMIC OBSERVATIONS & RECOMMENDATIONS*",
+        "*4. OBSERVATIONS*",
+    ])
+    for obs in observations:
+        lines.append(obs)
+        lines.append("")
+
+    lines.extend([
+        "*5. RECOMMENDATIONS*",
     ])
     for rec in recommendations:
-        lines.append(f"• {rec}")
+        lines.append(rec)
+        lines.append("")
+
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)

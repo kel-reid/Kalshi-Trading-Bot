@@ -14,6 +14,8 @@ from scripts.generate_daily_report import (
     fetch_daily_metrics,
     format_slack_report,
     send_slack_report,
+    generate_observations,
+    generate_recommendations,
 )
 
 
@@ -141,13 +143,57 @@ def test_format_slack_report():
 
     report = format_slack_report(metrics)
     assert "*Kalshi Trading Bot — Daily Performance Report: 2026-11-22*" in report
-    assert "• *Session Realized PnL*: `$-2.58`" in report
-    assert "• *Net Strategy PnL*: `$-2.73`" in report
-    assert "• *Total Session Fees Paid*: `$0.73`" in report
-    assert "• *Win Rate (ex-scratches)*: *31.6%*" in report
-    assert "• *Profit Factor*: *0.64*" in report
+    assert "    • *Session Realized PnL*: `$-2.58`" in report
+    assert "    • *Net Strategy PnL*: `$-2.73`" in report
+    assert "    • *Total Session Fees Paid*: `$0.73`" in report
+    assert "    • *Win Rate (ex-scratches)*: *31.6%*" in report
+    assert "    • *Profit Factor*: *0.64*" in report
     assert "KXTEST-1" in report
     assert "KXTEST-2" in report
+
+    # Verify Section 4 and Section 5 headers and absence of bullet points
+    assert "*4. OBSERVATIONS*" in report
+    assert "*5. RECOMMENDATIONS*" in report
+    sec4_text = report.split("*4. OBSERVATIONS*")[1].split("*5. RECOMMENDATIONS*")[0]
+    sec5_text = report.split("*5. RECOMMENDATIONS*")[1].split("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")[0]
+    assert "•" not in sec4_text
+    assert "•" not in sec5_text
+
+
+def test_generate_observations_and_recommendations():
+    metrics = {
+        "date": "2026-11-22",
+        "timezone": "America/New_York",
+        "totals": {
+            "total_realized_delta_cents": -258.0,
+            "total_fees_delta_cents": 73.0,
+            "total_orders": 707,
+            "total_fills": 55,
+            "total_buy_orders": 343,
+            "total_sell_orders": 364,
+            "total_cancels": 642,
+            "snapshot_count": 100,
+        },
+        "tickers": {
+            "KXTEST-1": {
+                "realized_delta_cents": -175.0,
+                "min_inventory": -8,
+                "max_inventory": 6,
+                "ending_inventory": 0,
+            },
+        },
+    }
+    obs = generate_observations(metrics)
+    recs = generate_recommendations(metrics)
+    assert len(obs) > 0
+    assert len(recs) > 0
+    # Check that neither obs nor recs start with bullet characters
+    for o in obs:
+        assert not o.strip().startswith("•")
+        assert not o.strip().startswith("- ")
+    for r in recs:
+        assert not r.strip().startswith("•")
+        assert not r.strip().startswith("- ")
 
 
 def test_send_slack_report_success():
