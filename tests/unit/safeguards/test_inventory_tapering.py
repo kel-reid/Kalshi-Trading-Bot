@@ -516,15 +516,17 @@ class TestInventoryTapering:
         bot.inv_manager.get_position = MagicMock(return_value=5)
 
         await bot._update_quotes(None, 52)
-        # Order placement must use fresh inventory (2) instead of the stale snapshot (5)!
+        # Order placement must use fresh inventory (2) and pass reduce_only IOC!
         bot.om.place_order.assert_called_once_with(
             ticker="KXTEST-CONCURRENT",
             side="yes",
             action="sell",
             count=2,
             price=52,
+            reduce_only=True,
+            time_in_force="immediate_or_cancel",
         )
-        assert bot.current_ask_size == 2
+        assert bot.current_ask_id is None
 
         # Scenario 2: Complete fill arrives while cancellation is in flight (inventory drops to 0)
         bot.om.place_order.reset_mock()
@@ -595,8 +597,7 @@ class TestInventoryTapering:
         # Retains active quote ID to block duplicate placement
         assert bot.current_ask_id == "old-ask-oversized"
         bot.om.place_order.assert_not_called()
-        # Dispatched reconciliation task in background with target_client_order_id
-        await asyncio.sleep(0.01)
+        # Synchronously awaited targeted reconciliation with target_client_order_id
         bot.om.reconcile_resting_orders.assert_called_once_with(
             ticker="KXTEST-FAILED-CANCEL",
             target_client_order_id="old-ask-oversized",
@@ -625,13 +626,15 @@ class TestInventoryTapering:
         bot._is_reduce_only = True
 
         await bot._update_quotes(None, 52)
-        # Should have waited for _pending_fills to drain to 0, then placed ask for fresh inventory (3)
+        # Should have waited for _pending_fills to drain to 0, then placed ask for fresh inventory (3) with IOC reduce_only
         bot.om.place_order.assert_called_once_with(
             ticker="KXTEST-PENDING-FILL",
             side="yes",
             action="sell",
             count=3,
             price=52,
+            reduce_only=True,
+            time_in_force="immediate_or_cancel",
         )
 
         # Case 2: Pending fill does NOT drain (stays > 0) -> quote placement deferred!
@@ -672,14 +675,14 @@ class TestInventoryTapering:
         assert bot.current_ask_id is None
 
     @pytest.mark.asyncio
-    async def test_passive_resting_taper_quote_uses_gtc_without_reduce_only(self):
-        """Passive resting quotes (not crossing) remain GTC without reduce_only to avoid Kalshi rejection."""
+    async def test_exit_orders_under_reduce_only_use_ioc_reduce_only(self):
+        """All exit orders under reduce-only mode cross the opposing book with reduce_only IOC."""
         bot = AvellanedaStoikovBot(
-            ticker="KXTEST-PASSIVE-TAPER",
+            ticker="KXTEST-EXIT-IOC",
             order_size=10,
             inventory_taper_enabled=True,
         )
-        bot.om.place_order = AsyncMock(return_value="passive-gtc-123")
+        bot.om.place_order = AsyncMock(return_value="ioc-exit-123")
         bot.om.cancel_order = AsyncMock(return_value=True)
         bot.inv_manager.get_position = MagicMock(return_value=2)
         bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
@@ -687,16 +690,81 @@ class TestInventoryTapering:
         bot._is_reduce_only = True
         bot._current_ask_quote_size = 2
 
-        # Passive ask @ 51c (above best bid 48c -> not crossing)
+        # Even with passive price (51c > best bid 48c), reduce-only exit ask crosses best bid (48c) with IOC
         await bot._update_quotes(None, 51)
 
         bot.om.place_order.assert_called_once_with(
-            ticker="KXTEST-PASSIVE-TAPER",
+            ticker="KXTEST-EXIT-IOC",
             side="yes",
             action="sell",
             count=2,
-            price=51,
+            price=48,
+            reduce_only=True,
+            time_in_force="immediate_or_cancel",
         )
-        # Passive quote rests on the book
-        assert bot.current_ask_id == "passive-gtc-123"
-        assert bot.current_ask_price == 51
+        # IOC orders never rest on the book
+        assert bot.current_ask_id is None
+
+    @pytest.mark.asyncio
+    async def test_delayed_fill_notification_during_cancellation(self):
+        """Delayed fill notification arriving after cancellation cannot flip position due to reduce_only IOC."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-DELAYED-FILL",
+            order_size=10,
+            inventory_taper_enabled=True,
+        )
+        bot.om.place_order = AsyncMock(return_value="ioc-exit-safe")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+
+        # Local position is +5 (stale: 3 contracts filled on exchange before cancel but packet delayed)
+        bot.inv_manager.get_position = MagicMock(return_value=5)
+        bot._is_reduce_only = True
+        bot._current_ask_quote_size = 5
+
+        await bot._update_quotes(None, 50)
+
+        # Replacement order is dispatched with reduce_only=True and IOC
+        # Exchange matching engine strictly rejects any execution exceeding true remaining position
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-DELAYED-FILL",
+            side="yes",
+            action="sell",
+            count=5,
+            price=49,
+            reduce_only=True,
+            time_in_force="immediate_or_cancel",
+        )
+        assert bot.current_ask_id is None
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_cancellation_blocks_quote_replacement(self):
+        """Unconfirmed withdrawal immediately escalates targeted reconciliation and blocks replacement quote."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-UNCONFIRMED-CANCEL",
+            order_size=10,
+        )
+        bot.current_ask_id = "unconfirmed-ask-999"
+        bot.current_ask_price = 55
+        bot.current_ask_size = 5
+        bot._current_ask_quote_size = 3
+
+        bot.om.cancel_order = AsyncMock(return_value=False)
+        bot.om.reconcile_resting_orders = AsyncMock(return_value=0)
+        bot.om.place_order = AsyncMock(return_value="replacement-order")
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+
+        await bot._update_quotes(None, 52)
+
+        # 1. Cancellation was retried
+        assert bot.om.cancel_order.call_count == 2
+        # 2. Targeted reconciliation was immediately awaited
+        bot.om.reconcile_resting_orders.assert_called_once_with(
+            ticker="KXTEST-UNCONFIRMED-CANCEL",
+            target_client_order_id="unconfirmed-ask-999",
+        )
+        # 3. Active quote tracking is retained
+        assert bot.current_ask_id == "unconfirmed-ask-999"
+        # 4. Replacement order placement is completely blocked
+        bot.om.place_order.assert_not_called()
