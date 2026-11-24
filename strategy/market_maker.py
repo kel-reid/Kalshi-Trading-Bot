@@ -1792,32 +1792,65 @@ class AvellanedaStoikovBot:
             result_iter = iter(results)
             if cancel_bid:
                 result = next(result_iter)
+                if result is not True:
+                    try:
+                        result = await self.om.cancel_order(self.current_bid_id)
+                    except Exception as e_retry:
+                        result = e_retry
                 if result is True:
                     self.current_bid_id = None
                     self.current_bid_price = None
                     self.current_bid_size = None
                 else:
+                    failed_bid_id = self.current_bid_id
                     logger.error(
-                        f"Failed to confirm cancellation of bid quote {self.current_bid_id} "
+                        f"Failed to confirm cancellation of bid quote {failed_bid_id} "
                         f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
                     )
-                    rec_task = asyncio.create_task(self.om.reconcile_resting_orders(ticker=self.ticker))
+                    # Targeted reconciliation: explicitly pass target_client_order_id so reconciliation
+                    # actively cancels this specific tracked order on the exchange
+                    rec_task = asyncio.create_task(
+                        self.om.reconcile_resting_orders(ticker=self.ticker, target_client_order_id=failed_bid_id)
+                    )
                     self._background_tasks.add(rec_task)
                     rec_task.add_done_callback(self._background_tasks.discard)
             if cancel_ask:
                 result = next(result_iter)
+                if result is not True:
+                    try:
+                        result = await self.om.cancel_order(self.current_ask_id)
+                    except Exception as e_retry:
+                        result = e_retry
                 if result is True:
                     self.current_ask_id = None
                     self.current_ask_price = None
                     self.current_ask_size = None
                 else:
+                    failed_ask_id = self.current_ask_id
                     logger.error(
-                        f"Failed to confirm cancellation of ask quote {self.current_ask_id} "
+                        f"Failed to confirm cancellation of ask quote {failed_ask_id} "
                         f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
                     )
-                    rec_task = asyncio.create_task(self.om.reconcile_resting_orders(ticker=self.ticker))
+                    # Targeted reconciliation: explicitly pass target_client_order_id so reconciliation
+                    # actively cancels this specific tracked order on the exchange
+                    rec_task = asyncio.create_task(
+                        self.om.reconcile_resting_orders(ticker=self.ticker, target_client_order_id=failed_ask_id)
+                    )
                     self._background_tasks.add(rec_task)
                     rec_task.add_done_callback(self._background_tasks.discard)
+
+        # Drain/wait for any in-flight fill processing to complete so inventory snapshot is authoritative
+        for _ in range(5):
+            if getattr(self.inv_manager, "_pending_fills", 0) == 0:
+                break
+            await asyncio.sleep(0.01)
+
+        if getattr(self.inv_manager, "_pending_fills", 0) > 0:
+            logger.warning(
+                f"Fill processing still in-flight on {self.ticker} "
+                f"(pending: {getattr(self.inv_manager, '_pending_fills', 0)}); deferring quote update to avoid stale inventory sizing."
+            )
+            return
 
         # Re-sample inventory post-cancellation to safeguard against fills that arrived while cancels were in flight
         current_inv = self.inv_manager.get_position(self.ticker)
@@ -1825,6 +1858,17 @@ class AvellanedaStoikovBot:
         is_reduce_only = getattr(self, "_is_reduce_only", False) or (
             self.inventory_taper_enabled and getattr(self, "_current_taper_factor", 1.0) < 0.5 and current_inv != 0
         )
+
+        # Check if this order is an aggressive crossing exit hedge
+        is_crossing_bid_hedge = False
+        is_crossing_ask_hedge = False
+        if is_reduce_only:
+            best_bid = self.ob_manager.get_best_bid(self.ticker)
+            best_ask = self.ob_manager.get_best_ask(self.ticker)
+            if new_bid is not None and best_ask and new_bid >= best_ask[0]:
+                is_crossing_bid_hedge = True
+            if new_ask is not None and best_bid and new_ask <= best_bid[0]:
+                is_crossing_ask_hedge = True
 
         # Place new BID if needed
         now = time.time()
@@ -1849,6 +1893,10 @@ class AvellanedaStoikovBot:
 
                     logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c (Shard {self.exchange_index})")
                     order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                    if is_crossing_bid_hedge:
+                        order_kwargs["reduce_only"] = True
+                        order_kwargs["time_in_force"] = "immediate_or_cancel"
+
                     self.current_bid_id = await self.om.place_order(
                         ticker=self.ticker,
                         side="yes",
@@ -1862,6 +1910,10 @@ class AvellanedaStoikovBot:
                         self.current_bid_size = target_bid_size
                         if is_hedge:
                             self._consecutive_hedge_failures = 0
+                        if is_crossing_bid_hedge:
+                            self.current_bid_id = None
+                            self.current_bid_price = None
+                            self.current_bid_size = None
                     else:
                         self._last_order_error_time = time.time()
                         self.current_bid_price = None
@@ -1917,6 +1969,10 @@ class AvellanedaStoikovBot:
 
                     logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c (Shard {self.exchange_index})")
                     order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                    if is_crossing_ask_hedge:
+                        order_kwargs["reduce_only"] = True
+                        order_kwargs["time_in_force"] = "immediate_or_cancel"
+
                     self.current_ask_id = await self.om.place_order(
                         ticker=self.ticker,
                         side="yes",
@@ -1930,6 +1986,10 @@ class AvellanedaStoikovBot:
                         self.current_ask_size = target_ask_size
                         if is_hedge:
                             self._consecutive_hedge_failures = 0
+                        if is_crossing_ask_hedge:
+                            self.current_ask_id = None
+                            self.current_ask_price = None
+                            self.current_ask_size = None
                     else:
                         self._last_order_error_time = time.time()
                         self.current_ask_price = None

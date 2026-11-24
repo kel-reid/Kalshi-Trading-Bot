@@ -595,6 +595,108 @@ class TestInventoryTapering:
         # Retains active quote ID to block duplicate placement
         assert bot.current_ask_id == "old-ask-oversized"
         bot.om.place_order.assert_not_called()
-        # Dispatched reconciliation task in background
+        # Dispatched reconciliation task in background with target_client_order_id
         await asyncio.sleep(0.01)
-        bot.om.reconcile_resting_orders.assert_called_once_with(ticker="KXTEST-FAILED-CANCEL")
+        bot.om.reconcile_resting_orders.assert_called_once_with(
+            ticker="KXTEST-FAILED-CANCEL",
+            target_client_order_id="old-ask-oversized",
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_fill_processing_drains_or_defers_quote_update(self):
+        """_update_quotes drains in-flight fills or defers quote replacement if fill is still processing."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-PENDING-FILL",
+            order_size=10,
+        )
+        bot.om.place_order = AsyncMock(return_value="order-123")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+
+        # Case 1: Pending fill drains to 0 within the wait loop
+        bot.inv_manager._pending_fills = 1
+        async def drain_fills():
+            await asyncio.sleep(0.01)
+            bot.inv_manager._pending_fills = 0
+            bot.inv_manager.get_position = MagicMock(return_value=3)
+
+        asyncio.create_task(drain_fills())
+        bot.inv_manager.get_position = MagicMock(return_value=5)
+        bot._current_ask_quote_size = 5
+        bot._is_reduce_only = True
+
+        await bot._update_quotes(None, 52)
+        # Should have waited for _pending_fills to drain to 0, then placed ask for fresh inventory (3)
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-PENDING-FILL",
+            side="yes",
+            action="sell",
+            count=3,
+            price=52,
+        )
+
+        # Case 2: Pending fill does NOT drain (stays > 0) -> quote placement deferred!
+        bot.om.place_order.reset_mock()
+        bot.inv_manager._pending_fills = 2
+        await bot._update_quotes(None, 52)
+        bot.om.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_crossing_hedge_invokes_reduce_only_ioc(self):
+        """Crossing exit hedge orders pass exchange-enforced reduce_only=True and IOC."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-CROSS-HEDGE",
+            order_size=10,
+            max_hedge_inventory=10,
+        )
+        bot.om.place_order = AsyncMock(return_value="hedge-ioc-123")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.inv_manager.get_position = MagicMock(return_value=6)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._is_reduce_only = True
+        bot._current_ask_quote_size = 6
+
+        # Cross best bid (48c) to exit 6 long contracts
+        await bot._update_quotes(None, 48)
+
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-CROSS-HEDGE",
+            side="yes",
+            action="sell",
+            count=6,
+            price=48,
+            reduce_only=True,
+            time_in_force="immediate_or_cancel",
+        )
+        # IOC crossing order does not leave resting quote state
+        assert bot.current_ask_id is None
+
+    @pytest.mark.asyncio
+    async def test_passive_resting_taper_quote_uses_gtc_without_reduce_only(self):
+        """Passive resting quotes (not crossing) remain GTC without reduce_only to avoid Kalshi rejection."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-PASSIVE-TAPER",
+            order_size=10,
+            inventory_taper_enabled=True,
+        )
+        bot.om.place_order = AsyncMock(return_value="passive-gtc-123")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.inv_manager.get_position = MagicMock(return_value=2)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._is_reduce_only = True
+        bot._current_ask_quote_size = 2
+
+        # Passive ask @ 51c (above best bid 48c -> not crossing)
+        await bot._update_quotes(None, 51)
+
+        bot.om.place_order.assert_called_once_with(
+            ticker="KXTEST-PASSIVE-TAPER",
+            side="yes",
+            action="sell",
+            count=2,
+            price=51,
+        )
+        # Passive quote rests on the book
+        assert bot.current_ask_id == "passive-gtc-123"
+        assert bot.current_ask_price == 51
