@@ -14,7 +14,7 @@ import os
 import datetime
 from collections import deque
 from decimal import Decimal, InvalidOperation
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Any
 
 from data.websocket_client import KalshiWebsocketClient, FatalIngestionError
 from data.orderbook_manager import OrderbookManager
@@ -80,6 +80,8 @@ from config import (
     EXPIRATION_BLACKOUT_SECONDS,
     BLACKOUT_DANGER_PRICE_LOW,
     BLACKOUT_DANGER_PRICE_HIGH,
+    INVENTORY_TAPER_ENABLED,
+    INVENTORY_TAPER_WINDOW_SECONDS,
 )
 from strategy.dynamic_spread import (
     RollingVolatilityEstimator,
@@ -146,6 +148,8 @@ class AvellanedaStoikovBot:
         expiration_blackout_seconds: Optional[int] = None,
         blackout_danger_price_low: Optional[int] = None,
         blackout_danger_price_high: Optional[int] = None,
+        inventory_taper_enabled: Optional[bool] = None,
+        inventory_taper_window_seconds: Optional[int] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -297,6 +301,16 @@ class AvellanedaStoikovBot:
             if blackout_danger_price_high is not None
             else BLACKOUT_DANGER_PRICE_HIGH
         )
+        self.inventory_taper_enabled = (
+            bool(inventory_taper_enabled)
+            if inventory_taper_enabled is not None
+            else INVENTORY_TAPER_ENABLED
+        )
+        self.inventory_taper_window_seconds = (
+            max(0, int(inventory_taper_window_seconds))
+            if inventory_taper_window_seconds is not None
+            else INVENTORY_TAPER_WINDOW_SECONDS
+        )
         self._market_close_time: Optional[datetime.datetime] = None
         self._in_expiration_blackout: bool = False
 
@@ -330,8 +344,8 @@ class AvellanedaStoikovBot:
         
         self.current_bid_price: Optional[Union[int, float]] = None
         self.current_ask_price: Optional[Union[int, float]] = None
-        self.current_bid_size: Optional[int] = None
-        self.current_ask_size: Optional[int] = None
+        self.current_bid_size: Optional[Union[int, float]] = None
+        self.current_ask_size: Optional[Union[int, float]] = None
         self._last_empty_ob_log: float = 0.0
 
 
@@ -629,7 +643,43 @@ class AvellanedaStoikovBot:
         except Exception as e:
             logger.debug(f"Failed to refresh market metadata for {self.ticker}: {e}")
 
-    def calculate_order_size(self, mid_price: Optional[float]) -> int:
+    def get_inventory_taper_factor(self, now_dt: Optional[datetime.datetime] = None) -> float:
+        """
+        Calculates dynamic inventory tapering factor alpha in [0.0, 1.0] as the market approaches
+        expiration blackout:
+            alpha = max(0.0, min(1.0, (remaining_to_close - blackout_seconds) / taper_window_seconds))
+
+        When alpha == 1.0, market is outside tapering window (full sizing and normal limits).
+        When 0.0 < alpha < 1.0, market is within the pre-blackout tapering window:
+            - Order sizing scales down smoothly towards 1 contract.
+            - Maximum inventory limits taper down.
+            - Reservation price gamma skew increases to favor flattening open exposure.
+        When alpha == 0.0, market has reached or passed the blackout threshold.
+        """
+        if not self.inventory_taper_enabled or self._market_close_time is None or self.inventory_taper_window_seconds <= 0:
+            return 1.0
+
+        now_utc = now_dt if (now_dt is not None and isinstance(now_dt, datetime.datetime)) else datetime.datetime.now(datetime.timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=datetime.timezone.utc)
+
+        close_time = self._market_close_time
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=datetime.timezone.utc)
+
+        remaining_to_close = (close_time - now_utc).total_seconds()
+        if remaining_to_close <= self.expiration_blackout_seconds:
+            return 0.0
+
+        taper_start = self.expiration_blackout_seconds + self.inventory_taper_window_seconds
+        if remaining_to_close >= taper_start:
+            return 1.0
+
+        time_into_taper = remaining_to_close - self.expiration_blackout_seconds
+        alpha = time_into_taper / float(self.inventory_taper_window_seconds)
+        return max(0.0, min(1.0, alpha))
+
+    def calculate_order_size(self, mid_price: Optional[float], taper_factor: float = 1.0) -> int:
         """
         Calculates the order size (contract count) for the current quoting cycle.
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
@@ -641,8 +691,13 @@ class AvellanedaStoikovBot:
         Additionally enforces a collateral-constrained ceiling (self.max_low_price_contracts)
         when contract prices fall below low_price_threshold_cents (< 25c) to prevent
         collateral exhaustion on the short/NO leg.
+        When taper_factor in [0.0, 1.0) is supplied (pre-blackout tapering), contract count
+        and low-price caps scale down smoothly towards 1 contract.
         Otherwise falls back to fixed order_size (also capped by max_order_contracts).
         """
+        tf = float(taper_factor) if (isinstance(taper_factor, (int, float)) and not isinstance(taper_factor, bool) and math.isfinite(taper_factor) and taper_factor >= 0.0) else 1.0
+        tf = min(1.0, tf)
+
         if self.order_dollars is not None and math.isfinite(self.order_dollars) and self.order_dollars >= 1.0:
             if isinstance(mid_price, (int, float)) and not isinstance(mid_price, bool) and math.isfinite(mid_price) and mid_price > 0:
                 # Bound midpoint to Kalshi's valid exchange quoting limits [1c, 99c]
@@ -654,11 +709,45 @@ class AvellanedaStoikovBot:
                 if self.max_low_price_contracts and self.max_low_price_contracts > 0:
                     if effective_price <= self.low_price_threshold_cents:
                         capped_count = min(capped_count, self.max_low_price_contracts)
+                # Apply taper factor smoothly after establishing the fully capped baseline
+                if tf < 1.0:
+                    capped_count = max(1, math.floor(capped_count * tf))
                 return capped_count
         fallback = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
-        return min(self.max_order_contracts, max(1, fallback))
+        capped_fallback = min(self.max_order_contracts, fallback)
+        if tf < 1.0:
+            capped_fallback = max(1, math.floor(capped_fallback * tf))
+        return max(1, capped_fallback)
 
+    def _cap_quote_size_to_inventory(
+        self,
+        quote_size: Union[int, float],
+        inventory: Union[int, float, Decimal],
+    ) -> Union[int, float]:
+        """Caps the quote size to available inventory to prevent overshooting or position flips.
 
+        Supports fractional inventory (e.g. 1.5 contracts) down to 0.01 contracts.
+        For strictly integer inventory and integer quote sizes, preserves integer typing.
+        """
+        try:
+            abs_inv = abs(float(inventory))
+            q_size = float(quote_size)
+        except (ValueError, TypeError):
+            return quote_size
+
+        if not math.isfinite(abs_inv) or not math.isfinite(q_size) or abs_inv <= 0 or q_size <= 0:
+            return quote_size
+
+        # Integer fast-path if both are integer values >= 1
+        if (isinstance(quote_size, int) or q_size.is_integer()) and (isinstance(inventory, int) or abs_inv.is_integer()) and abs_inv >= 1:
+            return max(1, min(int(q_size), int(abs_inv)))
+
+        # Fractional path: bounded strictly by abs_inv and floored at 0.01 (exchange precision)
+        capped = min(q_size, abs_inv)
+        rounded = round(capped, 2)
+        if rounded > abs_inv and abs_inv >= 0.01:
+            rounded = round(rounded - 0.01, 2)
+        return max(0.01, rounded)
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -1235,10 +1324,17 @@ class AvellanedaStoikovBot:
             rec_task.add_done_callback(self._background_tasks.discard)
 
         # 3. Determine dynamic quote size and hedge threshold for current market price
-        quote_size = self.calculate_order_size(mid_price)
+        taper_factor = self.get_inventory_taper_factor()
+        self._current_taper_factor = taper_factor
+        self._is_reduce_only = False
+        quote_size = self.calculate_order_size(mid_price, taper_factor=taper_factor)
         self._current_quote_size = quote_size
         base_hedge_threshold = (5 * quote_size) if self.order_dollars else 5
-        hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
+        if taper_factor < 1.0:
+            tapered_hedge = max(1, math.ceil(base_hedge_threshold * taper_factor))
+            hedge_threshold = min(self.max_hedge_inventory, tapered_hedge)
+        else:
+            hedge_threshold = min(self.max_hedge_inventory, base_hedge_threshold)
 
         # 2b. Session Risk Safeguards (Fee Churn Circuit Breaker & Max Loss Stop-Loss)
         pnl_summary = self.inv_manager.get_pnl_summary(self.ticker)
@@ -1259,6 +1355,7 @@ class AvellanedaStoikovBot:
 
             # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
             if abs(inventory) >= hedge_threshold:
+                self._is_reduce_only = True
                 if inventory >= hedge_threshold:
                     logger.warning(
                         f"[{reason.upper()} - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
@@ -1266,6 +1363,8 @@ class AvellanedaStoikovBot:
                     )
                     optimal_bid = None
                     optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                    self._current_bid_quote_size = quote_size
+                    self._current_ask_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
                 else:
                     logger.warning(
                         f"[{reason.upper()} - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
@@ -1273,11 +1372,14 @@ class AvellanedaStoikovBot:
                     )
                     optimal_ask = None
                     optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+                    self._current_bid_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+                    self._current_ask_quote_size = quote_size
 
                 realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
                 unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                active_size = self._current_ask_quote_size if optimal_ask is not None else self._current_bid_quote_size
                 logger.info(
-                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                     f"→ Bid={optimal_bid}c  Ask={optimal_ask}c ({reason} Hedged) | "
                     f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                 )
@@ -1329,6 +1431,7 @@ class AvellanedaStoikovBot:
 
             # If inventory is at or above hedge threshold, allow ONLY the single-sided exit hedge to unwind exposure.
             if abs(inventory) >= hedge_threshold:
+                self._is_reduce_only = True
                 if inventory >= hedge_threshold:
                     logger.warning(
                         f"[COLLAR BREACH - HEDGE ACTIVE] Long inventory high ({inventory} >= {hedge_threshold}). "
@@ -1336,6 +1439,8 @@ class AvellanedaStoikovBot:
                     )
                     optimal_bid = None
                     optimal_ask = max(2, min(best_bid[0], 99)) if best_bid else None
+                    self._current_bid_quote_size = quote_size
+                    self._current_ask_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
                 else:
                     logger.warning(
                         f"[COLLAR BREACH - HEDGE ACTIVE] Short inventory high ({inventory} <= -{hedge_threshold}). "
@@ -1343,11 +1448,14 @@ class AvellanedaStoikovBot:
                     )
                     optimal_ask = None
                     optimal_bid = max(1, min(best_ask[0], 98)) if best_ask else None
+                    self._current_bid_quote_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+                    self._current_ask_quote_size = quote_size
 
                 realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
                 unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
+                active_size = self._current_ask_quote_size if optimal_ask is not None else self._current_bid_quote_size
                 logger.info(
-                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                    f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                     f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Collar Breach Hedged) | "
                     f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
                 )
@@ -1445,10 +1553,15 @@ class AvellanedaStoikovBot:
         normalized_q = (inventory / quote_size) if (self.order_dollars and quote_size > 0) else inventory
 
         effective_gamma = self.gamma
+        if taper_factor < 1.0:
+            # Pre-blackout de-risking: smoothly boost gamma up to 2.5x as we approach blackout
+            taper_gamma_multiplier = 1.0 + (1.0 - taper_factor) * 1.5
+            effective_gamma = self.gamma * taper_gamma_multiplier
+
         if self.momentum_skew_enabled and abs(normalized_q) > 1.0:
             excess_q = abs(normalized_q) - 1.0
             gamma_scale = min(self.max_gamma_multiplier, 1.0 + (self.momentum_gamma_factor * excess_q))
-            effective_gamma = self.gamma * gamma_scale
+            effective_gamma = effective_gamma * gamma_scale
 
         # Adverse Momentum / Drift Skew:
         # If orderbook mid price has drifted adversely against current inventory position,
@@ -1546,6 +1659,49 @@ class AvellanedaStoikovBot:
                 except Exception:
                     pass
 
+        # Late-Session Dynamic Inventory Tapering (Pre-Blackout De-risking Safeguard):
+        # Progressively steps down position risk in the window leading up to expiration blackout.
+        # When within the latter half of the taper window (taper_factor < 0.50) and holding open inventory,
+        # suppress quotes on the accumulating side to guarantee that remaining resting orders can ONLY reduce inventory.
+        if self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0:
+            if inventory > 0 and optimal_bid is not None:
+                logger.info(
+                    f"[INVENTORY TAPER - REDUCE ONLY] Taper factor {taper_factor:.2f} < 0.50. "
+                    f"Suppressing BUY YES quote to unwind long inventory ({inventory})."
+                )
+                optimal_bid = None
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="inventory_taper", ticker=self.ticker).inc()
+                except Exception:
+                    pass
+            elif inventory < 0 and optimal_ask is not None:
+                logger.info(
+                    f"[INVENTORY TAPER - REDUCE ONLY] Taper factor {taper_factor:.2f} < 0.50. "
+                    f"Suppressing SELL YES quote to unwind short inventory ({inventory})."
+                )
+                optimal_ask = None
+                try:
+                    SAFEGUARD_EVENTS_TOTAL.labels(safeguard="inventory_taper", ticker=self.ticker).inc()
+                except Exception:
+                    pass
+
+        # Determine target quote sizes for both sides
+        target_bid_size = quote_size
+        target_ask_size = quote_size
+
+        # In late-session reduce-only or active hedging, cap surviving quote size at open inventory
+        # to ensure fills cannot overshoot and flip the position into the opposite direction.
+        is_reduce_only = (self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0) or abs(inventory) >= hedge_threshold
+        self._is_reduce_only = is_reduce_only
+        if is_reduce_only:
+            if inventory > 0:
+                target_ask_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+            elif inventory < 0:
+                target_bid_size = self._cap_quote_size_to_inventory(quote_size, inventory)
+
+        self._current_bid_quote_size = target_bid_size
+        self._current_ask_quote_size = target_ask_size
+
         realized_pnl = self.inv_manager.get_realized_pnl(self.ticker)
         unrealized_pnl = self.inv_manager.get_unrealized_pnl(self.ticker)
         if optimal_bid is not None and optimal_ask is not None:
@@ -1556,8 +1712,9 @@ class AvellanedaStoikovBot:
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
         else:
+            active_size = target_ask_size if optimal_ask is not None else target_bid_size
             logger.info(
-                f"[A-S MATH] Mid={mid_price:.1f}c | Size={quote_size} | Inventory={inventory} | "
+                f"[A-S MATH] Mid={mid_price:.1f}c | Size={active_size} | Inventory={inventory} | "
                 f"→ Bid={optimal_bid}c  Ask={optimal_ask}c (Hedged) | "
                 f"Realized={realized_pnl:+.1f}c | Unrealized={unrealized_pnl:+.1f}c"
             )
@@ -1571,14 +1728,29 @@ class AvellanedaStoikovBot:
         cancel_bid = False
         cancel_ask = False
 
-        # Determine target quote sizes for bid and ask
-        target_bid_size = getattr(self, "_current_quote_size", None)
-        if not isinstance(target_bid_size, int) or isinstance(target_bid_size, bool) or target_bid_size <= 0:
-            target_bid_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        def _is_valid_size(s: Any) -> bool:
+            if isinstance(s, bool):
+                return False
+            if isinstance(s, (int, float, Decimal)):
+                try:
+                    f = float(s)
+                    return math.isfinite(f) and f > 0
+                except (ValueError, TypeError, OverflowError):
+                    return False
+            return False
 
-        target_ask_size = getattr(self, "_current_quote_size", None)
-        if not isinstance(target_ask_size, int) or isinstance(target_ask_size, bool) or target_ask_size <= 0:
-            target_ask_size = self.order_size if (isinstance(self.order_size, int) and not isinstance(self.order_size, bool) and self.order_size > 0) else 1
+        default_size = self.order_size if _is_valid_size(self.order_size) else 1
+
+        # Determine target quote sizes for bid and ask
+        raw_bid_size = getattr(self, "_current_bid_quote_size", None)
+        if raw_bid_size is None:
+            raw_bid_size = getattr(self, "_current_quote_size", None)
+        target_bid_size = raw_bid_size if _is_valid_size(raw_bid_size) else default_size
+
+        raw_ask_size = getattr(self, "_current_ask_quote_size", None)
+        if raw_ask_size is None:
+            raw_ask_size = getattr(self, "_current_quote_size", None)
+        target_ask_size = raw_ask_size if _is_valid_size(raw_ask_size) else default_size
 
         # Check whether quotes need update (price change >= tolerance OR contract size change on active quote)
         bid_price_changed = False
@@ -1620,137 +1792,242 @@ class AvellanedaStoikovBot:
             result_iter = iter(results)
             if cancel_bid:
                 result = next(result_iter)
+                if result is not True:
+                    try:
+                        result = await self.om.cancel_order(self.current_bid_id)
+                    except Exception as e_retry:
+                        result = e_retry
                 if result is True:
                     self.current_bid_id = None
                     self.current_bid_price = None
                     self.current_bid_size = None
                 else:
+                    failed_bid_id = self.current_bid_id
                     logger.error(
-                        f"Failed to confirm cancellation of bid quote {self.current_bid_id} "
+                        f"Failed to confirm cancellation of bid quote {failed_bid_id} "
                         f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
                     )
+                    # Targeted reconciliation: explicitly pass target_client_order_id so reconciliation
+                    # actively cancels this specific tracked order on the exchange immediately
+                    try:
+                        await self.om.reconcile_resting_orders(
+                            ticker=self.ticker, target_client_order_id=failed_bid_id
+                        )
+                    except Exception as e_rec:
+                        logger.error(f"Targeted reconciliation failed for bid {failed_bid_id}: {e_rec}")
             if cancel_ask:
                 result = next(result_iter)
+                if result is not True:
+                    try:
+                        result = await self.om.cancel_order(self.current_ask_id)
+                    except Exception as e_retry:
+                        result = e_retry
                 if result is True:
                     self.current_ask_id = None
                     self.current_ask_price = None
                     self.current_ask_size = None
                 else:
+                    failed_ask_id = self.current_ask_id
                     logger.error(
-                        f"Failed to confirm cancellation of ask quote {self.current_ask_id} "
+                        f"Failed to confirm cancellation of ask quote {failed_ask_id} "
                         f"(result: {result!r}); retaining active quote state to prevent duplicate quoting."
                     )
+                    # Targeted reconciliation: explicitly pass target_client_order_id so reconciliation
+                    # actively cancels this specific tracked order on the exchange immediately
+                    try:
+                        await self.om.reconcile_resting_orders(
+                            ticker=self.ticker, target_client_order_id=failed_ask_id
+                        )
+                    except Exception as e_rec:
+                        logger.error(f"Targeted reconciliation failed for ask {failed_ask_id}: {e_rec}")
 
+        # Drain/wait for any in-flight fill processing to complete so inventory snapshot is authoritative
+        for _ in range(5):
+            if getattr(self.inv_manager, "_pending_fills", 0) == 0:
+                break
+            await asyncio.sleep(0.01)
+
+        if getattr(self.inv_manager, "_pending_fills", 0) > 0:
+            logger.warning(
+                f"Fill processing still in-flight on {self.ticker} "
+                f"(pending: {getattr(self.inv_manager, '_pending_fills', 0)}); deferring quote update to avoid stale inventory sizing."
+            )
+            return
+
+        # Re-sample inventory post-cancellation to safeguard against fills that arrived while cancels were in flight
+        current_inv = self.inv_manager.get_position(self.ticker)
+        is_hedge = (new_bid is None and new_ask is not None) or (new_ask is None and new_bid is not None)
+        is_reduce_only = getattr(self, "_is_reduce_only", False) or (
+            self.inventory_taper_enabled and getattr(self, "_current_taper_factor", 1.0) < 0.5 and current_inv != 0
+        )
+
+        is_exit_bid = bool(is_reduce_only and current_inv < 0)
+        is_exit_ask = bool(is_reduce_only and current_inv > 0)
 
         # Place new BID if needed
         now = time.time()
-        is_hedge = (new_bid is None and new_ask is not None) or (new_ask is None and new_bid is not None)
         in_error_cooldown = (now - self._last_order_error_time < self._order_error_cooldown) and not is_hedge
 
         if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
-                logger.info(f">> Placing new BID: {target_bid_size} YES @ {new_bid}c (Shard {self.exchange_index})")
-                order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
-                self.current_bid_id = await self.om.place_order(
-                    ticker=self.ticker,
-                    side="yes",
-                    action="buy",
-                    count=target_bid_size,
-                    price=new_bid,
-                    **order_kwargs,
-                )
-                if self.current_bid_id:
-                    self.current_bid_price = new_bid
-                    self.current_bid_size = target_bid_size
-                    if is_hedge:
-                        self._consecutive_hedge_failures = 0
+                # If entering single-sided hedge, confirm withdrawal of opposing quote first
+                if is_reduce_only and self.current_ask_id is not None:
+                    logger.warning(
+                        f"Aborting hedge BID placement on {self.ticker}: opposing ASK quote {self.current_ask_id} "
+                        f"withdrawal not yet confirmed."
+                    )
+                elif is_reduce_only and current_inv >= 0:
+                    logger.info(
+                        f"Skipping BID quote placement on {self.ticker}: short position already closed or flipped "
+                        f"(current inventory: {current_inv})."
+                    )
                 else:
-                    self._last_order_error_time = time.time()
-                    self.current_bid_price = None
-                    self.current_bid_size = None
-                    if is_hedge:
-                        self._consecutive_hedge_failures += 1
-                        logger.warning(
-                            f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
-                            f"Attempting shard rebalance..."
-                        )
-                        hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
-                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
-                        if self._consecutive_hedge_failures >= 3:
-                            logger.critical(
-                                f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
-                                f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                    if is_exit_bid:
+                        target_bid_size = self._cap_quote_size_to_inventory(target_bid_size, current_inv)
+
+                    order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                    exec_bid_price = new_bid
+                    if is_exit_bid:
+                        order_kwargs["reduce_only"] = True
+                        order_kwargs["time_in_force"] = "immediate_or_cancel"
+                        best_ask = self.ob_manager.get_best_ask(self.ticker)
+                        if best_ask:
+                            exec_bid_price = max(new_bid, best_ask[0])
+
+                    logger.info(f">> Placing new BID: {target_bid_size} YES @ {exec_bid_price}c (Shard {self.exchange_index})")
+
+                    self.current_bid_id = await self.om.place_order(
+                        ticker=self.ticker,
+                        side="yes",
+                        action="buy",
+                        count=target_bid_size,
+                        price=exec_bid_price,
+                        **order_kwargs,
+                    )
+                    if self.current_bid_id:
+                        self.current_bid_price = exec_bid_price
+                        self.current_bid_size = target_bid_size
+                        if is_hedge:
+                            self._consecutive_hedge_failures = 0
+                        if is_exit_bid:
+                            self.current_bid_id = None
+                            self.current_bid_price = None
+                            self.current_bid_size = None
+                    else:
+                        self._last_order_error_time = time.time()
+                        self.current_bid_price = None
+                        self.current_bid_size = None
+                        if is_hedge:
+                            self._consecutive_hedge_failures += 1
+                            logger.warning(
+                                f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                                f"Attempting shard rebalance..."
                             )
-                            from execution.kill_switch import KillSwitch
-                            killer = KillSwitch(self.om, ticker=self.ticker)
-                            await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
-                            await send_alert(
-                                f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
-                                f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                            hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
+                            await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                            if self._consecutive_hedge_failures >= 3:
+                                logger.critical(
+                                    f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                    f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                                )
+                                from execution.kill_switch import KillSwitch
+                                killer = KillSwitch(self.om, ticker=self.ticker)
+                                await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                                await send_alert(
+                                    f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                    f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                )
+                                self._market_inactive = True
+                        elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                            logger.warning(
+                                f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                                f"Triggering background shard collateral rebalance..."
                             )
-                            self._market_inactive = True
-                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
-                        logger.warning(
-                            f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
-                            f"Triggering background shard collateral rebalance..."
-                        )
-                        self._last_shard_rebalance_dispatch_time = now
-                        rebal_task = asyncio.create_task(self.ensure_shard_collateral())
-                        self._background_tasks.add(rebal_task)
-                        rebal_task.add_done_callback(self._background_tasks.discard)
+                            self._last_shard_rebalance_dispatch_time = now
+                            rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                            self._background_tasks.add(rebal_task)
+                            rebal_task.add_done_callback(self._background_tasks.discard)
 
         # Place new ASK if needed
         if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
-                logger.info(f">> Placing new ASK: {target_ask_size} YES @ {new_ask}c (Shard {self.exchange_index})")
-                order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
-                self.current_ask_id = await self.om.place_order(
-                    ticker=self.ticker,
-                    side="yes",
-                    action="sell",
-                    count=target_ask_size,
-                    price=new_ask,
-                    **order_kwargs,
-                )
-                if self.current_ask_id:
-                    self.current_ask_price = new_ask
-                    self.current_ask_size = target_ask_size
-                    if is_hedge:
-                        self._consecutive_hedge_failures = 0
+                # If entering single-sided hedge, confirm withdrawal of opposing quote first
+                if is_reduce_only and self.current_bid_id is not None:
+                    logger.warning(
+                        f"Aborting hedge ASK placement on {self.ticker}: opposing BID quote {self.current_bid_id} "
+                        f"withdrawal not yet confirmed."
+                    )
+                elif is_reduce_only and current_inv <= 0:
+                    logger.info(
+                        f"Skipping ASK quote placement on {self.ticker}: long position already closed or flipped "
+                        f"(current inventory: {current_inv})."
+                    )
                 else:
-                    self._last_order_error_time = time.time()
-                    self.current_ask_price = None
-                    self.current_ask_size = None
-                    if is_hedge:
-                        self._consecutive_hedge_failures += 1
-                        logger.warning(
-                            f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
-                            f"Attempting shard rebalance..."
-                        )
-                        hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
-                        await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
-                        if self._consecutive_hedge_failures >= 3:
-                            logger.critical(
-                                f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
-                                f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                    if is_exit_ask:
+                        target_ask_size = self._cap_quote_size_to_inventory(target_ask_size, current_inv)
+
+                    order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                    exec_ask_price = new_ask
+                    if is_exit_ask:
+                        order_kwargs["reduce_only"] = True
+                        order_kwargs["time_in_force"] = "immediate_or_cancel"
+                        best_bid = self.ob_manager.get_best_bid(self.ticker)
+                        if best_bid:
+                            exec_ask_price = min(new_ask, best_bid[0])
+
+                    logger.info(f">> Placing new ASK: {target_ask_size} YES @ {exec_ask_price}c (Shard {self.exchange_index})")
+
+                    self.current_ask_id = await self.om.place_order(
+                        ticker=self.ticker,
+                        side="yes",
+                        action="sell",
+                        count=target_ask_size,
+                        price=exec_ask_price,
+                        **order_kwargs,
+                    )
+                    if self.current_ask_id:
+                        self.current_ask_price = exec_ask_price
+                        self.current_ask_size = target_ask_size
+                        if is_hedge:
+                            self._consecutive_hedge_failures = 0
+                        if is_exit_ask:
+                            self.current_ask_id = None
+                            self.current_ask_price = None
+                            self.current_ask_size = None
+                    else:
+                        self._last_order_error_time = time.time()
+                        self.current_ask_price = None
+                        self.current_ask_size = None
+                        if is_hedge:
+                            self._consecutive_hedge_failures += 1
+                            logger.warning(
+                                f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                                f"Attempting shard rebalance..."
                             )
-                            from execution.kill_switch import KillSwitch
-                            killer = KillSwitch(self.om, ticker=self.ticker)
-                            await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
-                            await send_alert(
-                                f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
-                                f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                            hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
+                            await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                            if self._consecutive_hedge_failures >= 3:
+                                logger.critical(
+                                    f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                    f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                                )
+                                from execution.kill_switch import KillSwitch
+                                killer = KillSwitch(self.om, ticker=self.ticker)
+                                await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                                await send_alert(
+                                    f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                    f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                )
+                                self._market_inactive = True
+                        elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                            logger.warning(
+                                f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                                f"Triggering background shard collateral rebalance..."
                             )
-                            self._market_inactive = True
-                    elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
-                        logger.warning(
-                            f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
-                            f"Triggering background shard collateral rebalance..."
-                        )
-                        self._last_shard_rebalance_dispatch_time = now
-                        rebal_task = asyncio.create_task(self.ensure_shard_collateral())
-                        self._background_tasks.add(rebal_task)
-                        rebal_task.add_done_callback(self._background_tasks.discard)
+                            self._last_shard_rebalance_dispatch_time = now
+                            rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                            self._background_tasks.add(rebal_task)
+                            rebal_task.add_done_callback(self._background_tasks.discard)
 
 
 

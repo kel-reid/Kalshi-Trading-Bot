@@ -474,8 +474,9 @@ async def test_update_quotes_failed_cancellation_blocks_duplicate_order():
     # Midpoint shifts requiring new bid price 32c
     await bot._update_quotes(new_bid=32, new_ask=None)
 
-    # Cancellation was attempted
-    bot.om.cancel_order.assert_called_once_with("bid-order-active")
+    # Cancellation was attempted (initial attempt + immediate retry on failure)
+    assert bot.om.cancel_order.call_count == 2
+    bot.om.cancel_order.assert_called_with("bid-order-active")
 
     # Because cancellation returned False, current_bid_id must be RETAINED
     assert bot.current_bid_id == "bid-order-active"
