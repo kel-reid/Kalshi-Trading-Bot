@@ -196,6 +196,18 @@ def test_calculate_order_size_smooth_ramp_eliminates_low_price_cliff():
     # Previously 26.5c jumped abruptly from 5 to 19!
     assert bot_ramp.calculate_order_size(26.5) <= 6
 
+    # Case 3: Cap generous above 50c baseline ($2.50 -> 5c @ 50c, cap=10) deploys target notional smoothly down to 50c
+    bot_generous_cap = AvellanedaStoikovBot(
+        ticker="KXRAMP-3",
+        order_size=1,
+        order_dollars=2.50,
+        low_price_threshold_cents=35,
+        max_low_price_contracts=10,
+    )
+    assert bot_generous_cap.calculate_order_size(35.0) == 8
+    assert bot_generous_cap.calculate_order_size(36.0) == 7
+    assert bot_generous_cap.calculate_order_size(50.0) == 5
+
 
 @pytest.mark.asyncio
 async def test_passive_maker_clamp_prevents_accidental_taker_cross():
@@ -242,7 +254,7 @@ async def test_passive_maker_clamp_prevents_accidental_taker_cross():
     bot.ob_manager.get_best_bid = MagicMock(return_value=(51, 10))
     bot.ob_manager.get_best_ask = MagicMock(return_value=(53, 10))
     await bot._tick()
-    bid_short, ask_short = bot._update_quotes.call_args[0]
+    bid_short, _ask_short = bot._update_quotes.call_args[0]
     assert bid_short is not None and bid_short <= 52
 
     # Step 4: Long 5 (>= hedge_threshold 5) is NOT clamped back from best_bid when unwinding urgently
@@ -253,3 +265,39 @@ async def test_passive_maker_clamp_prevents_accidental_taker_cross():
     await bot._tick()
     _, ask_hedge = bot._update_quotes.call_args[0]
     assert ask_hedge <= 51
+
+
+@pytest.mark.asyncio
+async def test_update_quotes_reclamps_passive_price_after_async_cancel():
+    """
+    If top-of-book moves favorably during async cancel_order wait, _update_quotes re-clamps
+    the passive quote right before place_order so it still does not cross as a taker.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXCLAMP-RACE",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        passive_maker_clamp_enabled=True,
+    )
+    bot.current_ask_id = "ask-old"
+    bot.current_ask_price = 55
+    bot.current_ask_size = 1
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=2)
+    bot._current_hedge_threshold = 5
+
+    # Book ticked up to (52, 54) while cancellation was running -> 50c ask would cross best_bid=52c!
+    async def mock_cancel(_cid):
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(52, 10))
+        return True
+
+    bot.om.cancel_order = AsyncMock(side_effect=mock_cancel)
+    bot.om.place_order = AsyncMock(return_value="ask-new")
+
+    await bot._update_quotes(46, 50)
+
+    bot.om.place_order.assert_awaited()
+    placed_asks = [c.kwargs for c in bot.om.place_order.call_args_list if c.kwargs.get("action") == "sell"]
+    assert len(placed_asks) == 1
+    assert placed_asks[0]["price"] == 53

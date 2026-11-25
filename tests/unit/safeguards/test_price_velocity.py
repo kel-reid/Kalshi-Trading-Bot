@@ -12,6 +12,7 @@ Validates:
 """
 
 import time
+from decimal import Decimal
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from strategy.market_maker import AvellanedaStoikovBot
@@ -293,8 +294,95 @@ class TestPriceVelocityCircuitBreaker:
         bot.inv_manager.get_balance = MagicMock(return_value=10000)
         # Position flattened to 0 by the time exit ask placement checks post-cancel inventory
         bot.inv_manager.get_position = MagicMock(return_value=0)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={})
 
         await bot._update_quotes(None, 55)
 
         bot.om.cancel_order.assert_awaited_once_with("bid-old")
+        bot.om.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_delayed_partial_fill_caps_to_verified_exchange_position(self):
+        """
+        If an old resting ASK partially filled (2 of 3) before cancellation returned 200
+        and the WebSocket fill has not yet arrived locally (local inv still 3), REST
+        position verification caps the pause-exit replacement ASK to 1 so total sells
+        cannot reverse the position below zero.
+        """
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot._pause_accumulating_side = True
+        bot.current_ask_id = "ask-old"
+        bot.current_ask_price = 56
+        bot.current_ask_size = 3
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="ask-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)  # Stale local inventory
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("1")})
+
+        await bot._update_quotes(None, 54)
+
+        bot.om.cancel_order.assert_awaited_once_with("ask-old")
+        bot.om.place_order.assert_awaited_once()
+        kwargs = bot.om.place_order.call_args.kwargs
+        assert kwargs["action"] == "sell"
+        assert kwargs["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_short_delayed_partial_fill_caps_bid_to_verified_exchange_position(self):
+        """
+        Symmetric short path: if local inv is -3 due to a delayed partial fill on the
+        cancelled covering BID, exchange verification returning -1 caps replacement BID to 1.
+        """
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot._pause_accumulating_side = True
+        bot.current_bid_id = "bid-old"
+        bot.current_bid_price = 44
+        bot.current_bid_size = 3
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="bid-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=-3)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("-1")})
+
+        await bot._update_quotes(46, None)
+
+        bot.om.cancel_order.assert_awaited_once_with("bid-old")
+        bot.om.place_order.assert_awaited_once()
+        kwargs = bot.om.place_order.call_args.kwargs
+        assert kwargs["action"] == "buy"
+        assert kwargs["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_fails_closed_when_exchange_position_unverified(self):
+        """When live exchange position cannot be verified, pause-exit placement defers rather than risking reversal."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=3,
+        )
+        bot._pause_accumulating_side = True
+        bot.current_ask_id = "ask-old"
+        bot.current_ask_price = 56
+        bot.current_ask_size = 3
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="ask-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value=None)
+
+        await bot._update_quotes(None, 54)
+
+        bot.om.cancel_order.assert_awaited_once_with("ask-old")
         bot.om.place_order.assert_not_called()

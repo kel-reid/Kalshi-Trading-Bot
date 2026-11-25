@@ -11,6 +11,7 @@ All monetary performance metrics and trading outcomes are reported in USD ($).
 import argparse
 import datetime
 import logging
+import math
 import os
 import sys
 import zoneinfo
@@ -46,6 +47,62 @@ except ImportError:
     DEFAULT_REPORTS_CHANNEL = os.getenv("REPORTS_SLACK_CHANNEL", "#reports")
 
 logger = logging.getLogger("DailyReportGenerator")
+
+
+def _parse_iso_timestamp_seconds(raw_value: Any) -> Optional[float]:
+    """Parses an ISO-8601 timestamp string into UTC epoch seconds, or None if invalid."""
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    text = raw_value.strip()
+    if not text:
+        return None
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def _resolve_fill_epoch_seconds(row: Dict[str, Any]) -> Optional[float]:
+    """Resolves a kalshi_fills row timestamp in strict priority: ts -> ts_ms/1000 -> created_time."""
+    for field, divisor in (("ts", 1.0), ("ts_ms", 1000.0)):
+        raw = row.get(field)
+        if raw is not None and not isinstance(raw, bool):
+            try:
+                val = float(raw) / divisor
+                if math.isfinite(val):
+                    return val
+            except (ValueError, TypeError):
+                pass
+    return _parse_iso_timestamp_seconds(row.get("raw_created_time") or row.get("created_time"))
+
+
+def _format_fill_conversion_summary(
+    orders_total: int,
+    fills_total: int,
+    filled_orders_total: int,
+) -> Tuple[str, str]:
+    """Returns (rate_label, observation_phrase) separating distinct order conversion from executions per order."""
+    if orders_total <= 0:
+        return "0.0% executions per quoted order", f"{fills_total} fills"
+    if filled_orders_total > 0:
+        order_conv = filled_orders_total / orders_total * 100.0
+        exec_per_order = fills_total / orders_total * 100.0
+        return (
+            f"{order_conv:.1f}% order conversion ({filled_orders_total:,}/{orders_total:,} orders), "
+            f"{exec_per_order:.1f}% executions per quoted order",
+            f"{fills_total} fills across {filled_orders_total:,} filled orders "
+            f"({order_conv:.1f}% order conversion rate, {exec_per_order:.1f}% executions per quoted order)",
+        )
+    exec_per_order = fills_total / orders_total * 100.0
+    return (
+        f"{exec_per_order:.1f}% executions per quoted order",
+        f"{fills_total} fills ({exec_per_order:.1f}% executions per quoted order)",
+    )
 
 
 def get_db_connection(
@@ -189,6 +246,7 @@ def fetch_daily_metrics(
             "total_buy_orders": 0,
             "total_sell_orders": 0,
             "total_fills": 0,
+            "total_filled_orders": 0,
             "total_maker_fills": 0,
             "total_taker_fills": 0,
             "total_maker_fees_cents": 0.0,
@@ -241,16 +299,27 @@ def fetch_daily_metrics(
 
         cur.execute(
             """
-            SELECT DISTINCT market_ticker AS ticker
+            SELECT DISTINCT market_ticker AS ticker, ts, ts_ms, created_time
             FROM kalshi_fills
-            WHERE COALESCE(ts, ts_ms / 1000.0) >= %s
-              AND COALESCE(ts, ts_ms / 1000.0) <= %s
-              AND market_ticker IS NOT NULL
+            WHERE market_ticker IS NOT NULL
+              AND (
+                    (COALESCE(ts, ts_ms / 1000.0) >= %s AND COALESCE(ts, ts_ms / 1000.0) <= %s)
+                    OR (ts IS NULL AND ts_ms IS NULL AND created_time IS NOT NULL)
+              )
             ORDER BY market_ticker
             """,
             (start_ts, end_ts),
         )
-        fill_tickers = [row["ticker"] for row in cur.fetchall()]
+        fill_tickers = []
+        for row in cur.fetchall():
+            ticker_val = row.get("ticker")
+            if not ticker_val:
+                continue
+            if row.get("ts") is None and row.get("ts_ms") is None and row.get("created_time") is not None:
+                parsed_ts = _parse_iso_timestamp_seconds(row.get("created_time"))
+                if parsed_ts is None or not (start_ts <= parsed_ts <= end_ts):
+                    continue
+            fill_tickers.append(ticker_val)
 
         all_tickers = sorted(list(set(pnl_tickers + order_tickers + fill_tickers)))
         metrics["totals"]["active_market_count"] = len(all_tickers)
@@ -344,6 +413,7 @@ def fetch_daily_metrics(
                 """
                 SELECT
                     COALESCE(client_order_id, order_id, fill_id) AS client_order_id,
+                    COALESCE(NULLIF(order_id, ''), NULLIF(client_order_id, '')) AS order_ref,
                     LOWER(action) AS action,
                     LOWER(side) AS side,
                     CASE
@@ -353,16 +423,50 @@ def fetch_daily_metrics(
                     quantity AS count,
                     COALESCE(fee_dollars * 100.0, 0.0) AS fee_cents,
                     COALESCE(is_taker, FALSE) AS is_taker,
-                    COALESCE(TO_TIMESTAMP(COALESCE(ts, ts_ms / 1000.0)), created_time::timestamptz) AS created_at
+                    ts,
+                    ts_ms,
+                    created_time AS raw_created_time,
+                    id AS fill_row_id
                 FROM kalshi_fills
                 WHERE market_ticker = %s
-                  AND COALESCE(ts, ts_ms / 1000.0) >= %s
-                  AND COALESCE(ts, ts_ms / 1000.0) <= %s
-                ORDER BY COALESCE(ts_ms, ts * 1000.0) ASC, id ASC
+                  AND (
+                        (COALESCE(ts, ts_ms / 1000.0) >= %s AND COALESCE(ts, ts_ms / 1000.0) <= %s)
+                        OR (ts IS NULL AND ts_ms IS NULL AND created_time IS NOT NULL)
+                  )
+                ORDER BY COALESCE(ts, ts_ms / 1000.0) ASC NULLS LAST, id ASC
                 """,
                 (ticker, start_ts, end_ts),
             )
-            ticker_fills = cur.fetchall() or []
+            raw_ticker_fills = cur.fetchall() or []
+            ticker_fills_with_sort: List[Tuple[float, int, Dict[str, Any]]] = []
+            for idx, raw_fill in enumerate(raw_ticker_fills):
+                has_raw_ts_fields = (
+                    raw_fill.get("ts") is not None
+                    or raw_fill.get("ts_ms") is not None
+                    or raw_fill.get("raw_created_time") is not None
+                    or isinstance(raw_fill.get("created_time"), str)
+                )
+                epoch_s = _resolve_fill_epoch_seconds(raw_fill)
+                if raw_fill.get("ts") is None and raw_fill.get("ts_ms") is None and (
+                    raw_fill.get("raw_created_time") is not None or isinstance(raw_fill.get("created_time"), str)
+                ):
+                    if epoch_s is None or not (start_ts <= epoch_s <= end_ts):
+                        continue
+                fill_copy = dict(raw_fill)
+                if epoch_s is not None:
+                    fill_copy["created_at"] = datetime.datetime.fromtimestamp(epoch_s, tz=datetime.timezone.utc)
+                    sort_epoch = epoch_s
+                else:
+                    if has_raw_ts_fields:
+                        continue
+                    existing_dt = fill_copy.get("created_at")
+                    sort_epoch = existing_dt.timestamp() if isinstance(existing_dt, datetime.datetime) else float(idx)
+                row_id = fill_copy.get("fill_row_id")
+                sort_id = int(row_id) if isinstance(row_id, int) else idx
+                ticker_fills_with_sort.append((sort_epoch, sort_id, fill_copy))
+
+            ticker_fills_with_sort.sort(key=lambda item: (item[0], item[1]))
+            ticker_fills = [item[2] for item in ticker_fills_with_sort]
             all_day_fills.extend(ticker_fills)
             ticker_rt = compute_fifo_round_trips(ticker_fills)
 
@@ -370,6 +474,7 @@ def fetch_daily_metrics(
             buy_orders = ord_agg.get("buy_orders") or 0
             sell_orders = ord_agg.get("sell_orders") or 0
             fills = len(ticker_fills)
+            filled_orders = len({f.get("order_ref") for f in ticker_fills if f.get("order_ref")})
             maker_fills = sum(1 for f in ticker_fills if not f.get("is_taker"))
             taker_fills = sum(1 for f in ticker_fills if f.get("is_taker"))
             maker_fees_cents = sum(float(f.get("fee_cents") or 0.0) for f in ticker_fills if not f.get("is_taker"))
@@ -400,6 +505,7 @@ def fetch_daily_metrics(
                 "buy_orders": buy_orders,
                 "sell_orders": sell_orders,
                 "fills": fills,
+                "filled_orders": filled_orders,
                 "cancelled_orders": cancels,
                 "resting_orders": ord_agg.get("resting_orders") or 0,
                 "total_contracts_quoted": total_contracts,
@@ -418,6 +524,7 @@ def fetch_daily_metrics(
             metrics["totals"]["total_buy_orders"] += buy_orders
             metrics["totals"]["total_sell_orders"] += sell_orders
             metrics["totals"]["total_fills"] += fills
+            metrics["totals"]["total_filled_orders"] += filled_orders
             metrics["totals"]["total_maker_fills"] += maker_fills
             metrics["totals"]["total_taker_fills"] += taker_fills
             metrics["totals"]["total_maker_fees_cents"] += maker_fees_cents
@@ -477,11 +584,15 @@ def generate_observations(metrics: Dict[str, Any]) -> List[str]:
             "indicating restrictive market discovery criteria or collar boundary gating."
         )
     elif orders_total > 0:
-        fill_ratio = (fills_total / orders_total * 100.0) if orders_total > 0 else 0.0
+        _, fill_phrase = _format_fill_conversion_summary(
+            orders_total,
+            fills_total,
+            totals.get("total_filled_orders", 0),
+        )
         observations.append(
             f"The bot quoted {orders_total:,} orders ({totals.get('total_buy_orders', 0):,} BIDs, "
-            f"{totals.get('total_sell_orders', 0):,} ASKs), yielding {fills_total} fills "
-            f"({fill_ratio:.1f}% fill conversion rate) and {totals.get('total_cancels', 0):,} cancellations or quote replacements."
+            f"{totals.get('total_sell_orders', 0):,} ASKs), yielding {fill_phrase} "
+            f"and {totals.get('total_cancels', 0):,} cancellations or quote replacements."
         )
 
     # 2. Drawdown & inventory concentration observation
@@ -672,12 +783,13 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
     net_pnl_dlr = net_pnl_cents / 100.0
 
     fills = totals.get("total_fills", 0)
+    filled_orders = totals.get("total_filled_orders", 0)
     maker_fills = totals.get("total_maker_fills", 0)
     taker_fills = totals.get("total_taker_fills", 0)
     maker_fees_dlr = totals.get("total_maker_fees_cents", 0.0) / 100.0
     taker_fees_dlr = totals.get("total_taker_fees_cents", 0.0) / 100.0
     orders = totals.get("total_orders", 0)
-    fill_rate = (fills / orders * 100.0) if orders > 0 else 0.0
+    fill_rate_label, fill_rate_phrase = _format_fill_conversion_summary(orders, fills, filled_orders)
 
     total_rts = totals.get("total_round_trips", 0)
     wins = totals.get("winning_trades", 0)
@@ -795,7 +907,7 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
         "| Trade Outcome Metric | Session Value | Description |",
         "| :--- | :---: | :--- |",
         f"| **Total Quoting Orders Placed** | `{orders:,}` | {totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs |",
-        f"| **Executed Fills** | `{fills}` ({fill_rate:.1f}%) | {maker_fills} Maker (`${maker_fees_dlr:.2f}` fees) / {taker_fills} Taker (`${taker_fees_dlr:.2f}` fees) |",
+        f"| **Executed Fills** | `{fills}` ({fill_rate_label}) | {maker_fills} Maker (`${maker_fees_dlr:.2f}` fees) / {taker_fills} Taker (`${taker_fees_dlr:.2f}` fees) |",
         f"| **Total Cancellations / Replacements** | `{totals.get('total_cancels', 0):,}` | Cancelled resting orders during price updates |",
         f"| **Profit Factor** | `{profit_factor:.2f}` | $\\text{{Gross Wins}} / |\\text{{Gross Losses}}|$ |",
         f"| **Gross Trading Profit (Wins)** | `${gross_wins_dlr:+.2f}` | Cumulative gains across all winning round trips |",
@@ -808,7 +920,7 @@ def format_markdown_report(metrics: Dict[str, Any]) -> str:
         "",
         f"- **Quoting Velocity vs Fill Ratio**: Quoted {orders:,} orders across the session "
         f"({totals.get('total_buy_orders', 0):,} BIDs, {totals.get('total_sell_orders', 0):,} ASKs), "
-        f"yielding {fills} executed fills ({fill_rate:.1f}% fill conversion rate) and "
+        f"yielding {fill_rate_phrase} and "
         f"{totals.get('total_cancels', 0):,} cancellations or quote replacements.",
     ])
 

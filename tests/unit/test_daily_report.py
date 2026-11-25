@@ -428,3 +428,163 @@ def test_send_slack_report_no_url():
     success = send_slack_report(None, "Test Report")
     assert success is False
 
+
+def test_fetch_daily_metrics_resolves_created_time_and_skips_unparseable():
+    """
+    Fills in kalshi_fills with ts=None and ts_ms=None must resolve created_time consistently
+    in discovery, detail filtering, and ordering, without crashing on invalid created_time strings.
+    """
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Target date: 2026-10-27 in America/New_York (EDT UTC-4 -> 2026-10-27T04:00:00Z .. 2026-10-28T03:59:59Z)
+    target_date = datetime.date(2026, 10, 27)
+    mock_cur.fetchall.side_effect = [
+        [],  # 1. pnl_attribution tickers
+        [],  # 2. orders tickers
+        [    # 3. kalshi_fills candidate tickers (one valid created_time, one wrong day, one malformed)
+            {"ticker": "KXVALID-CT", "ts": None, "ts_ms": None, "created_time": "2026-10-27T18:00:00Z"},
+            {"ticker": "KXOLD-DAY", "ts": None, "ts_ms": None, "created_time": "2026-10-20T18:00:00Z"},
+            {"ticker": "KXBAD-TS", "ts": None, "ts_ms": None, "created_time": "not-a-timestamp"},
+        ],
+        [    # 4. kalshi_fills rows for KXVALID-CT (created_time-only BUY before ts SELL, plus invalid & out-of-window rows)
+            {
+                "client_order_id": "c-sell",
+                "order_ref": "ord-sell-1",
+                "action": "sell",
+                "side": "yes",
+                "price": 52.0,
+                "count": 2,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": datetime.datetime(2026, 10, 27, 19, 0, 0, tzinfo=datetime.timezone.utc).timestamp(),
+                "ts_ms": None,
+                "raw_created_time": None,
+                "fill_row_id": 2,
+            },
+            {
+                "client_order_id": "c-buy",
+                "order_ref": "ord-buy-1",
+                "action": "buy",
+                "side": "yes",
+                "price": 45.0,
+                "count": 2,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": None,
+                "ts_ms": None,
+                "raw_created_time": "2026-10-27T18:00:00Z",
+                "fill_row_id": 1,
+            },
+            {
+                "client_order_id": "c-bad",
+                "order_ref": "ord-bad",
+                "action": "buy",
+                "side": "yes",
+                "price": 40.0,
+                "count": 1,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": None,
+                "ts_ms": None,
+                "raw_created_time": "garbage-iso-string",
+                "fill_row_id": 3,
+            },
+            {
+                "client_order_id": "c-wrongday",
+                "order_ref": "ord-wrongday",
+                "action": "buy",
+                "side": "yes",
+                "price": 40.0,
+                "count": 1,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": None,
+                "ts_ms": None,
+                "raw_created_time": "2026-10-20T18:00:00Z",
+                "fill_row_id": 4,
+            },
+        ],
+    ]
+    mock_cur.fetchone.side_effect = [
+        {"snapshot_count": 0},
+        None,
+        None,
+        {
+            "total_orders": 4,
+            "buy_orders": 2,
+            "sell_orders": 2,
+            "resting_orders": 0,
+            "cancelled_orders": 2,
+            "total_contracts_quoted": 8,
+            "avg_price_cents": 48.5,
+        },
+    ]
+
+    metrics = fetch_daily_metrics(mock_conn, target_date=target_date)
+
+    assert list(metrics["tickers"].keys()) == ["KXVALID-CT"]
+    t = metrics["tickers"]["KXVALID-CT"]
+    assert t["fills"] == 2
+    assert t["filled_orders"] == 2
+    assert t["trade_outcomes"]["total_round_trips"] == 1
+    assert t["trade_outcomes"]["winning_trades"] == 1
+    assert t["trade_outcomes"]["gross_wins_cents"] == 14.0
+
+
+def test_daily_report_separates_partial_fill_executions_from_order_conversion():
+    """
+    When 1 quoted order generates 3 partial fills out of 2 quoted orders, execution count
+    stays 3 while order conversion reports 50.0% (1/2) rather than 150% fill conversion.
+    """
+    metrics_with_distinct = {
+        "date": "2026-10-27",
+        "timezone": "America/New_York",
+        "totals": {
+            "total_realized_delta_cents": 10.0,
+            "total_unrealized_delta_cents": 0.0,
+            "total_ending_unrealized_cents": 0.0,
+            "total_fees_delta_cents": 0.0,
+            "net_strategy_pnl_cents": 10.0,
+            "total_orders": 2,
+            "total_buy_orders": 1,
+            "total_sell_orders": 1,
+            "total_fills": 3,
+            "total_filled_orders": 1,
+            "total_maker_fills": 3,
+            "total_taker_fills": 0,
+            "total_maker_fees_cents": 0.0,
+            "total_taker_fees_cents": 0.0,
+            "total_cancels": 1,
+            "active_market_count": 1,
+            "snapshot_count": 10,
+            "total_round_trips": 1,
+            "winning_trades": 1,
+            "losing_trades": 0,
+            "scratch_trades": 0,
+            "win_rate_pct": 100.0,
+            "win_rate_ex_scratches_pct": 100.0,
+            "gross_wins_cents": 10.0,
+            "gross_losses_cents": 0.0,
+            "net_gross_realized_cents": 10.0,
+            "avg_win_cents": 10.0,
+            "avg_loss_cents": 0.0,
+            "profit_factor": 999.0,
+        },
+        "tickers": {},
+    }
+
+    obs = " ".join(generate_observations(metrics_with_distinct))
+    md = format_markdown_report(metrics_with_distinct)
+    assert "50.0% order conversion" in obs
+    assert "150.0% fill conversion" not in obs
+    assert "50.0% order conversion" in md
+    assert "150.0% fill conversion" not in md
+
+    # When total_filled_orders is unavailable, label ratio explicitly as executions per quoted order
+    metrics_legacy = {**metrics_with_distinct, "totals": {**metrics_with_distinct["totals"], "total_filled_orders": 0}}
+    obs_legacy = " ".join(generate_observations(metrics_legacy))
+    assert "150.0% executions per quoted order" in obs_legacy
+    assert "fill conversion rate" not in obs_legacy
+
