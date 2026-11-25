@@ -204,3 +204,97 @@ class TestPriceVelocityCircuitBreaker:
         assert success is True
         assert len(bot._mid_price_history) == 0
         assert bot._fast_market_until == 0.0
+
+    @pytest.mark.asyncio
+    async def test_fast_market_trigger_long_inventory_keeps_exit_ask_active(self):
+        """When Fast Market triggers while long, suppress bids only and keep exit ask active."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+            price_velocity_threshold_cents=5.0,
+            price_velocity_window_seconds=10.0,
+            price_velocity_quiesce_seconds=30.0,
+            post_fill_pause_seconds=0.0,
+        )
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+
+        now = 1_000_000.0
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        with patch("time.time", return_value=now):
+            await bot._tick()
+
+        # Tick 2: +6c move triggers Fast Market while carrying +3 contracts
+        bot._update_quotes.reset_mock()
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(54, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(58, 10))
+        with patch("time.time", return_value=now + 2.0):
+            await bot._tick()
+
+        assert bot._fast_market_until == now + 2.0 + 30.0
+        bot._cancel_all_quotes.assert_not_called()
+        bot._update_quotes.assert_called_once()
+        bid, ask = bot._update_quotes.call_args[0]
+        assert bid is None
+        assert ask is not None
+        assert bot._pause_accumulating_side is True
+
+    @pytest.mark.asyncio
+    async def test_fast_market_active_short_inventory_keeps_exit_bid_active(self):
+        """While in active Fast Market cooldown with short inventory, keep covering bid active only."""
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+            post_fill_pause_seconds=0.0,
+        )
+        now = 1_000_000.0
+        bot._fast_market_until = now + 20.0
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=-3)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+
+        with patch("time.time", return_value=now + 5.0):
+            await bot._tick()
+
+        bot._cancel_all_quotes.assert_not_called()
+        bot._update_quotes.assert_called_once()
+        bid, ask = bot._update_quotes.call_args[0]
+        assert bid is not None
+        assert ask is None
+
+    @pytest.mark.asyncio
+    async def test_pause_accumulating_side_update_quotes_skips_exit_if_flattened_during_cancel(self):
+        """
+        With _pause_accumulating_side=True on an exit-only ask quote, if cancelling the
+        accumulating bid reveals inventory flattened to 0, no new exit ask is placed.
+        """
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+        )
+        bot._pause_accumulating_side = True
+        bot.current_bid_id = "bid-old"
+        bot.current_bid_price = 45
+        bot.current_bid_size = 1
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="ask-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        # Position flattened to 0 by the time exit ask placement checks post-cancel inventory
+        bot.inv_manager.get_position = MagicMock(return_value=0)
+
+        await bot._update_quotes(None, 55)
+
+        bot.om.cancel_order.assert_awaited_once_with("bid-old")
+        bot.om.place_order.assert_not_called()

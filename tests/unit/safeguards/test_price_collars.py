@@ -38,8 +38,8 @@ class TestSafeguardConfigValidation:
                 m.delenv("MIN_MID_PRICE", raising=False)
                 m.delenv("MAX_MID_PRICE", raising=False)
                 importlib.reload(config)
-                assert config.MIN_MID_PRICE == 10
-                assert config.MAX_MID_PRICE == 90
+                assert config.MIN_MID_PRICE == 20
+                assert config.MAX_MID_PRICE == 80
                 assert 1 <= config.MIN_MID_PRICE < config.MAX_MID_PRICE <= 99
 
                 m.setenv("MIN_MID_PRICE", "95")
@@ -251,7 +251,7 @@ class TestPreflightDiscoveryCollar:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         # YES bid = 14c, NO bid = 84c -> YES ask = 16c -> mid = 15.0c
-        # 15.0c is WITHIN global [10, 90], but OUTSIDE custom [20, 80]
+        # 15.0c is OUTSIDE tightened global [20, 80], but WITHIN custom [10, 90]
         mock_resp.json.return_value = {
             "orderbook_fp": {
                 "yes_dollars_fp": [["0.1400", "50.00"]],
@@ -259,9 +259,11 @@ class TestPreflightDiscoveryCollar:
             }
         }
         with patch("requests.get", return_value=mock_resp):
-            # Passes default global collar
-            assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND") is True
-            # Fails custom tighter collar
+            # Fails tightened default global collar [20, 80]
+            assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND") is False
+            # Passes custom wider collar
+            assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND", min_mid_price=10.0, max_mid_price=90.0) is True
+            # Fails explicit [20, 80] collar
             assert check_orderbook_has_quotes("KXNFLGAME-CUSTOM-BOUND", min_mid_price=20.0, max_mid_price=80.0) is False
 
     def test_preflight_orderbook_legacy_cents_unit_disambiguation(self):

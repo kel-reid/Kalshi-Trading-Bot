@@ -101,3 +101,59 @@ class TestPostFillAdverseSelectionBackoff:
         bot = AvellanedaStoikovBot(ticker="KXDEFAULT-PAUSE")
         assert bot.post_fill_pause_seconds == 12.0
 
+    @pytest.mark.asyncio
+    async def test_post_fill_pause_keeps_exit_side_active_when_long(self):
+        """During post-fill pause with long inventory, suppress bids but keep unwinding ask active."""
+        ticker = "KXPAUSE-LONG"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+            post_fill_pause_seconds=12.0,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot.inv_manager._last_fill_times[ticker] = time.time()
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_not_called()
+        bot._update_quotes.assert_called_once()
+        bid, ask = bot._update_quotes.call_args[0]
+        assert bid is None
+        assert ask is not None
+        assert bot._pause_accumulating_side is True
+
+    @pytest.mark.asyncio
+    async def test_post_fill_pause_keeps_exit_side_active_when_short(self):
+        """During post-fill pause with short inventory, suppress asks but keep covering bid active."""
+        ticker = "KXPAUSE-SHORT"
+        bot = AvellanedaStoikovBot(
+            ticker=ticker,
+            gamma=0.5,
+            min_spread=4,
+            order_size=1,
+            post_fill_pause_seconds=12.0,
+        )
+        bot._cancel_all_quotes = AsyncMock(return_value=True)
+        bot._update_quotes = AsyncMock(return_value=True)
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(48, 10))
+        bot.ob_manager.get_best_ask = MagicMock(return_value=(52, 10))
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=-3)
+        bot.inv_manager._last_fill_times[ticker] = time.time()
+
+        await bot._tick()
+
+        bot._cancel_all_quotes.assert_not_called()
+        bot._update_quotes.assert_called_once()
+        bid, ask = bot._update_quotes.call_args[0]
+        assert bid is not None
+        assert ask is None
+        assert bot._pause_accumulating_side is True
+

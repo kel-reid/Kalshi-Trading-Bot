@@ -43,6 +43,9 @@ class OrderManager:
         self._ioc_order_ids: Dict[str, str] = {}
         # In-flight client_order_ids currently undergoing placement POST requests
         self._pending_client_ids: set[str] = set()
+        # Recently cancelled/executed order IDs -> monotonic timestamp to avoid Kalshi read-replica 404 loops
+        self._recently_cleared_orders: Dict[str, float] = {}
+        self._recent_clear_ttl_seconds: float = 5.0
         self.db_pool: Optional[pool.ThreadedConnectionPool] = None
 
         # Initialize PostgreSQL database connection pool and schema
@@ -52,6 +55,41 @@ class OrderManager:
         # Kalshi Rate Limit: 10 requests per second
         self.rate_limiter = RateLimiter(rate=10, per=1.0)
         self._ticker_exchange_indices: Dict[str, int] = {}
+
+    def _mark_order_cleared(
+        self,
+        client_order_id: Optional[str] = None,
+        kalshi_order_id: Optional[str] = None,
+    ) -> None:
+        """Record an order ID as recently cancelled/executed to suppress read-replica lag phantom reconciliations."""
+        now = time.monotonic()
+        self._prune_recently_cleared(now)
+        if client_order_id:
+            self._recently_cleared_orders[client_order_id] = now
+        if kalshi_order_id:
+            self._recently_cleared_orders[kalshi_order_id] = now
+
+    def _prune_recently_cleared(self, now: Optional[float] = None) -> None:
+        if not self._recently_cleared_orders:
+            return
+        cur = now if now is not None else time.monotonic()
+        cutoff = cur - self._recent_clear_ttl_seconds
+        expired = [oid for oid, ts in self._recently_cleared_orders.items() if ts < cutoff]
+        for oid in expired:
+            self._recently_cleared_orders.pop(oid, None)
+
+    def _is_recently_cleared(
+        self,
+        client_order_id: Optional[str] = None,
+        kalshi_order_id: Optional[str] = None,
+    ) -> bool:
+        """Return True if either client_order_id or kalshi_order_id was cleared within the TTL window."""
+        self._prune_recently_cleared()
+        if client_order_id and client_order_id in self._recently_cleared_orders:
+            return True
+        if kalshi_order_id and kalshi_order_id in self._recently_cleared_orders:
+            return True
+        return False
 
     def get_ticker_exchange_index(self, ticker: str) -> Optional[int]:
         """Returns cached exchange_index for ticker, or queries market_api if uncached."""
@@ -404,6 +442,7 @@ class OrderManager:
                         if time_in_force in ("immediate_or_cancel", "fill_or_kill"):
                             if kalshi_order_id:
                                 self._ioc_order_ids[client_order_id] = kalshi_order_id
+                            self._mark_order_cleared(client_order_id, kalshi_order_id)
                         else:
                             self.active_orders[client_order_id] = order_record
                         if confirmed_shard is not None and ticker:
@@ -481,6 +520,7 @@ class OrderManager:
                 if response.status_code in [200, 204]:
                     logger.info(f"Order Cancelled: {client_order_id} (kalshi_id: {order_id}, shard: {shard_idx})")
                     self.active_orders.pop(client_order_id, None)
+                    self._mark_order_cleared(client_order_id, order_id)
                     self._update_db_order_status(client_order_id, "cancelled")
                     return True
                 elif response.status_code == 404:
@@ -497,6 +537,19 @@ class OrderManager:
                             or order_status.get("remaining_count_fp")
                             or 0
                         )
+                        # Kalshi's GET /orders/{id} read-replica can lag 200-350ms behind matching engine 404
+                        if status_str == "resting" or rem_count > 0:
+                            await asyncio.sleep(0.35)
+                            recheck = await self.get_order_status(order_id)
+                            if recheck is not None:
+                                order_status = recheck
+                                status_str = str(order_status.get("status", "")).lower()
+                                rem_count = float(
+                                    order_status.get("remaining_count")
+                                    or order_status.get("remaining_count_fp")
+                                    or 0
+                                )
+
                         if status_str == "resting" or rem_count > 0:
                             logger.error(
                                 f"DELETE returned 404 for order {client_order_id} ({order_id}), but exchange status "
@@ -509,6 +562,7 @@ class OrderManager:
                             )
                             if recon is not None and recon > 0:
                                 self.active_orders.pop(client_order_id, None)
+                                self._mark_order_cleared(client_order_id, order_id)
                                 self._update_db_order_status(client_order_id, "reconciled_after_404")
                                 return True
                             return False
@@ -517,6 +571,7 @@ class OrderManager:
                                 f"Order {client_order_id} ({order_id}) verified cleared on exchange (status={status_str})."
                             )
                             self.active_orders.pop(client_order_id, None)
+                            self._mark_order_cleared(client_order_id, order_id)
                             self._update_db_order_status(client_order_id, f"verified_{status_str}")
                             return True
 
@@ -527,6 +582,7 @@ class OrderManager:
                     )
                     if recon_result is not None:
                         self.active_orders.pop(client_order_id, None)
+                        self._mark_order_cleared(client_order_id, order_id)
                         self._update_db_order_status(client_order_id, "reconciled_after_404")
                         return True
                     else:
@@ -616,6 +672,7 @@ class OrderManager:
             if resp is not None:
                 if resp.status_code in [200, 204]:
                     logger.info(f"Successfully cancelled orphaned order {cancel_path} (shard={exchange_index})")
+                    self._mark_order_cleared(client_order_id, order_id)
                     if client_order_id:
                         self._update_db_order_status(client_order_id, "cancelled", kalshi_order_id=order_id)
                     return True
@@ -635,10 +692,23 @@ class OrderManager:
                     is_terminal = ord_status in ("canceled", "cancelled", "executed")
                     is_zero_remaining = (rem_int == 0 and rem_fp == 0.0)
 
+                    if not (is_terminal and is_zero_remaining):
+                        # Re-check briefly after Kalshi read-replica propagation window (~350ms)
+                        await asyncio.sleep(0.35)
+                        recheck_info = await self.get_order_status(order_id)
+                        if recheck_info:
+                            status_info = recheck_info
+                            ord_status = status_info.get("status")
+                            rem_int = status_info.get("remaining_count", 0)
+                            rem_fp = float(status_info.get("remaining_count_fp", 0.0) or 0.0)
+                            is_terminal = ord_status in ("canceled", "cancelled", "executed")
+                            is_zero_remaining = (rem_int == 0 and rem_fp == 0.0)
+
                     if is_terminal and is_zero_remaining:
                         logger.info(
                             f"Orphaned order {cancel_path} confirmed closed on exchange (404, status={ord_status})."
                         )
+                        self._mark_order_cleared(client_order_id, order_id)
                         if client_order_id:
                             self._update_db_order_status(client_order_id, "cancelled_or_filled_404", kalshi_order_id=order_id)
                         return True
@@ -866,6 +936,12 @@ class OrderManager:
                     continue
                 
                 is_target = bool(target_client_order_id and cid == target_client_order_id)
+                if not is_target and self._is_recently_cleared(cid, oid):
+                    logger.debug(
+                        f"Skipping recently cleared order {oid} (client_id: {cid}) during reconciliation "
+                        f"(within {self._recent_clear_ttl_seconds:.1f}s read-replica propagation window)."
+                    )
+                    continue
                 is_orphan = (
                     target_client_order_id is None
                     and oid not in tracked_kalshi_ids

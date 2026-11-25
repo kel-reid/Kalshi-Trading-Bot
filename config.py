@@ -92,9 +92,14 @@ MAX_ORDER_CONTRACTS = _get_int_env("MAX_ORDER_CONTRACTS", 100)
 MAX_HEDGE_INVENTORY = _get_int_env("MAX_HEDGE_INVENTORY", 250)
 
 # Collateral-Constrained Sizing Ceiling on Low-Price Contracts
-# Prevents excessive contract sizing on low-price contracts (< 25c) where short leg requires heavy NO collateral
+# Prevents excessive contract sizing on low-price contracts (< 35c) where short leg requires heavy NO collateral
+# and binary underdog losses scale disproportionately
 MAX_LOW_PRICE_CONTRACTS = _get_int_env("MAX_LOW_PRICE_CONTRACTS", 10, allow_zero=True)
-LOW_PRICE_THRESHOLD_CENTS = _get_int_env("LOW_PRICE_THRESHOLD_CENTS", 25, allow_zero=True)
+LOW_PRICE_THRESHOLD_CENTS = _get_int_env("LOW_PRICE_THRESHOLD_CENTS", 35, allow_zero=True)
+
+# Passive Maker Quote Clamping
+# Prevents skewed passive A-S quotes from accidentally crossing the opposing top-of-book and paying taker fees
+PASSIVE_MAKER_CLAMP_ENABLED = os.getenv("PASSIVE_MAKER_CLAMP_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # Aggressive Momentum Quote Skewing
 # Increases inventory penalty gamma during multi-possession runs and adverse price drift
@@ -129,10 +134,10 @@ VOLATILITY_WINDOW_SECONDS = _get_float_env("VOLATILITY_WINDOW_SECONDS", 30.0)
 KALSHI_FEE_RATE = _get_float_env("KALSHI_FEE_RATE", 0.07)
 
 # Extreme Price Collar Safeguards (Cents)
-# In binary markets ($0-$1.00), quoting outside safe collars (e.g. < 10c or > 90c) introduces
-# asymmetric adverse selection and settlement-at-zero holding risk.
-MIN_MID_PRICE = _get_int_env("MIN_MID_PRICE", 10)
-MAX_MID_PRICE = _get_int_env("MAX_MID_PRICE", 90)
+# In binary markets ($0-$1.00), quoting outside safe collars (e.g. < 20c or > 80c) introduces
+# asymmetric adverse selection, severe percentage fee drag, and settlement-at-zero holding risk.
+MIN_MID_PRICE = _get_int_env("MIN_MID_PRICE", 20)
+MAX_MID_PRICE = _get_int_env("MAX_MID_PRICE", 80)
 if MIN_MID_PRICE < 1 or MAX_MID_PRICE > 99 or MIN_MID_PRICE >= MAX_MID_PRICE:
     raise ValueError(
         f"Invalid price collar configuration: MIN_MID_PRICE ({MIN_MID_PRICE}) "

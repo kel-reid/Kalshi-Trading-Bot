@@ -82,6 +82,7 @@ from config import (
     BLACKOUT_DANGER_PRICE_HIGH,
     INVENTORY_TAPER_ENABLED,
     INVENTORY_TAPER_WINDOW_SECONDS,
+    PASSIVE_MAKER_CLAMP_ENABLED,
 )
 from strategy.dynamic_spread import (
     RollingVolatilityEstimator,
@@ -150,6 +151,7 @@ class AvellanedaStoikovBot:
         blackout_danger_price_high: Optional[int] = None,
         inventory_taper_enabled: Optional[bool] = None,
         inventory_taper_window_seconds: Optional[int] = None,
+        passive_maker_clamp_enabled: Optional[bool] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -311,8 +313,14 @@ class AvellanedaStoikovBot:
             if inventory_taper_window_seconds is not None
             else INVENTORY_TAPER_WINDOW_SECONDS
         )
+        self.passive_maker_clamp_enabled = (
+            bool(passive_maker_clamp_enabled)
+            if passive_maker_clamp_enabled is not None
+            else PASSIVE_MAKER_CLAMP_ENABLED
+        )
         self._market_close_time: Optional[datetime.datetime] = None
         self._in_expiration_blackout: bool = False
+        self._pause_accumulating_side: bool = False
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -705,10 +713,23 @@ class AvellanedaStoikovBot:
                 effective_price = max(1.0, min(99.0, float(mid_price)))
                 raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
                 capped_count = min(self.max_order_contracts, raw_count)
-                # Collateral-constrained ceiling for low-price contracts
+                # Collateral-constrained ceiling for low-price contracts with smooth ramp to 50c
+                # Prevents a sharp contract-count spike just above low_price_threshold_cents (e.g. 26.5c -> 10 vs 25c -> 5)
                 if self.max_low_price_contracts and self.max_low_price_contracts > 0:
                     if effective_price <= self.low_price_threshold_cents:
                         capped_count = min(capped_count, self.max_low_price_contracts)
+                    elif effective_price < 50.0:
+                        baseline_50c = max(1, math.ceil((self.order_dollars * 100.0) / 50.0))
+                        if baseline_50c <= self.max_low_price_contracts:
+                            smooth_cap = self.max_low_price_contracts
+                        elif self.low_price_threshold_cents < 50:
+                            frac = (effective_price - self.low_price_threshold_cents) / (50.0 - self.low_price_threshold_cents)
+                            smooth_cap = self.max_low_price_contracts + math.floor(
+                                frac * (baseline_50c - self.max_low_price_contracts)
+                            )
+                        else:
+                            smooth_cap = self.max_low_price_contracts
+                        capped_count = min(capped_count, smooth_cap)
                 # Apply taper factor smoothly after establishing the fully capped baseline
                 if tf < 1.0:
                     capped_count = max(1, math.floor(capped_count * tf))
@@ -1495,19 +1516,29 @@ class AvellanedaStoikovBot:
             return
 
         # 2c. Fast Market / Price Velocity Circuit Breaker:
+        # When flat (inventory == 0), withdraw all quotes during velocity spikes or post-fill backoff.
+        # When holding open inventory (inventory != 0), suppress ONLY the accumulating side so the
+        # unwinding exit side remains active rather than trapping exposure until collar liquidation.
+        pause_accumulating_side = False
+
         # Check active Fast Market quiesce period
         if self._fast_market_until > now:
             remaining = self._fast_market_until - now
+            if inventory == 0:
+                logger.info(
+                    f"[FAST MARKET ACTIVE] Volatility circuit breaker active for {self.ticker} "
+                    f"({remaining:.1f}s remaining). Withdrawing quotes."
+                )
+                if self.current_bid_id or self.current_ask_id:
+                    await self._cancel_all_quotes()
+                return
             logger.info(
                 f"[FAST MARKET ACTIVE] Volatility circuit breaker active for {self.ticker} "
-                f"({remaining:.1f}s remaining). Withdrawing quotes."
+                f"({remaining:.1f}s remaining) with inventory={inventory}. Suppressing accumulating side; keeping exit active."
             )
-            if self.current_bid_id or self.current_ask_id:
-                await self._cancel_all_quotes()
-            return
-
+            pause_accumulating_side = True
         # Evaluate orderbook midpoint velocity over rolling window
-        if self.price_velocity_threshold_cents > 0 and self.price_velocity_window_seconds > 0:
+        elif self.price_velocity_threshold_cents > 0 and self.price_velocity_window_seconds > 0:
             cutoff = now - self.price_velocity_window_seconds
             while self._mid_price_history and self._mid_price_history[0][0] < cutoff:
                 self._mid_price_history.popleft()
@@ -1522,7 +1553,7 @@ class AvellanedaStoikovBot:
                     logger.warning(
                         f"[FAST MARKET / VELOCITY BREACH] Market {self.ticker} mid price swung "
                         f"{delta_p:.1f}c over {elapsed:.1f}s (threshold: {self.price_velocity_threshold_cents:.1f}c). "
-                        f"Entering Fast Market state; withdrawing quotes for {self.price_velocity_quiesce_seconds:.1f}s."
+                        f"Entering Fast Market state for {self.price_velocity_quiesce_seconds:.1f}s."
                     )
                     try:
                         SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_velocity", ticker=self.ticker).inc()
@@ -1531,21 +1562,29 @@ class AvellanedaStoikovBot:
 
                     self._fast_market_until = now + self.price_velocity_quiesce_seconds
                     self._mid_price_history.clear()
-                    await self._cancel_all_quotes()
-                    return
+                    if inventory == 0:
+                        await self._cancel_all_quotes()
+                        return
+                    pause_accumulating_side = True
 
         # Check post-fill adverse selection backoff pause
         if self.post_fill_pause_seconds > 0:
             last_fill_time = self.inv_manager.get_last_fill_time(self.ticker)
             if last_fill_time > 0 and (now - last_fill_time) < self.post_fill_pause_seconds:
                 remaining = self.post_fill_pause_seconds - (now - last_fill_time)
+                if inventory == 0:
+                    logger.info(
+                        f"Post-fill adverse selection pause active for {self.ticker} "
+                        f"({remaining:.2f}s remaining). Withdrawing quotes."
+                    )
+                    if self.current_bid_id or self.current_ask_id:
+                        await self._cancel_all_quotes()
+                    return
                 logger.info(
                     f"Post-fill adverse selection pause active for {self.ticker} "
-                    f"({remaining:.2f}s remaining). Withdrawing quotes."
+                    f"({remaining:.2f}s remaining) with inventory={inventory}. Suppressing accumulating side; keeping exit active."
                 )
-                if self.current_bid_id or self.current_ask_id:
-                    await self._cancel_all_quotes()
-                return
+                pause_accumulating_side = True
 
         # 4. Calculate Reservation Price (R)
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
@@ -1615,7 +1654,21 @@ class AvellanedaStoikovBot:
         # Ensure we don't cross the spread against ourselves
         if optimal_bid >= optimal_ask:
             optimal_bid = optimal_ask - 1
-            
+
+        # Passive Maker Quote Clamping (Non-Hedge Mode):
+        # Prevents skewed passive A-S quotes from accidentally crossing the opposing top-of-book
+        # and incurring ~4x taker transaction fees unless an active hedge or late-taper exit is active.
+        is_late_taper_unwind = bool(self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0)
+        if self.passive_maker_clamp_enabled and abs(inventory) < hedge_threshold and not is_late_taper_unwind:
+            if best_ask:
+                max_passive_bid = max(1, int(math.ceil(best_ask[0])) - 1) if best_ask[0] > 1 else 1
+                optimal_bid = min(optimal_bid, max_passive_bid)
+            if best_bid:
+                min_passive_ask = min(99, int(math.floor(best_bid[0])) + 1) if best_bid[0] < 99 else 99
+                optimal_ask = max(optimal_ask, min_passive_ask)
+            if optimal_bid >= optimal_ask:
+                optimal_bid = max(1, optimal_ask - 1)
+
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
         if inventory >= hedge_threshold:
@@ -1685,15 +1738,24 @@ class AvellanedaStoikovBot:
                 except Exception:
                     pass
 
+        # Fast-Market / Post-Fill Pause Exit Continuity:
+        # Suppress accumulating side while keeping the unwinding exit side active.
+        if pause_accumulating_side and inventory != 0:
+            if inventory > 0:
+                optimal_bid = None
+            else:
+                optimal_ask = None
+
         # Determine target quote sizes for both sides
         target_bid_size = quote_size
         target_ask_size = quote_size
 
-        # In late-session reduce-only or active hedging, cap surviving quote size at open inventory
-        # to ensure fills cannot overshoot and flip the position into the opposite direction.
+        # In late-session reduce-only, active hedging, or paused exit continuity, cap surviving quote size
+        # at open inventory so fills cannot overshoot and flip the position into the opposite direction.
         is_reduce_only = (self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0) or abs(inventory) >= hedge_threshold
         self._is_reduce_only = is_reduce_only
-        if is_reduce_only:
+        self._pause_accumulating_side = pause_accumulating_side
+        if is_reduce_only or pause_accumulating_side:
             if inventory > 0:
                 target_ask_size = self._cap_quote_size_to_inventory(quote_size, inventory)
             elif inventory < 0:
@@ -1860,6 +1922,7 @@ class AvellanedaStoikovBot:
         is_reduce_only = getattr(self, "_is_reduce_only", False) or (
             self.inventory_taper_enabled and getattr(self, "_current_taper_factor", 1.0) < 0.5 and current_inv != 0
         )
+        is_pause_exit = bool(getattr(self, "_pause_accumulating_side", False))
 
         is_exit_bid = bool(is_reduce_only and current_inv < 0)
         is_exit_ask = bool(is_reduce_only and current_inv > 0)
@@ -1871,18 +1934,18 @@ class AvellanedaStoikovBot:
         if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
                 # If entering single-sided hedge, confirm withdrawal of opposing quote first
-                if is_reduce_only and self.current_ask_id is not None:
+                if (is_reduce_only or is_pause_exit) and self.current_ask_id is not None:
                     logger.warning(
                         f"Aborting hedge BID placement on {self.ticker}: opposing ASK quote {self.current_ask_id} "
                         f"withdrawal not yet confirmed."
                     )
-                elif is_reduce_only and current_inv >= 0:
+                elif (is_reduce_only or (is_pause_exit and is_hedge)) and current_inv >= 0:
                     logger.info(
                         f"Skipping BID quote placement on {self.ticker}: short position already closed or flipped "
                         f"(current inventory: {current_inv})."
                     )
                 else:
-                    if is_exit_bid:
+                    if is_exit_bid or (is_pause_exit and current_inv < 0):
                         target_bid_size = self._cap_quote_size_to_inventory(target_bid_size, current_inv)
 
                     order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
@@ -1952,18 +2015,18 @@ class AvellanedaStoikovBot:
         if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
                 # If entering single-sided hedge, confirm withdrawal of opposing quote first
-                if is_reduce_only and self.current_bid_id is not None:
+                if (is_reduce_only or is_pause_exit) and self.current_bid_id is not None:
                     logger.warning(
                         f"Aborting hedge ASK placement on {self.ticker}: opposing BID quote {self.current_bid_id} "
                         f"withdrawal not yet confirmed."
                     )
-                elif is_reduce_only and current_inv <= 0:
+                elif (is_reduce_only or (is_pause_exit and is_hedge)) and current_inv <= 0:
                     logger.info(
                         f"Skipping ASK quote placement on {self.ticker}: long position already closed or flipped "
                         f"(current inventory: {current_inv})."
                     )
                 else:
-                    if is_exit_ask:
+                    if is_exit_ask or (is_pause_exit and current_inv > 0):
                         target_ask_size = self._cap_quote_size_to_inventory(target_ask_size, current_inv)
 
                     order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
