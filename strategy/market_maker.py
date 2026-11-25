@@ -384,6 +384,9 @@ class AvellanedaStoikovBot:
         self._mid_price_history: deque = deque()
         self._fast_market_until: float = 0.0
         self._current_hedge_threshold: int = 5
+        self._unsettled_cancelled_asks: dict[str, dict[str, Any]] = {}
+        self._unsettled_cancelled_bids: dict[str, dict[str, Any]] = {}
+        self._pause_exit_settle_seconds: float = 2.0
 
         # Periodic active slate and event-horizon re-evaluation
         # Re-evaluates whether current market is off-slate/distant while inventory is flat
@@ -692,8 +695,9 @@ class AvellanedaStoikovBot:
         """
         Calculates the order size (contract count) for the current quoting cycle.
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
-        required to deploy at least order_dollars at the current mid-price.
-        Guaranteed to deploy at least $1.00 and never lower.
+        targeting at least order_dollars of notional deployment at the current mid-price
+        (subject to max_order_contracts, max_low_price_contracts, and taper_factor,
+        which can cap contract count and resulting notional below $1.00).
         Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] and enforces
         a hard pre-submission ceiling (self.max_order_contracts) to prevent runaway
         or manipulated contract counts.
@@ -793,17 +797,96 @@ class AvellanedaStoikovBot:
             clamped_bid = max(1, clamped_ask - 1)
         return clamped_bid, clamped_ask
 
+    def _record_unsettled_cancel(
+        self,
+        quote_side: str,
+        client_order_id: Optional[str],
+        size: Any,
+        kalshi_order_id: Optional[str] = None,
+    ) -> None:
+        """Records cancelled exit-side order exposure until fills or settle verification clear it."""
+        if not client_order_id:
+            return
+        try:
+            qty_dec = Decimal(str(size))
+        except (InvalidOperation, ValueError, TypeError):
+            fallback = self.order_size if isinstance(self.order_size, (int, float)) and self.order_size > 0 else 1
+            qty_dec = Decimal(str(fallback))
+        if not qty_dec.is_finite() or qty_dec <= 0:
+            return
+        active_rec = getattr(getattr(self, "om", None), "active_orders", {}).get(client_order_id) or {}
+        if kalshi_order_id is None and isinstance(active_rec, dict):
+            kalshi_order_id = active_rec.get("kalshi_order_id")
+        raw_fc = getattr(self.inv_manager, "_fill_count", 0)
+        fc_at_cancel = raw_fc if isinstance(raw_fc, int) and not isinstance(raw_fc, bool) else 0
+        target_map = self._unsettled_cancelled_asks if quote_side == "ask" else self._unsettled_cancelled_bids
+        target_map[client_order_id] = {
+            "qty": qty_dec,
+            "kalshi_id": kalshi_order_id,
+            "cancelled_at": time.monotonic(),
+            "fill_count_at_cancel": fc_at_cancel,
+        }
+
+    async def _unsettled_cancelled_exit_exposure(self, exit_action: str) -> Decimal:
+        """Returns conservative unfilled/unsettled quantity from cancelled exit-side orders.
+
+        Entries remain reserved for at least ``_pause_exit_settle_seconds`` (or while fills are
+        in flight) so stale REST position reads immediately after cancellation cannot cause
+        overlapping GTC pause exits to overshoot zero. Once settled, confirmed un-delivered fills
+        from ``get_order_status`` keep their filled quantity reserved until local fills catch up.
+        """
+        target_map = self._unsettled_cancelled_asks if exit_action == "sell" else self._unsettled_cancelled_bids
+        if not target_map:
+            return Decimal("0")
+
+        raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
+        raw_fc = getattr(self.inv_manager, "_fill_count", 0)
+        current_fc = raw_fc if isinstance(raw_fc, int) and not isinstance(raw_fc, bool) else 0
+        now_mono = time.monotonic()
+
+        total_exposure = Decimal("0")
+        for cid, entry in list(target_map.items()):
+            elapsed = now_mono - entry["cancelled_at"]
+            if pending_fills == 0 and elapsed >= self._pause_exit_settle_seconds:
+                kalshi_id = entry.get("kalshi_id")
+                get_status = getattr(getattr(self, "om", None), "get_order_status", None)
+                if kalshi_id and callable(get_status):
+                    try:
+                        status_info = await get_status(kalshi_id)
+                    except Exception:
+                        status_info = None
+                    if isinstance(status_info, dict):
+                        status_str = str(status_info.get("status", "")).lower()
+                        rem = float(status_info.get("remaining_count") or status_info.get("remaining_count_fp") or 0)
+                        if status_str in ("canceled", "cancelled", "executed") and rem == 0:
+                            raw_filled = status_info.get("fill_count_fp", status_info.get("fill_count") or 0)
+                            try:
+                                remote_filled = Decimal(str(raw_filled))
+                            except (InvalidOperation, ValueError, TypeError):
+                                remote_filled = entry["qty"]
+                            if remote_filled > 0 and current_fc == entry["fill_count_at_cancel"]:
+                                entry["qty"] = min(entry["qty"], remote_filled)
+                            else:
+                                target_map.pop(cid, None)
+                                continue
+                elif not kalshi_id:
+                    target_map.pop(cid, None)
+                    continue
+            total_exposure += entry["qty"]
+        return total_exposure
+
     async def _verify_pause_exit_inventory(
         self,
         local_inv: Union[int, float],
         exit_action: str,
     ) -> Optional[Union[int, float]]:
-        """Verifies live exchange inventory via REST before placing a non-reduce_only pause exit.
+        """Verifies live exchange inventory and deducts unsettled cancelled-exit exposure.
 
-        Kalshi rejects ``reduce_only`` on resting GTC orders, so pause-mode passive exits
-        verify net position post-cancel rather than relying solely on local inventory that
-        may lag an in-flight WebSocket fill notification. Fails closed (returns None) on
-        verification errors or concurrent fills.
+        Because Kalshi rejects ``reduce_only`` on resting GTC orders and ``GET /portfolio/positions``
+        does not guarantee immediate read-after-write consistency post-cancellation, subtracting
+        still-unsettled cancelled exit orders guarantees a pause-mode exit cannot reverse the
+        position even when both WebSocket fills and REST position reads are stale.
         """
         positions = await self._verified_ticker_positions(self.ticker)
         if positions is None:
@@ -825,7 +908,7 @@ class AvellanedaStoikovBot:
                     f"(local={local_inv}, exchange={exchange_inv})."
                 )
                 return None
-            conservative = min(local_dec, exchange_inv)
+            conservative_abs = min(local_dec, exchange_inv)
         else:
             if exchange_inv > Decimal("-0.01") or local_dec > Decimal("-0.01"):
                 logger.info(
@@ -833,9 +916,19 @@ class AvellanedaStoikovBot:
                     f"(local={local_inv}, exchange={exchange_inv})."
                 )
                 return None
-            conservative = max(local_dec, exchange_inv)
+            conservative_abs = min(abs(local_dec), abs(exchange_inv))
 
-        return int(conservative) if conservative == conservative.to_integral_value() else float(conservative)
+        unsettled_qty = await self._unsettled_cancelled_exit_exposure(exit_action)
+        safe_abs = conservative_abs - unsettled_qty
+        if safe_abs < Decimal("0.01"):
+            logger.info(
+                f"Deferring pause-exit {exit_action.upper()} on {self.ticker}: "
+                f"unsettled cancelled exit exposure ({unsettled_qty}) covers safe inventory ({conservative_abs})."
+            )
+            return None
+
+        signed_safe = safe_abs if exit_action == "sell" else -safe_abs
+        return int(signed_safe) if signed_safe == signed_safe.to_integral_value() else float(signed_safe)
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -1897,15 +1990,41 @@ class AvellanedaStoikovBot:
         bid_needs_update = bid_price_changed or (new_bid is not None and target_bid_size != self.current_bid_size)
         ask_needs_update = ask_price_changed or (new_ask is not None and target_ask_size != self.current_ask_size)
 
+        # In pause-only single-sided mode, avoid cancel-replacing an already-resting exit order
+        # when its resting size already fits within open inventory (eliminates cancel-replace fill races).
+        is_pause_single_sided = bool(getattr(self, "_pause_accumulating_side", False)) and (
+            (new_bid is None and new_ask is not None) or (new_ask is None and new_bid is not None)
+        )
+        if is_pause_single_sided:
+            pre_cancel_inv = self.inv_manager.get_position(self.ticker)
+            if (
+                new_ask is not None
+                and self.current_ask_id is not None
+                and self.current_ask_size is not None
+                and pre_cancel_inv > 0
+                and Decimal(str(self.current_ask_size)) <= Decimal(str(pre_cancel_inv))
+            ):
+                ask_needs_update = False
+            if (
+                new_bid is not None
+                and self.current_bid_id is not None
+                and self.current_bid_size is not None
+                and pre_cancel_inv < 0
+                and Decimal(str(self.current_bid_size)) <= abs(Decimal(str(pre_cancel_inv)))
+            ):
+                bid_needs_update = False
+
         # Handle BID Side
         if bid_needs_update:
             if self.current_bid_id:
+                self._record_unsettled_cancel("bid", self.current_bid_id, self.current_bid_size)
                 cancel_tasks.append(self.om.cancel_order(self.current_bid_id))
                 cancel_bid = True
 
         # Handle ASK Side (Selling YES contracts)
         if ask_needs_update:
             if self.current_ask_id:
+                self._record_unsettled_cancel("ask", self.current_ask_id, self.current_ask_size)
                 cancel_tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_ask = True
 
@@ -2413,15 +2532,21 @@ class AvellanedaStoikovBot:
         cancel_targets = []
         if target_ticker == self.ticker:
             if self.current_bid_id:
+                self._record_unsettled_cancel("bid", self.current_bid_id, self.current_bid_size)
                 tasks.append(self.om.cancel_order(self.current_bid_id))
                 cancel_targets.append(("bid", self.current_bid_id))
             if self.current_ask_id:
+                self._record_unsettled_cancel("ask", self.current_ask_id, self.current_ask_size)
                 tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_targets.append(("ask", self.current_ask_id))
 
         quoted_ids = {order_id for _, order_id in cancel_targets}
         for order_id, details in list(self.om.active_orders.items()):
             if details.get("ticker") == target_ticker and order_id not in quoted_ids:
+                d_action = str(details.get("action") or "").lower()
+                d_side = str(details.get("side") or "yes").lower()
+                q_side = "bid" if ((d_action == "buy" and d_side == "yes") or (d_action == "sell" and d_side == "no")) else "ask"
+                self._record_unsettled_cancel(q_side, order_id, details.get("count"), details.get("kalshi_order_id"))
                 tasks.append(self.om.cancel_order(order_id))
                 cancel_targets.append(("tracked", order_id))
              
@@ -2671,6 +2796,8 @@ class AvellanedaStoikovBot:
         self._market_close_time = None
         self._last_pnl_snapshot = time.time()
         self._mid_price_history.clear()
+        self._unsettled_cancelled_asks.clear()
+        self._unsettled_cancelled_bids.clear()
         if hasattr(self, "volatility_estimator"):
             self.volatility_estimator.reset()
         self._fast_market_until = 0.0

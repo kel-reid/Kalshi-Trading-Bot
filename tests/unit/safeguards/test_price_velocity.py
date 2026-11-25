@@ -302,12 +302,10 @@ class TestPriceVelocityCircuitBreaker:
         bot.om.place_order.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_pause_exit_delayed_partial_fill_caps_to_verified_exchange_position(self):
+    async def test_pause_exit_keeps_valid_sized_resting_ask_without_cancel_replace(self):
         """
-        If an old resting ASK partially filled (2 of 3) before cancellation returned 200
-        and the WebSocket fill has not yet arrived locally (local inv still 3), REST
-        position verification caps the pause-exit replacement ASK to 1 so total sells
-        cannot reverse the position below zero.
+        In pause-only mode, if an existing exit ASK already has size <= open inventory,
+        _update_quotes keeps it resting untouched rather than introducing a cancel-replace race.
         """
         bot = AvellanedaStoikovBot(
             ticker="KXTEST-TICKER",
@@ -322,22 +320,20 @@ class TestPriceVelocityCircuitBreaker:
         bot.om.cancel_order = AsyncMock(return_value=True)
         bot.om.place_order = AsyncMock(return_value="ask-new")
         bot.inv_manager.get_balance = MagicMock(return_value=10000)
-        bot.inv_manager.get_position = MagicMock(return_value=3)  # Stale local inventory
-        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("1")})
+        bot.inv_manager.get_position = MagicMock(return_value=3)
 
         await bot._update_quotes(None, 54)
 
-        bot.om.cancel_order.assert_awaited_once_with("ask-old")
-        bot.om.place_order.assert_awaited_once()
-        kwargs = bot.om.place_order.call_args.kwargs
-        assert kwargs["action"] == "sell"
-        assert kwargs["count"] == 1
+        bot.om.cancel_order.assert_not_called()
+        bot.om.place_order.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_pause_exit_short_delayed_partial_fill_caps_bid_to_verified_exchange_position(self):
+    async def test_pause_exit_stale_rest_defers_replacement_when_cancelled_ask_unsettled(self):
         """
-        Symmetric short path: if local inv is -3 due to a delayed partial fill on the
-        cancelled covering BID, exchange verification returning -1 caps replacement BID to 1.
+        Option A ASK guard: if an old ASK (size 3) was cancelled and 2 of 3 filled silently
+        while BOTH WS (_pending_fills=0, local=3) AND REST get-positions are stale (3),
+        unsettled cancelled-ask exposure (3) prevents placing a 3-contract replacement ASK
+        that would reverse +1 into -2.
         """
         bot = AvellanedaStoikovBot(
             ticker="KXTEST-TICKER",
@@ -346,22 +342,156 @@ class TestPriceVelocityCircuitBreaker:
             order_size=5,
         )
         bot._pause_accumulating_side = True
-        bot.current_bid_id = "bid-old"
-        bot.current_bid_price = 44
-        bot.current_bid_size = 3
+        # Case A: pre-cancelled 3-lot ASK before entering pause
+        bot._record_unsettled_cancel("ask", "ask-old", 3, kalshi_order_id="k-ask-old")
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="ask-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)  # Stale WS
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("3")})  # Stale REST
+
+        await bot._update_quotes(None, 54)
+
+        bot.om.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_stale_rest_defers_replacement_when_cancelled_bid_unsettled(self):
+        """
+        Option A BID guard: symmetric short path when old covering BID (size 3) was
+        cancelled and BOTH WS (local=-3) AND REST get-positions return stale -3; replacement
+        BID is deferred rather than risking a short-to-long reversal.
+        """
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot._pause_accumulating_side = True
+        bot._record_unsettled_cancel("bid", "bid-old", 3, kalshi_order_id="k-bid-old")
         bot.om.cancel_order = AsyncMock(return_value=True)
         bot.om.place_order = AsyncMock(return_value="bid-new")
         bot.inv_manager.get_balance = MagicMock(return_value=10000)
-        bot.inv_manager.get_position = MagicMock(return_value=-3)
-        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("-1")})
+        bot.inv_manager.get_position = MagicMock(return_value=-3)  # Stale WS
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("-3")})  # Stale REST
 
         await bot._update_quotes(46, None)
 
-        bot.om.cancel_order.assert_awaited_once_with("bid-old")
+        bot.om.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_stale_rest_caps_ask_and_bid_to_surplus_above_unsettled_cancel(self):
+        """
+        With +5 local / stale +5 REST and a cancelled 2-lot ASK unsettled, pause exit
+        safely places at most 5 - 2 = 3 contracts (same symmetrically on BID for -5 / -2).
+        """
+        bot_long = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot_long._pause_accumulating_side = True
+        bot_long._record_unsettled_cancel("ask", "ask-2", 2, kalshi_order_id="k-ask-2")
+        bot_long.om.place_order = AsyncMock(return_value="ask-safe")
+        bot_long.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot_long.inv_manager.get_position = MagicMock(return_value=5)
+        bot_long.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("5")})
+
+        await bot_long._update_quotes(None, 54)
+        bot_long.om.place_order.assert_awaited_once()
+        assert bot_long.om.place_order.call_args.kwargs["action"] == "sell"
+        assert bot_long.om.place_order.call_args.kwargs["count"] == 3
+
+        bot_short = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot_short._pause_accumulating_side = True
+        bot_short._record_unsettled_cancel("bid", "bid-2", 2, kalshi_order_id="k-bid-2")
+        bot_short.om.place_order = AsyncMock(return_value="bid-safe")
+        bot_short.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot_short.inv_manager.get_position = MagicMock(return_value=-5)
+        bot_short.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("-5")})
+
+        await bot_short._update_quotes(46, None)
+        bot_short.om.place_order.assert_awaited_once()
+        assert bot_short.om.place_order.call_args.kwargs["action"] == "buy"
+        assert bot_short.om.place_order.call_args.kwargs["count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_oversized_resting_ask_cancelled_and_deferred_under_stale_rest(self):
+        """
+        If an oversized 5-lot ASK is cancelled on entering pause (inv=3) and REST still
+        reports stale +3, the 5-lot unsettled cancel keeps replacement deferred until settled.
+        """
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot._pause_accumulating_side = True
+        bot.current_ask_id = "ask-oversized"
+        bot.current_ask_price = 56
+        bot.current_ask_size = 5
+        bot.om.cancel_order = AsyncMock(return_value=True)
+        bot.om.place_order = AsyncMock(return_value="ask-new")
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("3")})
+
+        await bot._update_quotes(None, 54)
+
+        bot.om.cancel_order.assert_awaited_once_with("ask-oversized")
+        bot.om.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pause_exit_after_settle_reserves_remote_fills_and_releases_zero_fill_cancel(self, monkeypatch):
+        """
+        After _pause_exit_settle_seconds elapses:
+        - If get_order_status reports fill_count=2 with unchanged _fill_count, only 1 (3-2) is allowed even under stale REST=3.
+        - If get_order_status confirms status='canceled', fill_count=0, reservation releases and full 3 places.
+        """
+        mono = [100.0]
+        monkeypatch.setattr("strategy.market_maker.time.monotonic", lambda: mono[0])
+
+        bot = AvellanedaStoikovBot(
+            ticker="KXTEST-TICKER",
+            gamma=0.5,
+            min_spread=4,
+            order_size=5,
+        )
+        bot._pause_accumulating_side = True
+        bot.inv_manager.get_balance = MagicMock(return_value=10000)
+        bot.inv_manager.get_position = MagicMock(return_value=3)
+        bot.inv_manager._fetch_ticker_positions = MagicMock(return_value={0: Decimal("3")})
+
+        # 1. Cancelled 3-lot order had 2 remote fills that local WS hasn't delivered yet -> only 1 allowed
+        bot._record_unsettled_cancel("ask", "ask-part", 3, kalshi_order_id="k-part")
+        bot.om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0, "fill_count": 2})
+        bot.om.place_order = AsyncMock(return_value="ask-1")
+        mono[0] += bot._pause_exit_settle_seconds + 0.5
+
+        await bot._update_quotes(None, 54)
         bot.om.place_order.assert_awaited_once()
-        kwargs = bot.om.place_order.call_args.kwargs
-        assert kwargs["action"] == "buy"
-        assert kwargs["count"] == 1
+        assert bot.om.place_order.call_args.kwargs["count"] == 1
+
+        # 2. Reset with clean 0-fill terminal cancel after settle window -> releases full 3
+        bot._unsettled_cancelled_asks.clear()
+        bot.current_ask_id = None
+        bot.current_ask_price = None
+        bot.current_ask_size = None
+        bot.om.place_order.reset_mock()
+        bot._record_unsettled_cancel("ask", "ask-clean", 3, kalshi_order_id="k-clean")
+        bot.om.get_order_status = AsyncMock(return_value={"status": "canceled", "remaining_count": 0, "fill_count": 0})
+        mono[0] += bot._pause_exit_settle_seconds + 0.5
+
+        await bot._update_quotes(None, 54)
+        bot.om.place_order.assert_awaited_once()
+        assert bot.om.place_order.call_args.kwargs["count"] == 3
 
     @pytest.mark.asyncio
     async def test_pause_exit_fails_closed_when_exchange_position_unverified(self):
@@ -373,10 +503,6 @@ class TestPriceVelocityCircuitBreaker:
             order_size=3,
         )
         bot._pause_accumulating_side = True
-        bot.current_ask_id = "ask-old"
-        bot.current_ask_price = 56
-        bot.current_ask_size = 3
-        bot.om.cancel_order = AsyncMock(return_value=True)
         bot.om.place_order = AsyncMock(return_value="ask-new")
         bot.inv_manager.get_balance = MagicMock(return_value=10000)
         bot.inv_manager.get_position = MagicMock(return_value=3)
@@ -384,5 +510,4 @@ class TestPriceVelocityCircuitBreaker:
 
         await bot._update_quotes(None, 54)
 
-        bot.om.cancel_order.assert_awaited_once_with("ask-old")
         bot.om.place_order.assert_not_called()

@@ -89,13 +89,13 @@ def _format_fill_conversion_summary(
     """Returns (rate_label, observation_phrase) separating distinct order conversion from executions per order."""
     if orders_total <= 0:
         return "0.0% executions per quoted order", f"{fills_total} fills"
-    if filled_orders_total > 0:
+    if 0 < filled_orders_total <= orders_total:
         order_conv = filled_orders_total / orders_total * 100.0
         exec_per_order = fills_total / orders_total * 100.0
         return (
             f"{order_conv:.1f}% order conversion ({filled_orders_total:,}/{orders_total:,} orders), "
             f"{exec_per_order:.1f}% executions per quoted order",
-            f"{fills_total} fills across {filled_orders_total:,} filled orders "
+            f"{fills_total} fills across {filled_orders_total:,} session-quoted orders "
             f"({order_conv:.1f}% order conversion rate, {exec_per_order:.1f}% executions per quoted order)",
         )
     exec_per_order = fills_total / orders_total * 100.0
@@ -414,6 +414,17 @@ def fetch_daily_metrics(
                 SELECT
                     COALESCE(client_order_id, order_id, fill_id) AS client_order_id,
                     COALESCE(NULLIF(order_id, ''), NULLIF(client_order_id, '')) AS order_ref,
+                    EXISTS (
+                        SELECT 1
+                        FROM orders o
+                        WHERE o.ticker = %s
+                          AND o.created_at >= %s
+                          AND o.created_at <= %s
+                          AND (
+                                (NULLIF(kalshi_fills.order_id, '') IS NOT NULL AND o.kalshi_order_id = kalshi_fills.order_id)
+                                OR (NULLIF(kalshi_fills.client_order_id, '') IS NOT NULL AND o.client_order_id = kalshi_fills.client_order_id)
+                          )
+                    ) AS in_session_order_cohort,
                     LOWER(action) AS action,
                     LOWER(side) AS side,
                     CASE
@@ -435,7 +446,7 @@ def fetch_daily_metrics(
                   )
                 ORDER BY COALESCE(ts, ts_ms / 1000.0) ASC NULLS LAST, id ASC
                 """,
-                (ticker, start_ts, end_ts),
+                (ticker, start_utc, end_utc, ticker, start_ts, end_ts),
             )
             raw_ticker_fills = cur.fetchall() or []
             ticker_fills_with_sort: List[Tuple[float, int, Dict[str, Any]]] = []
@@ -474,7 +485,11 @@ def fetch_daily_metrics(
             buy_orders = ord_agg.get("buy_orders") or 0
             sell_orders = ord_agg.get("sell_orders") or 0
             fills = len(ticker_fills)
-            filled_orders = len({f.get("order_ref") for f in ticker_fills if f.get("order_ref")})
+            filled_orders = len({
+                f.get("order_ref")
+                for f in ticker_fills
+                if f.get("order_ref") and f.get("in_session_order_cohort") is True
+            })
             maker_fills = sum(1 for f in ticker_fills if not f.get("is_taker"))
             taker_fills = sum(1 for f in ticker_fills if f.get("is_taker"))
             maker_fees_cents = sum(float(f.get("fee_cents") or 0.0) for f in ticker_fills if not f.get("is_taker"))

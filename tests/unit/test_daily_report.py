@@ -452,6 +452,7 @@ def test_fetch_daily_metrics_resolves_created_time_and_skips_unparseable():
             {
                 "client_order_id": "c-sell",
                 "order_ref": "ord-sell-1",
+                "in_session_order_cohort": True,
                 "action": "sell",
                 "side": "yes",
                 "price": 52.0,
@@ -466,6 +467,7 @@ def test_fetch_daily_metrics_resolves_created_time_and_skips_unparseable():
             {
                 "client_order_id": "c-buy",
                 "order_ref": "ord-buy-1",
+                "in_session_order_cohort": True,
                 "action": "buy",
                 "side": "yes",
                 "price": 45.0,
@@ -587,4 +589,105 @@ def test_daily_report_separates_partial_fill_executions_from_order_conversion():
     obs_legacy = " ".join(generate_observations(metrics_legacy))
     assert "150.0% executions per quoted order" in obs_legacy
     assert "fill conversion rate" not in obs_legacy
+
+    # Defensive invariant: never report > 100% order conversion even on inconsistent totals
+    metrics_over = {**metrics_with_distinct, "totals": {**metrics_with_distinct["totals"], "total_filled_orders": 5}}
+    obs_over = " ".join(generate_observations(metrics_over))
+    assert "order conversion" not in obs_over
+    assert "150.0% executions per quoted order" in obs_over
+
+
+def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion():
+    """
+    Fills during the session referencing pre-session orders (in_session_order_cohort=False)
+    must still count in executions/fees/FIFO, but NOT inflate order conversion above 100%.
+    """
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    now_ts = datetime.datetime(2026, 10, 27, 20, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    mock_cur.fetchall.side_effect = [
+        [{"ticker": "KXCOHORT"}],
+        [],
+        [],
+        [
+            # Pre-session resting order fills during today's session -> excluded from session order_conversion
+            {
+                "client_order_id": "old-order",
+                "order_ref": "ord-old-day",
+                "in_session_order_cohort": False,
+                "action": "buy",
+                "side": "yes",
+                "price": 40.0,
+                "count": 1,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": now_ts,
+                "ts_ms": None,
+                "raw_created_time": None,
+                "fill_row_id": 1,
+            },
+            # Two partial fills on the SAME order created in today's session (total_orders=1)
+            {
+                "client_order_id": "c-sess-1",
+                "order_ref": "ord-sess-1",
+                "in_session_order_cohort": True,
+                "action": "sell",
+                "side": "yes",
+                "price": 45.0,
+                "count": 1,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": now_ts + 5,
+                "ts_ms": None,
+                "raw_created_time": None,
+                "fill_row_id": 2,
+            },
+            {
+                "client_order_id": "c-sess-1",
+                "order_ref": "ord-sess-1",
+                "in_session_order_cohort": True,
+                "action": "sell",
+                "side": "yes",
+                "price": 46.0,
+                "count": 1,
+                "fee_cents": 0.0,
+                "is_taker": False,
+                "ts": now_ts + 6,
+                "ts_ms": None,
+                "raw_created_time": None,
+                "fill_row_id": 3,
+            },
+        ],
+    ]
+    mock_cur.fetchone.side_effect = [
+        {"snapshot_count": 0},
+        None,
+        None,
+        {
+            "total_orders": 1,
+            "buy_orders": 0,
+            "sell_orders": 1,
+            "resting_orders": 0,
+            "cancelled_orders": 0,
+            "total_contracts_quoted": 2,
+            "avg_price_cents": 45.5,
+        },
+    ]
+
+    metrics = fetch_daily_metrics(mock_conn, target_date=datetime.date(2026, 10, 27))
+
+    sqls = [c[0][0] for c in mock_cur.execute.call_args_list]
+    assert any("in_session_order_cohort" in q for q in sqls)
+
+    t = metrics["tickers"]["KXCOHORT"]
+    assert t["fills"] == 3
+    assert t["filled_orders"] == 1
+    assert metrics["totals"]["total_filled_orders"] == 1
+
+    obs = " ".join(generate_observations(metrics))
+    assert "100.0% order conversion rate" in obs
+    assert "300.0% executions per quoted order" in obs
+    assert "200.0% order conversion" not in obs
 
