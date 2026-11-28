@@ -55,6 +55,7 @@ async def test_momentum_skew_aggression_and_drift_retreat():
         momentum_gamma_factor=0.5,
         max_gamma_multiplier=2.5,
         price_velocity_threshold_cents=20.0,  # Do not trip fast-market during test
+        passive_maker_clamp_enabled=False,
     )
 
     bot.inv_manager.get_balance = MagicMock(return_value=10000)
@@ -158,3 +159,145 @@ def test_max_gamma_multiplier_lower_bound_clamping(monkeypatch):
         max_gamma_multiplier=3.0,
     )
     assert bot_valid.max_gamma_multiplier == 3.0
+
+
+def test_calculate_order_size_smooth_ramp_eliminates_low_price_cliff():
+    """
+    Verify calculate_order_size ramps smoothly between low_price_threshold_cents and 50c
+    without a cliff jump above 50c-implied sizing or below max_low_price_contracts.
+    """
+    # Case 1: $2.50 baseline (5 contracts @ 50c) with cap=5 and threshold=35c -> uniform 5c across 20..50c
+    bot_uniform = AvellanedaStoikovBot(
+        ticker="KXRAMP-1",
+        order_size=1,
+        order_dollars=2.50,
+        low_price_threshold_cents=35,
+        max_low_price_contracts=5,
+    )
+    sizes_uniform = [bot_uniform.calculate_order_size(p) for p in [20.0, 25.0, 26.5, 35.0, 36.0, 50.0]]
+    assert sizes_uniform == [5, 5, 5, 5, 5, 5]
+
+    # Case 2: $5.00 baseline (10 contracts @ 50c) with cap=5 and threshold=25c -> monotonic ramp 5 -> 10
+    bot_ramp = AvellanedaStoikovBot(
+        ticker="KXRAMP-2",
+        order_size=1,
+        order_dollars=5.00,
+        low_price_threshold_cents=25,
+        max_low_price_contracts=5,
+    )
+    p25 = bot_ramp.calculate_order_size(25.0)
+    p30 = bot_ramp.calculate_order_size(30.0)
+    p37 = bot_ramp.calculate_order_size(37.5)
+    p45 = bot_ramp.calculate_order_size(45.0)
+    p50 = bot_ramp.calculate_order_size(50.0)
+    assert p25 == 5
+    assert p50 == 10
+    assert p25 <= p30 <= p37 <= p45 <= p50
+    # Previously 26.5c jumped abruptly from 5 to 19!
+    assert bot_ramp.calculate_order_size(26.5) <= 6
+
+    # Case 3: Cap generous above 50c baseline ($2.50 -> 5c @ 50c, cap=10) deploys target notional smoothly down to 50c
+    bot_generous_cap = AvellanedaStoikovBot(
+        ticker="KXRAMP-3",
+        order_size=1,
+        order_dollars=2.50,
+        low_price_threshold_cents=35,
+        max_low_price_contracts=10,
+    )
+    assert bot_generous_cap.calculate_order_size(35.0) == 8
+    assert bot_generous_cap.calculate_order_size(36.0) == 7
+    assert bot_generous_cap.calculate_order_size(50.0) == 5
+
+
+@pytest.mark.asyncio
+async def test_passive_maker_clamp_prevents_accidental_taker_cross():
+    """
+    When passive_maker_clamp_enabled=True and abs(inventory) < hedge_threshold,
+    A-S skewed quotes clamp outside the opposing touch (ask >= best_bid + 1, bid <= best_ask - 1)
+    so normal skew does not accidentally pay taker fees.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXCLAMP-1",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        momentum_skew_enabled=True,
+        momentum_gamma_factor=0.5,
+        max_gamma_multiplier=2.5,
+        price_velocity_threshold_cents=20.0,
+        passive_maker_clamp_enabled=True,
+    )
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot._update_quotes = AsyncMock()
+
+    # Step 1: Long 3 (< threshold 5) at (49, 51). Raw ask=49 <= best_bid=49 -> clamps to 50
+    bot.inv_manager.get_position = MagicMock(return_value=3)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(49, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(51, 10))
+    await bot._tick()
+    bot._update_quotes.assert_called_with(45, 50)
+
+    # Step 2: Downtrend drops book to (45, 47). Raw ask=43 <= best_bid=45 -> clamps to 46
+    bot._update_quotes.reset_mock()
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(45, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(47, 10))
+    await bot._tick()
+    bot._update_quotes.assert_called_with(39, 46)
+
+    # Step 3: Short -3 (< threshold 5) with uptrend skew -> bid clamps to best_ask - 1 (50)
+    bot._update_quotes.reset_mock()
+    bot._mid_price_history.clear()
+    bot.inv_manager.get_position = MagicMock(return_value=-3)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(47, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(49, 10))
+    await bot._tick()
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(51, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(53, 10))
+    await bot._tick()
+    bid_short, _ask_short = bot._update_quotes.call_args[0]
+    assert bid_short is not None and bid_short <= 52
+
+    # Step 4: Long 5 (>= hedge_threshold 5) is NOT clamped back from best_bid when unwinding urgently
+    bot._update_quotes.reset_mock()
+    bot.inv_manager.get_position = MagicMock(return_value=5)
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(51, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(53, 10))
+    await bot._tick()
+    _, ask_hedge = bot._update_quotes.call_args[0]
+    assert ask_hedge <= 51
+
+
+@pytest.mark.asyncio
+async def test_update_quotes_reclamps_passive_price_after_async_cancel():
+    """
+    If top-of-book moves favorably during async cancel_order wait, _update_quotes re-clamps
+    the passive quote right before place_order so it still does not cross as a taker.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXCLAMP-RACE",
+        gamma=0.5,
+        min_spread=4,
+        order_size=1,
+        passive_maker_clamp_enabled=True,
+    )
+    bot.current_ask_id = "ask-old"
+    bot.current_ask_price = 55
+    bot.current_ask_size = 1
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=2)
+    bot._current_hedge_threshold = 5
+
+    # Book ticked up to (52, 54) while cancellation was running -> 50c ask would cross best_bid=52c!
+    async def mock_cancel(_cid):
+        bot.ob_manager.get_best_bid = MagicMock(return_value=(52, 10))
+        return True
+
+    bot.om.cancel_order = AsyncMock(side_effect=mock_cancel)
+    bot.om.place_order = AsyncMock(return_value="ask-new")
+
+    await bot._update_quotes(46, 50)
+
+    bot.om.place_order.assert_awaited()
+    placed_asks = [c.kwargs for c in bot.om.place_order.call_args_list if c.kwargs.get("action") == "sell"]
+    assert len(placed_asks) == 1
+    assert placed_asks[0]["price"] == 53

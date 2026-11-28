@@ -415,6 +415,8 @@ async def test_danger_zone_blackout_suppresses_bids_at_or_below_low_threshold():
         gamma=0.5,
         min_spread=2,
         order_size=1,
+        min_mid_price=10.0,
+        max_mid_price=90.0,
         blackout_enabled=True,
         blackout_danger_price_low=20.0,
         blackout_danger_price_high=80.0,
@@ -449,6 +451,8 @@ async def test_danger_zone_blackout_suppresses_asks_at_or_above_high_threshold()
         gamma=0.5,
         min_spread=2,
         order_size=1,
+        min_mid_price=10.0,
+        max_mid_price=90.0,
         blackout_enabled=True,
         blackout_danger_price_low=20.0,
         blackout_danger_price_high=80.0,
@@ -504,6 +508,45 @@ async def test_danger_zone_normal_price_allows_two_sided_quotes():
 
     assert optimal_bid is not None
     assert optimal_ask is not None
+
+
+@pytest.mark.asyncio
+async def test_danger_zone_blackout_fires_at_exact_default_collar_boundary():
+    """
+    With default [20c, 80c] price collars, exact 20.0c and 80.0c mids do not trip
+    strict-inequality collars (<20 / >80) and trigger Danger-Zone Blackout instead.
+    """
+    bot = AvellanedaStoikovBot(
+        ticker="KXTEST-BOUNDARY",
+        gamma=0.5,
+        min_spread=2,
+        order_size=1,
+        blackout_enabled=True,
+        blackout_danger_price_low=20.0,
+        blackout_danger_price_high=80.0,
+    )
+    bot.inv_manager.get_balance = MagicMock(return_value=10000)
+    bot.inv_manager.get_position = MagicMock(return_value=0)
+    bot._update_quotes = AsyncMock()
+
+    # Exact 20.0c mid -> suppresses bid
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(19, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(21, 10))
+    await bot._tick()
+    bid_20, ask_20 = bot._update_quotes.call_args[0]
+    assert bid_20 is None
+    assert ask_20 is not None
+
+    # Exact 80.0c mid -> suppresses ask
+    bot._update_quotes.reset_mock()
+    bot._mid_price_history.clear()
+    bot._fast_market_until = 0.0
+    bot.ob_manager.get_best_bid = MagicMock(return_value=(79, 10))
+    bot.ob_manager.get_best_ask = MagicMock(return_value=(81, 10))
+    await bot._tick()
+    bid_80, ask_80 = bot._update_quotes.call_args[0]
+    assert bid_80 is not None
+    assert ask_80 is None
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +780,8 @@ async def test_danger_zone_blackout_allows_exit_leg():
     bot = AvellanedaStoikovBot(
         ticker="KXTEST-DANGER",
         order_size=1,
+        min_mid_price=10.0,
+        max_mid_price=90.0,
         blackout_enabled=True,
         blackout_danger_price_low=20.0,
         blackout_danger_price_high=80.0,

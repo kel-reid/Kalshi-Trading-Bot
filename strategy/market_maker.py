@@ -82,6 +82,7 @@ from config import (
     BLACKOUT_DANGER_PRICE_HIGH,
     INVENTORY_TAPER_ENABLED,
     INVENTORY_TAPER_WINDOW_SECONDS,
+    PASSIVE_MAKER_CLAMP_ENABLED,
 )
 from strategy.dynamic_spread import (
     RollingVolatilityEstimator,
@@ -150,6 +151,7 @@ class AvellanedaStoikovBot:
         blackout_danger_price_high: Optional[int] = None,
         inventory_taper_enabled: Optional[bool] = None,
         inventory_taper_window_seconds: Optional[int] = None,
+        passive_maker_clamp_enabled: Optional[bool] = None,
     ):
         self.ticker = ticker
         self.gamma = gamma if gamma is not None else RISK_GAMMA
@@ -311,8 +313,14 @@ class AvellanedaStoikovBot:
             if inventory_taper_window_seconds is not None
             else INVENTORY_TAPER_WINDOW_SECONDS
         )
+        self.passive_maker_clamp_enabled = (
+            bool(passive_maker_clamp_enabled)
+            if passive_maker_clamp_enabled is not None
+            else PASSIVE_MAKER_CLAMP_ENABLED
+        )
         self._market_close_time: Optional[datetime.datetime] = None
         self._in_expiration_blackout: bool = False
+        self._pause_accumulating_side: bool = False
 
 
         # Determine order_dollars with strict $1.00 minimum enforcement and non-finite boundary safety
@@ -375,6 +383,10 @@ class AvellanedaStoikovBot:
         # Fast Market / Price Velocity Circuit Breaker tracking
         self._mid_price_history: deque = deque()
         self._fast_market_until: float = 0.0
+        self._current_hedge_threshold: int = 5
+        self._unsettled_cancelled_asks: dict[str, dict[str, Any]] = {}
+        self._unsettled_cancelled_bids: dict[str, dict[str, Any]] = {}
+        self._pause_exit_settle_seconds: float = 2.0
 
         # Periodic active slate and event-horizon re-evaluation
         # Re-evaluates whether current market is off-slate/distant while inventory is flat
@@ -683,14 +695,17 @@ class AvellanedaStoikovBot:
         """
         Calculates the order size (contract count) for the current quoting cycle.
         If order_dollars is configured (>= $1.00), dynamically calculates the contract count
-        required to deploy at least order_dollars at the current mid-price.
-        Guaranteed to deploy at least $1.00 and never lower.
+        targeting at least order_dollars of notional deployment at the current mid-price
+        (subject to max_order_contracts, max_low_price_contracts, and taper_factor,
+        which can cap contract count and resulting notional below $1.00).
         Bounds midpoint to Kalshi's supported quoting limits [1.0, 99.0] and enforces
         a hard pre-submission ceiling (self.max_order_contracts) to prevent runaway
         or manipulated contract counts.
         Additionally enforces a collateral-constrained ceiling (self.max_low_price_contracts)
-        when contract prices fall below low_price_threshold_cents (< 25c) to prevent
-        collateral exhaustion on the short/NO leg.
+        at or below low_price_threshold_cents (default 35c) to prevent collateral exhaustion
+        on the short/NO leg, ramping smoothly up toward the 50c baseline whenever
+        the 50c baseline exceeds max_low_price_contracts (and otherwise capping at
+        max_low_price_contracts without an abrupt jump).
         When taper_factor in [0.0, 1.0) is supplied (pre-blackout tapering), contract count
         and low-price caps scale down smoothly towards 1 contract.
         Otherwise falls back to fixed order_size (also capped by max_order_contracts).
@@ -705,10 +720,23 @@ class AvellanedaStoikovBot:
                 effective_price = max(1.0, min(99.0, float(mid_price)))
                 raw_count = max(1, math.ceil((self.order_dollars * 100.0) / effective_price))
                 capped_count = min(self.max_order_contracts, raw_count)
-                # Collateral-constrained ceiling for low-price contracts
+                # Collateral-constrained ceiling for low-price contracts with smooth ramp to 50c
+                # Prevents a sharp contract-count spike just above low_price_threshold_cents (e.g. 26.5c -> 10 vs 25c -> 5)
                 if self.max_low_price_contracts and self.max_low_price_contracts > 0:
                     if effective_price <= self.low_price_threshold_cents:
                         capped_count = min(capped_count, self.max_low_price_contracts)
+                    elif effective_price < 50.0:
+                        baseline_50c = max(1, math.ceil((self.order_dollars * 100.0) / 50.0))
+                        if baseline_50c <= self.max_low_price_contracts:
+                            smooth_cap = self.max_low_price_contracts
+                        elif self.low_price_threshold_cents < 50:
+                            frac = (effective_price - self.low_price_threshold_cents) / (50.0 - self.low_price_threshold_cents)
+                            smooth_cap = self.max_low_price_contracts + math.floor(
+                                frac * (baseline_50c - self.max_low_price_contracts)
+                            )
+                        else:
+                            smooth_cap = self.max_low_price_contracts
+                        capped_count = min(capped_count, smooth_cap)
                 # Apply taper factor smoothly after establishing the fully capped baseline
                 if tf < 1.0:
                     capped_count = max(1, math.floor(capped_count * tf))
@@ -748,6 +776,174 @@ class AvellanedaStoikovBot:
         if rounded > abs_inv and abs_inv >= 0.01:
             rounded = round(rounded - 0.01, 2)
         return max(0.01, rounded)
+
+    @staticmethod
+    def _clamp_passive_prices(
+        bid: Optional[int],
+        ask: Optional[int],
+        best_bid: Optional[tuple],
+        best_ask: Optional[tuple],
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Clamps passive quotes outside the opposing top-of-book to avoid crossing as a taker."""
+        clamped_bid = bid
+        clamped_ask = ask
+        if clamped_bid is not None and best_ask and len(best_ask) > 0 and isinstance(best_ask[0], (int, float)):
+            max_passive_bid = max(1, math.ceil(best_ask[0]) - 1) if best_ask[0] > 1 else 1
+            clamped_bid = min(clamped_bid, max_passive_bid)
+        if clamped_ask is not None and best_bid and len(best_bid) > 0 and isinstance(best_bid[0], (int, float)):
+            min_passive_ask = min(99, math.floor(best_bid[0]) + 1) if best_bid[0] < 99 else 99
+            clamped_ask = max(clamped_ask, min_passive_ask)
+        if clamped_bid is not None and clamped_ask is not None and clamped_bid >= clamped_ask:
+            clamped_bid = max(1, clamped_ask - 1)
+        return clamped_bid, clamped_ask
+
+    def _record_unsettled_cancel(
+        self,
+        quote_side: str,
+        client_order_id: Optional[str],
+        size: Any,
+        kalshi_order_id: Optional[str] = None,
+    ) -> None:
+        """Records cancelled exit-side order exposure until fills or settle verification clear it."""
+        if not client_order_id:
+            return
+        try:
+            qty_dec = Decimal(str(size))
+        except (InvalidOperation, ValueError, TypeError):
+            fallback = self.order_size if isinstance(self.order_size, (int, float)) and self.order_size > 0 else 1
+            qty_dec = Decimal(str(fallback))
+        if not qty_dec.is_finite() or qty_dec <= 0:
+            return
+        active_rec = getattr(getattr(self, "om", None), "active_orders", {}).get(client_order_id) or {}
+        if kalshi_order_id is None and isinstance(active_rec, dict):
+            kalshi_order_id = active_rec.get("kalshi_order_id")
+        target_map = self._unsettled_cancelled_asks if quote_side == "ask" else self._unsettled_cancelled_bids
+        target_map[client_order_id] = {
+            "qty": qty_dec,
+            "kalshi_id": kalshi_order_id,
+            "cancelled_at": time.monotonic(),
+        }
+
+    def _get_order_delivered_qty(self, kalshi_id: Optional[str], client_order_id: str) -> Decimal:
+        """Returns locally delivered contract quantity for a specific cancelled order."""
+        getter = getattr(self.inv_manager, "get_delivered_fill_qty", None)
+        if not callable(getter):
+            return Decimal("0")
+        try:
+            res = getter(kalshi_order_id=kalshi_id, client_order_id=client_order_id)
+            if isinstance(res, Decimal):
+                return max(Decimal("0"), res) if res.is_finite() else Decimal("0")
+            if isinstance(res, (int, float)) and not isinstance(res, bool) and math.isfinite(res):
+                return max(Decimal("0"), Decimal(str(res)))
+        except Exception:
+            pass
+        return Decimal("0")
+
+    async def _unsettled_cancelled_exit_exposure(self, exit_action: str) -> Decimal:
+        """Returns conservative unaccounted fill quantity from cancelled exit-side orders.
+
+        Entries remain reserved for at least ``_pause_exit_settle_seconds`` (or while fills are
+        in flight). Once settled, terminal ``fill_count`` from ``get_order_status`` is reconciled
+        against per-order locally delivered quantity (``max(0, remote_filled - delivered_qty)``);
+        entries whose terminal status cannot be verified fail closed and keep their unaccounted
+        cancelled size reserved rather than clearing on global ``_fill_count`` changes.
+        """
+        target_map = self._unsettled_cancelled_asks if exit_action == "sell" else self._unsettled_cancelled_bids
+        if not target_map:
+            return Decimal("0")
+
+        raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
+        pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
+        now_mono = time.monotonic()
+
+        total_exposure = Decimal("0")
+        for cid, entry in list(target_map.items()):
+            kalshi_id = entry.get("kalshi_id")
+            delivered_qty = self._get_order_delivered_qty(kalshi_id, cid)
+            unaccounted = max(Decimal("0"), entry["qty"] - delivered_qty)
+            if unaccounted == 0:
+                target_map.pop(cid, None)
+                continue
+
+            elapsed = now_mono - entry["cancelled_at"]
+            if pending_fills == 0 and elapsed >= self._pause_exit_settle_seconds:
+                get_status = getattr(getattr(self, "om", None), "get_order_status", None)
+                query_id = kalshi_id or cid
+                if query_id and callable(get_status):
+                    try:
+                        status_info = await get_status(query_id)
+                    except Exception:
+                        status_info = None
+                    if isinstance(status_info, dict):
+                        status_str = str(status_info.get("status", "")).lower()
+                        rem = float(status_info.get("remaining_count") or status_info.get("remaining_count_fp") or 0)
+                        if status_str in ("canceled", "cancelled", "executed") and rem == 0:
+                            raw_filled = status_info.get("fill_count_fp", status_info.get("fill_count") or 0)
+                            try:
+                                remote_filled = Decimal(str(raw_filled))
+                            except (InvalidOperation, ValueError, TypeError):
+                                remote_filled = entry["qty"]
+                            entry["qty"] = max(Decimal("0"), min(entry["qty"], remote_filled))
+                            unaccounted = max(Decimal("0"), entry["qty"] - delivered_qty)
+                            if unaccounted == 0:
+                                target_map.pop(cid, None)
+                                continue
+            total_exposure += unaccounted
+        return total_exposure
+
+    async def _verify_pause_exit_inventory(
+        self,
+        local_inv: Union[int, float],
+        exit_action: str,
+    ) -> Optional[Union[int, float]]:
+        """Verifies live exchange inventory and deducts unsettled cancelled-exit exposure.
+
+        Because Kalshi rejects ``reduce_only`` on resting GTC orders and ``GET /portfolio/positions``
+        does not guarantee immediate read-after-write consistency post-cancellation, subtracting
+        still-unsettled cancelled exit orders guarantees a pause-mode exit cannot reverse the
+        position even when both WebSocket fills and REST position reads are stale.
+        """
+        positions = await self._verified_ticker_positions(self.ticker)
+        if positions is None:
+            logger.warning(
+                f"Deferring pause-exit {exit_action.upper()} on {self.ticker}: "
+                f"could not verify live exchange position."
+            )
+            return None
+        try:
+            exchange_inv = sum((Decimal(str(v)) for v in positions.values()), Decimal("0"))
+            local_dec = Decimal(str(local_inv))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+        if exit_action == "sell":
+            if exchange_inv < Decimal("0.01") or local_dec < Decimal("0.01"):
+                logger.info(
+                    f"Skipping pause-exit ASK on {self.ticker}: position flat or short "
+                    f"(local={local_inv}, exchange={exchange_inv})."
+                )
+                return None
+            conservative_abs = min(local_dec, exchange_inv)
+        else:
+            if exchange_inv > Decimal("-0.01") or local_dec > Decimal("-0.01"):
+                logger.info(
+                    f"Skipping pause-exit BID on {self.ticker}: position flat or long "
+                    f"(local={local_inv}, exchange={exchange_inv})."
+                )
+                return None
+            conservative_abs = min(abs(local_dec), abs(exchange_inv))
+
+        unsettled_qty = await self._unsettled_cancelled_exit_exposure(exit_action)
+        safe_abs = conservative_abs - unsettled_qty
+        if safe_abs < Decimal("0.01"):
+            logger.info(
+                f"Deferring pause-exit {exit_action.upper()} on {self.ticker}: "
+                f"unsettled cancelled exit exposure ({unsettled_qty}) covers safe inventory ({conservative_abs})."
+            )
+            return None
+
+        signed_safe = safe_abs if exit_action == "sell" else -safe_abs
+        return int(signed_safe) if signed_safe == signed_safe.to_integral_value() else float(signed_safe)
 
     async def start(self):
         """Initializes infrastructure and starts the main trading loop."""
@@ -1495,19 +1691,29 @@ class AvellanedaStoikovBot:
             return
 
         # 2c. Fast Market / Price Velocity Circuit Breaker:
+        # When flat (inventory == 0), withdraw all quotes during velocity spikes or post-fill backoff.
+        # When holding open inventory (inventory != 0), suppress ONLY the accumulating side so the
+        # unwinding exit side remains active rather than trapping exposure until collar liquidation.
+        pause_accumulating_side = False
+
         # Check active Fast Market quiesce period
         if self._fast_market_until > now:
             remaining = self._fast_market_until - now
+            if inventory == 0:
+                logger.info(
+                    f"[FAST MARKET ACTIVE] Volatility circuit breaker active for {self.ticker} "
+                    f"({remaining:.1f}s remaining). Withdrawing quotes."
+                )
+                if self.current_bid_id or self.current_ask_id:
+                    await self._cancel_all_quotes()
+                return
             logger.info(
                 f"[FAST MARKET ACTIVE] Volatility circuit breaker active for {self.ticker} "
-                f"({remaining:.1f}s remaining). Withdrawing quotes."
+                f"({remaining:.1f}s remaining) with inventory={inventory}. Suppressing accumulating side; keeping exit active."
             )
-            if self.current_bid_id or self.current_ask_id:
-                await self._cancel_all_quotes()
-            return
-
+            pause_accumulating_side = True
         # Evaluate orderbook midpoint velocity over rolling window
-        if self.price_velocity_threshold_cents > 0 and self.price_velocity_window_seconds > 0:
+        elif self.price_velocity_threshold_cents > 0 and self.price_velocity_window_seconds > 0:
             cutoff = now - self.price_velocity_window_seconds
             while self._mid_price_history and self._mid_price_history[0][0] < cutoff:
                 self._mid_price_history.popleft()
@@ -1522,7 +1728,7 @@ class AvellanedaStoikovBot:
                     logger.warning(
                         f"[FAST MARKET / VELOCITY BREACH] Market {self.ticker} mid price swung "
                         f"{delta_p:.1f}c over {elapsed:.1f}s (threshold: {self.price_velocity_threshold_cents:.1f}c). "
-                        f"Entering Fast Market state; withdrawing quotes for {self.price_velocity_quiesce_seconds:.1f}s."
+                        f"Entering Fast Market state for {self.price_velocity_quiesce_seconds:.1f}s."
                     )
                     try:
                         SAFEGUARD_EVENTS_TOTAL.labels(safeguard="price_velocity", ticker=self.ticker).inc()
@@ -1531,21 +1737,29 @@ class AvellanedaStoikovBot:
 
                     self._fast_market_until = now + self.price_velocity_quiesce_seconds
                     self._mid_price_history.clear()
-                    await self._cancel_all_quotes()
-                    return
+                    if inventory == 0:
+                        await self._cancel_all_quotes()
+                        return
+                    pause_accumulating_side = True
 
         # Check post-fill adverse selection backoff pause
         if self.post_fill_pause_seconds > 0:
             last_fill_time = self.inv_manager.get_last_fill_time(self.ticker)
             if last_fill_time > 0 and (now - last_fill_time) < self.post_fill_pause_seconds:
                 remaining = self.post_fill_pause_seconds - (now - last_fill_time)
+                if inventory == 0:
+                    logger.info(
+                        f"Post-fill adverse selection pause active for {self.ticker} "
+                        f"({remaining:.2f}s remaining). Withdrawing quotes."
+                    )
+                    if self.current_bid_id or self.current_ask_id:
+                        await self._cancel_all_quotes()
+                    return
                 logger.info(
                     f"Post-fill adverse selection pause active for {self.ticker} "
-                    f"({remaining:.2f}s remaining). Withdrawing quotes."
+                    f"({remaining:.2f}s remaining) with inventory={inventory}. Suppressing accumulating side; keeping exit active."
                 )
-                if self.current_bid_id or self.current_ask_id:
-                    await self._cancel_all_quotes()
-                return
+                pause_accumulating_side = True
 
         # 4. Calculate Reservation Price (R)
         # In multi-contract dynamic sizing, inventory is normalized by quote lot size:
@@ -1615,7 +1829,14 @@ class AvellanedaStoikovBot:
         # Ensure we don't cross the spread against ourselves
         if optimal_bid >= optimal_ask:
             optimal_bid = optimal_ask - 1
-            
+
+        # Passive Maker Quote Clamping (Non-Hedge Mode):
+        # Prevents skewed passive A-S quotes from accidentally crossing the opposing top-of-book
+        # and incurring ~4x taker transaction fees unless an active hedge or late-taper exit is active.
+        is_late_taper_unwind = bool(self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0)
+        if self.passive_maker_clamp_enabled and abs(inventory) < hedge_threshold and not is_late_taper_unwind:
+            optimal_bid, optimal_ask = self._clamp_passive_prices(optimal_bid, optimal_ask, best_bid, best_ask)
+
         # Active Inventory Mitigation:
         # If inventory is skewed too far, stop quoting the skew direction and aggressively cross/tighten on the other.
         if inventory >= hedge_threshold:
@@ -1685,15 +1906,25 @@ class AvellanedaStoikovBot:
                 except Exception:
                     pass
 
+        # Fast-Market / Post-Fill Pause Exit Continuity:
+        # Suppress accumulating side while keeping the unwinding exit side active.
+        if pause_accumulating_side and inventory != 0:
+            if inventory > 0:
+                optimal_bid = None
+            else:
+                optimal_ask = None
+
         # Determine target quote sizes for both sides
         target_bid_size = quote_size
         target_ask_size = quote_size
 
-        # In late-session reduce-only or active hedging, cap surviving quote size at open inventory
-        # to ensure fills cannot overshoot and flip the position into the opposite direction.
+        # In late-session reduce-only, active hedging, or paused exit continuity, cap surviving quote size
+        # at open inventory so fills cannot overshoot and flip the position into the opposite direction.
         is_reduce_only = (self.inventory_taper_enabled and taper_factor < 0.5 and inventory != 0) or abs(inventory) >= hedge_threshold
         self._is_reduce_only = is_reduce_only
-        if is_reduce_only:
+        self._current_hedge_threshold = hedge_threshold
+        self._pause_accumulating_side = pause_accumulating_side
+        if is_reduce_only or pause_accumulating_side:
             if inventory > 0:
                 target_ask_size = self._cap_quote_size_to_inventory(quote_size, inventory)
             elif inventory < 0:
@@ -1774,15 +2005,41 @@ class AvellanedaStoikovBot:
         bid_needs_update = bid_price_changed or (new_bid is not None and target_bid_size != self.current_bid_size)
         ask_needs_update = ask_price_changed or (new_ask is not None and target_ask_size != self.current_ask_size)
 
+        # In pause-only single-sided mode, avoid cancel-replacing an already-resting exit order
+        # when its resting size already fits within open inventory (eliminates cancel-replace fill races).
+        is_pause_single_sided = bool(getattr(self, "_pause_accumulating_side", False)) and (
+            (new_bid is None and new_ask is not None) or (new_ask is None and new_bid is not None)
+        )
+        if is_pause_single_sided:
+            pre_cancel_inv = self.inv_manager.get_position(self.ticker)
+            if (
+                new_ask is not None
+                and self.current_ask_id is not None
+                and self.current_ask_size is not None
+                and pre_cancel_inv > 0
+                and Decimal(str(self.current_ask_size)) <= Decimal(str(pre_cancel_inv))
+            ):
+                ask_needs_update = False
+            if (
+                new_bid is not None
+                and self.current_bid_id is not None
+                and self.current_bid_size is not None
+                and pre_cancel_inv < 0
+                and Decimal(str(self.current_bid_size)) <= abs(Decimal(str(pre_cancel_inv)))
+            ):
+                bid_needs_update = False
+
         # Handle BID Side
         if bid_needs_update:
             if self.current_bid_id:
+                self._record_unsettled_cancel("bid", self.current_bid_id, self.current_bid_size)
                 cancel_tasks.append(self.om.cancel_order(self.current_bid_id))
                 cancel_bid = True
 
         # Handle ASK Side (Selling YES contracts)
         if ask_needs_update:
             if self.current_ask_id:
+                self._record_unsettled_cancel("ask", self.current_ask_id, self.current_ask_size)
                 cancel_tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_ask = True
 
@@ -1860,6 +2117,7 @@ class AvellanedaStoikovBot:
         is_reduce_only = getattr(self, "_is_reduce_only", False) or (
             self.inventory_taper_enabled and getattr(self, "_current_taper_factor", 1.0) < 0.5 and current_inv != 0
         )
+        is_pause_exit = bool(getattr(self, "_pause_accumulating_side", False))
 
         is_exit_bid = bool(is_reduce_only and current_inv < 0)
         is_exit_ask = bool(is_reduce_only and current_inv > 0)
@@ -1871,163 +2129,191 @@ class AvellanedaStoikovBot:
         if bid_needs_update and not in_error_cooldown:
             if new_bid is not None and self.current_bid_id is None:
                 # If entering single-sided hedge, confirm withdrawal of opposing quote first
-                if is_reduce_only and self.current_ask_id is not None:
+                if (is_reduce_only or is_pause_exit) and self.current_ask_id is not None:
                     logger.warning(
                         f"Aborting hedge BID placement on {self.ticker}: opposing ASK quote {self.current_ask_id} "
                         f"withdrawal not yet confirmed."
                     )
-                elif is_reduce_only and current_inv >= 0:
+                elif (is_reduce_only or (is_pause_exit and is_hedge)) and current_inv >= 0:
                     logger.info(
                         f"Skipping BID quote placement on {self.ticker}: short position already closed or flipped "
                         f"(current inventory: {current_inv})."
                     )
                 else:
-                    if is_exit_bid:
+                    if is_pause_exit and is_hedge and not is_exit_bid:
+                        verified_inv = await self._verify_pause_exit_inventory(current_inv, "buy")
+                        if verified_inv is None:
+                            target_bid_size = None
+                        else:
+                            target_bid_size = self._cap_quote_size_to_inventory(target_bid_size, verified_inv)
+                    elif is_exit_bid:
                         target_bid_size = self._cap_quote_size_to_inventory(target_bid_size, current_inv)
 
-                    order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
-                    exec_bid_price = new_bid
-                    if is_exit_bid:
-                        order_kwargs["reduce_only"] = True
-                        order_kwargs["time_in_force"] = "immediate_or_cancel"
-                        best_ask = self.ob_manager.get_best_ask(self.ticker)
-                        if best_ask:
-                            exec_bid_price = max(new_bid, best_ask[0])
-
-                    logger.info(f">> Placing new BID: {target_bid_size} YES @ {exec_bid_price}c (Shard {self.exchange_index})")
-
-                    self.current_bid_id = await self.om.place_order(
-                        ticker=self.ticker,
-                        side="yes",
-                        action="buy",
-                        count=target_bid_size,
-                        price=exec_bid_price,
-                        **order_kwargs,
-                    )
-                    if self.current_bid_id:
-                        self.current_bid_price = exec_bid_price
-                        self.current_bid_size = target_bid_size
-                        if is_hedge:
-                            self._consecutive_hedge_failures = 0
+                    if target_bid_size is not None:
+                        order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                        exec_bid_price = new_bid
                         if is_exit_bid:
-                            self.current_bid_id = None
+                            order_kwargs["reduce_only"] = True
+                            order_kwargs["time_in_force"] = "immediate_or_cancel"
+                            best_ask = self.ob_manager.get_best_ask(self.ticker)
+                            if best_ask:
+                                exec_bid_price = max(new_bid, best_ask[0])
+                        elif (
+                            self.passive_maker_clamp_enabled
+                            and not is_reduce_only
+                            and abs(current_inv) < getattr(self, "_current_hedge_threshold", 5)
+                        ):
+                            best_ask = self.ob_manager.get_best_ask(self.ticker)
+                            exec_bid_price, _ = self._clamp_passive_prices(exec_bid_price, None, None, best_ask)
+
+                        logger.info(f">> Placing new BID: {target_bid_size} YES @ {exec_bid_price}c (Shard {self.exchange_index})")
+
+                        self.current_bid_id = await self.om.place_order(
+                            ticker=self.ticker,
+                            side="yes",
+                            action="buy",
+                            count=target_bid_size,
+                            price=exec_bid_price,
+                            **order_kwargs,
+                        )
+                        if self.current_bid_id:
+                            self.current_bid_price = exec_bid_price
+                            self.current_bid_size = target_bid_size
+                            if is_hedge:
+                                self._consecutive_hedge_failures = 0
+                            if is_exit_bid:
+                                self.current_bid_id = None
+                                self.current_bid_price = None
+                                self.current_bid_size = None
+                        else:
+                            self._last_order_error_time = time.time()
                             self.current_bid_price = None
                             self.current_bid_size = None
-                    else:
-                        self._last_order_error_time = time.time()
-                        self.current_bid_price = None
-                        self.current_bid_size = None
-                        if is_hedge:
-                            self._consecutive_hedge_failures += 1
-                            logger.warning(
-                                f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
-                                f"Attempting shard rebalance..."
-                            )
-                            hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
-                            await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
-                            if self._consecutive_hedge_failures >= 3:
-                                logger.critical(
-                                    f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
-                                    f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                            if is_hedge:
+                                self._consecutive_hedge_failures += 1
+                                logger.warning(
+                                    f"Hedge BID order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                                    f"Attempting shard rebalance..."
                                 )
-                                from execution.kill_switch import KillSwitch
-                                killer = KillSwitch(self.om, ticker=self.ticker)
-                                await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
-                                await send_alert(
-                                    f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
-                                    f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                hedge_dollars = max(20.0, (float(target_bid_size * new_bid) / 100.0) + 5.0)
+                                await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                                if self._consecutive_hedge_failures >= 3:
+                                    logger.critical(
+                                        f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                        f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                                    )
+                                    from execution.kill_switch import KillSwitch
+                                    killer = KillSwitch(self.om, ticker=self.ticker)
+                                    await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                                    await send_alert(
+                                        f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                        f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                    )
+                                    self._market_inactive = True
+                            elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                                logger.warning(
+                                    f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                                    f"Triggering background shard collateral rebalance..."
                                 )
-                                self._market_inactive = True
-                        elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
-                            logger.warning(
-                                f"Standard BID order placement failed on {self.ticker} (Shard {self.exchange_index}). "
-                                f"Triggering background shard collateral rebalance..."
-                            )
-                            self._last_shard_rebalance_dispatch_time = now
-                            rebal_task = asyncio.create_task(self.ensure_shard_collateral())
-                            self._background_tasks.add(rebal_task)
-                            rebal_task.add_done_callback(self._background_tasks.discard)
+                                self._last_shard_rebalance_dispatch_time = now
+                                rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                                self._background_tasks.add(rebal_task)
+                                rebal_task.add_done_callback(self._background_tasks.discard)
 
         # Place new ASK if needed
         if ask_needs_update and not in_error_cooldown:
             if new_ask is not None and self.current_ask_id is None:
                 # If entering single-sided hedge, confirm withdrawal of opposing quote first
-                if is_reduce_only and self.current_bid_id is not None:
+                if (is_reduce_only or is_pause_exit) and self.current_bid_id is not None:
                     logger.warning(
                         f"Aborting hedge ASK placement on {self.ticker}: opposing BID quote {self.current_bid_id} "
                         f"withdrawal not yet confirmed."
                     )
-                elif is_reduce_only and current_inv <= 0:
+                elif (is_reduce_only or (is_pause_exit and is_hedge)) and current_inv <= 0:
                     logger.info(
                         f"Skipping ASK quote placement on {self.ticker}: long position already closed or flipped "
                         f"(current inventory: {current_inv})."
                     )
                 else:
-                    if is_exit_ask:
+                    if is_pause_exit and is_hedge and not is_exit_ask:
+                        verified_inv = await self._verify_pause_exit_inventory(current_inv, "sell")
+                        if verified_inv is None:
+                            target_ask_size = None
+                        else:
+                            target_ask_size = self._cap_quote_size_to_inventory(target_ask_size, verified_inv)
+                    elif is_exit_ask:
                         target_ask_size = self._cap_quote_size_to_inventory(target_ask_size, current_inv)
 
-                    order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
-                    exec_ask_price = new_ask
-                    if is_exit_ask:
-                        order_kwargs["reduce_only"] = True
-                        order_kwargs["time_in_force"] = "immediate_or_cancel"
-                        best_bid = self.ob_manager.get_best_bid(self.ticker)
-                        if best_bid:
-                            exec_ask_price = min(new_ask, best_bid[0])
-
-                    logger.info(f">> Placing new ASK: {target_ask_size} YES @ {exec_ask_price}c (Shard {self.exchange_index})")
-
-                    self.current_ask_id = await self.om.place_order(
-                        ticker=self.ticker,
-                        side="yes",
-                        action="sell",
-                        count=target_ask_size,
-                        price=exec_ask_price,
-                        **order_kwargs,
-                    )
-                    if self.current_ask_id:
-                        self.current_ask_price = exec_ask_price
-                        self.current_ask_size = target_ask_size
-                        if is_hedge:
-                            self._consecutive_hedge_failures = 0
+                    if target_ask_size is not None:
+                        order_kwargs = {"exchange_index": self.exchange_index} if getattr(self, "exchange_index", 0) else {}
+                        exec_ask_price = new_ask
                         if is_exit_ask:
-                            self.current_ask_id = None
+                            order_kwargs["reduce_only"] = True
+                            order_kwargs["time_in_force"] = "immediate_or_cancel"
+                            best_bid = self.ob_manager.get_best_bid(self.ticker)
+                            if best_bid:
+                                exec_ask_price = min(new_ask, best_bid[0])
+                        elif (
+                            self.passive_maker_clamp_enabled
+                            and not is_reduce_only
+                            and abs(current_inv) < getattr(self, "_current_hedge_threshold", 5)
+                        ):
+                            best_bid = self.ob_manager.get_best_bid(self.ticker)
+                            _, exec_ask_price = self._clamp_passive_prices(None, exec_ask_price, best_bid, None)
+
+                        logger.info(f">> Placing new ASK: {target_ask_size} YES @ {exec_ask_price}c (Shard {self.exchange_index})")
+
+                        self.current_ask_id = await self.om.place_order(
+                            ticker=self.ticker,
+                            side="yes",
+                            action="sell",
+                            count=target_ask_size,
+                            price=exec_ask_price,
+                            **order_kwargs,
+                        )
+                        if self.current_ask_id:
+                            self.current_ask_price = exec_ask_price
+                            self.current_ask_size = target_ask_size
+                            if is_hedge:
+                                self._consecutive_hedge_failures = 0
+                            if is_exit_ask:
+                                self.current_ask_id = None
+                                self.current_ask_price = None
+                                self.current_ask_size = None
+                        else:
+                            self._last_order_error_time = time.time()
                             self.current_ask_price = None
                             self.current_ask_size = None
-                    else:
-                        self._last_order_error_time = time.time()
-                        self.current_ask_price = None
-                        self.current_ask_size = None
-                        if is_hedge:
-                            self._consecutive_hedge_failures += 1
-                            logger.warning(
-                                f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
-                                f"Attempting shard rebalance..."
-                            )
-                            hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
-                            await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
-                            if self._consecutive_hedge_failures >= 3:
-                                logger.critical(
-                                    f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
-                                    f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                            if is_hedge:
+                                self._consecutive_hedge_failures += 1
+                                logger.warning(
+                                    f"Hedge ASK order placement failed (failure count: {self._consecutive_hedge_failures}/3). "
+                                    f"Attempting shard rebalance..."
                                 )
-                                from execution.kill_switch import KillSwitch
-                                killer = KillSwitch(self.om, ticker=self.ticker)
-                                await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
-                                await send_alert(
-                                    f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
-                                    f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                hedge_dollars = max(20.0, (float(target_ask_size * new_ask) / 100.0) + 5.0)
+                                await self.ensure_shard_collateral(min_required_dollars=hedge_dollars)
+                                if self._consecutive_hedge_failures >= 3:
+                                    logger.critical(
+                                        f"Hedge circuit breaker tripped: 3 consecutive hedge order failures on {self.ticker} "
+                                        f"(Shard {self.exchange_index}). Tripping synchronous kill switch."
+                                    )
+                                    from execution.kill_switch import KillSwitch
+                                    killer = KillSwitch(self.om, ticker=self.ticker)
+                                    await asyncio.to_thread(killer.trigger_synchronous, ticker=self.ticker)
+                                    await send_alert(
+                                        f"🚨 CRITICAL: Stop-loss hedge order placement failed {self._consecutive_hedge_failures} "
+                                        f"consecutive times on {self.ticker} (Shard {self.exchange_index}). Emergency kill switch activated."
+                                    )
+                                    self._market_inactive = True
+                            elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
+                                logger.warning(
+                                    f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
+                                    f"Triggering background shard collateral rebalance..."
                                 )
-                                self._market_inactive = True
-                        elif now - self._last_shard_rebalance_dispatch_time >= 60.0:
-                            logger.warning(
-                                f"Standard ASK order placement failed on {self.ticker} (Shard {self.exchange_index}). "
-                                f"Triggering background shard collateral rebalance..."
-                            )
-                            self._last_shard_rebalance_dispatch_time = now
-                            rebal_task = asyncio.create_task(self.ensure_shard_collateral())
-                            self._background_tasks.add(rebal_task)
-                            rebal_task.add_done_callback(self._background_tasks.discard)
+                                self._last_shard_rebalance_dispatch_time = now
+                                rebal_task = asyncio.create_task(self.ensure_shard_collateral())
+                                self._background_tasks.add(rebal_task)
+                                rebal_task.add_done_callback(self._background_tasks.discard)
 
 
 
@@ -2261,15 +2547,21 @@ class AvellanedaStoikovBot:
         cancel_targets = []
         if target_ticker == self.ticker:
             if self.current_bid_id:
+                self._record_unsettled_cancel("bid", self.current_bid_id, self.current_bid_size)
                 tasks.append(self.om.cancel_order(self.current_bid_id))
                 cancel_targets.append(("bid", self.current_bid_id))
             if self.current_ask_id:
+                self._record_unsettled_cancel("ask", self.current_ask_id, self.current_ask_size)
                 tasks.append(self.om.cancel_order(self.current_ask_id))
                 cancel_targets.append(("ask", self.current_ask_id))
 
         quoted_ids = {order_id for _, order_id in cancel_targets}
         for order_id, details in list(self.om.active_orders.items()):
             if details.get("ticker") == target_ticker and order_id not in quoted_ids:
+                d_action = str(details.get("action") or "").lower()
+                d_side = str(details.get("side") or "yes").lower()
+                q_side = "bid" if ((d_action == "buy" and d_side == "yes") or (d_action == "sell" and d_side == "no")) else "ask"
+                self._record_unsettled_cancel(q_side, order_id, details.get("count"), details.get("kalshi_order_id"))
                 tasks.append(self.om.cancel_order(order_id))
                 cancel_targets.append(("tracked", order_id))
              
@@ -2519,6 +2811,8 @@ class AvellanedaStoikovBot:
         self._market_close_time = None
         self._last_pnl_snapshot = time.time()
         self._mid_price_history.clear()
+        self._unsettled_cancelled_asks.clear()
+        self._unsettled_cancelled_bids.clear()
         if hasattr(self, "volatility_estimator"):
             self.volatility_estimator.reset()
         self._fast_market_until = 0.0

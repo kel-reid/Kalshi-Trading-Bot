@@ -596,4 +596,92 @@ class TestV2PayloadSchema:
         limiter.acquire_sync()
         assert limiter._tokens < 1.0
 
+    @pytest.mark.asyncio
+    async def test_reconcile_skips_recently_cleared_orders_unless_targeted(self, order_manager, monkeypatch):
+        """Non-targeted reconcile skips replica-stale recently cleared orders until TTL expires, while targeted reconcile checks them."""
+        now = [100.0]
+        monkeypatch.setattr("execution.order_manager.time.monotonic", lambda: now[0])
+
+        order_manager._mark_order_cleared(client_order_id="c-cleared", kalshi_order_id="k-cleared")
+        replica_resp = MagicMock(status_code=200)
+        replica_resp.json.return_value = {
+            "orders": [{"order_id": "k-cleared", "client_order_id": "c-cleared"}],
+            "cursor": None,
+        }
+        order_manager._cancel_by_kalshi_id = AsyncMock(return_value=True)
+        order_manager._execute_db_update = MagicMock()
+
+        with patch("execution.order_manager.requests.get", return_value=replica_resp), \
+             patch("execution.order_manager.get_auth_headers", return_value={"mock": "header"}):
+            # 1. Within TTL: non-targeted reconcile ignores stale replica entry
+            res = await order_manager.reconcile_resting_orders("KX-TEST")
+            assert res == 0
+            order_manager._cancel_by_kalshi_id.assert_not_called()
+
+            # 2. Explicit targeted reconcile bypasses TTL cache to verify/cancel
+            res_target = await order_manager.reconcile_resting_orders("KX-TEST", target_client_order_id="c-cleared")
+            assert res_target == 1
+            order_manager._cancel_by_kalshi_id.assert_awaited_once_with("k-cleared", "c-cleared")
+
+            # 3. After TTL expiry: non-targeted reconcile cancels stale orphan normally
+            order_manager._cancel_by_kalshi_id.reset_mock()
+            order_manager._mark_order_cleared(client_order_id="c-expired", kalshi_order_id="k-expired")
+            replica_resp.json.return_value = {
+                "orders": [{"order_id": "k-expired", "client_order_id": "c-expired"}],
+                "cursor": None,
+            }
+            now[0] += order_manager._recent_clear_ttl_seconds + 1.0
+            res_expired = await order_manager.reconcile_resting_orders("KX-TEST")
+            assert res_expired == 1
+            order_manager._cancel_by_kalshi_id.assert_awaited_once_with("k-expired", "c-expired")
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_404_propagation_lag_recheck_confirms_terminal(self, order_manager):
+        """
+        On DELETE 404 when initial GET returns stale status='resting', wait 0.35s and re-check
+        get_order_status; if second check confirms 'executed', clear locally without reconcile loop.
+        """
+        order_manager.active_orders["c-lag"] = {"ticker": "KX-LAG", "kalshi_order_id": "k-lag"}
+        order_manager._execute_db_update = MagicMock()
+        order_manager.reconcile_resting_orders = AsyncMock()
+        order_manager.get_order_status = AsyncMock(side_effect=[
+            {"order_id": "k-lag", "status": "resting", "fill_count": 0},
+            {"order_id": "k-lag", "status": "executed", "fill_count": 5},
+        ])
+
+        resp_404 = MagicMock(status_code=404, text="not found")
+        with patch("execution.order_manager.requests.delete", return_value=resp_404), \
+             patch("execution.order_manager.get_auth_headers", return_value={"mock": "header"}), \
+             patch("execution.order_manager.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await order_manager.cancel_order("c-lag")
+
+        assert result is True
+        mock_sleep.assert_awaited_once_with(0.35)
+        assert order_manager.get_order_status.await_count == 2
+        assert "c-lag" not in order_manager.active_orders
+        assert order_manager._is_recently_cleared(client_order_id="c-lag", kalshi_order_id="k-lag") is True
+        order_manager.reconcile_resting_orders.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_kalshi_id_404_propagation_lag_recheck_confirms_terminal(self, order_manager):
+        """
+        In _cancel_by_kalshi_id, a 404 whose first get_order_status says 'resting' sleeps 0.35s
+        and re-checks; if confirmed 'canceled', returns True and marks the ID cleared.
+        """
+        order_manager.get_order_status = AsyncMock(side_effect=[
+            {"order_id": "k-lag-2", "status": "resting"},
+            {"order_id": "k-lag-2", "status": "canceled"},
+        ])
+        resp_404 = MagicMock(status_code=404, text="not found")
+
+        with patch("execution.order_manager.requests.delete", return_value=resp_404), \
+             patch("execution.order_manager.get_auth_headers", return_value={"mock": "header"}), \
+             patch("execution.order_manager.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await order_manager._cancel_by_kalshi_id("k-lag-2")
+
+        assert result is True
+        mock_sleep.assert_awaited_once_with(0.35)
+        assert order_manager.get_order_status.await_count == 2
+        assert order_manager._is_recently_cleared(kalshi_order_id="k-lag-2") is True
+
 
