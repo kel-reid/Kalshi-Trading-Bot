@@ -817,23 +817,36 @@ class AvellanedaStoikovBot:
         active_rec = getattr(getattr(self, "om", None), "active_orders", {}).get(client_order_id) or {}
         if kalshi_order_id is None and isinstance(active_rec, dict):
             kalshi_order_id = active_rec.get("kalshi_order_id")
-        raw_fc = getattr(self.inv_manager, "_fill_count", 0)
-        fc_at_cancel = raw_fc if isinstance(raw_fc, int) and not isinstance(raw_fc, bool) else 0
         target_map = self._unsettled_cancelled_asks if quote_side == "ask" else self._unsettled_cancelled_bids
         target_map[client_order_id] = {
             "qty": qty_dec,
             "kalshi_id": kalshi_order_id,
             "cancelled_at": time.monotonic(),
-            "fill_count_at_cancel": fc_at_cancel,
         }
 
+    def _get_order_delivered_qty(self, kalshi_id: Optional[str], client_order_id: str) -> Decimal:
+        """Returns locally delivered contract quantity for a specific cancelled order."""
+        getter = getattr(self.inv_manager, "get_delivered_fill_qty", None)
+        if not callable(getter):
+            return Decimal("0")
+        try:
+            res = getter(kalshi_order_id=kalshi_id, client_order_id=client_order_id)
+            if isinstance(res, Decimal):
+                return max(Decimal("0"), res) if res.is_finite() else Decimal("0")
+            if isinstance(res, (int, float)) and not isinstance(res, bool) and math.isfinite(res):
+                return max(Decimal("0"), Decimal(str(res)))
+        except Exception:
+            pass
+        return Decimal("0")
+
     async def _unsettled_cancelled_exit_exposure(self, exit_action: str) -> Decimal:
-        """Returns conservative unfilled/unsettled quantity from cancelled exit-side orders.
+        """Returns conservative unaccounted fill quantity from cancelled exit-side orders.
 
         Entries remain reserved for at least ``_pause_exit_settle_seconds`` (or while fills are
-        in flight) so stale REST position reads immediately after cancellation cannot cause
-        overlapping GTC pause exits to overshoot zero. Once settled, confirmed un-delivered fills
-        from ``get_order_status`` keep their filled quantity reserved until local fills catch up.
+        in flight). Once settled, terminal ``fill_count`` from ``get_order_status`` is reconciled
+        against per-order locally delivered quantity (``max(0, remote_filled - delivered_qty)``);
+        entries whose terminal status cannot be verified fail closed and keep their unaccounted
+        cancelled size reserved rather than clearing on global ``_fill_count`` changes.
         """
         target_map = self._unsettled_cancelled_asks if exit_action == "sell" else self._unsettled_cancelled_bids
         if not target_map:
@@ -841,19 +854,24 @@ class AvellanedaStoikovBot:
 
         raw_pending = getattr(self.inv_manager, "_pending_fills", 0)
         pending_fills = raw_pending if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) else 0
-        raw_fc = getattr(self.inv_manager, "_fill_count", 0)
-        current_fc = raw_fc if isinstance(raw_fc, int) and not isinstance(raw_fc, bool) else 0
         now_mono = time.monotonic()
 
         total_exposure = Decimal("0")
         for cid, entry in list(target_map.items()):
+            kalshi_id = entry.get("kalshi_id")
+            delivered_qty = self._get_order_delivered_qty(kalshi_id, cid)
+            unaccounted = max(Decimal("0"), entry["qty"] - delivered_qty)
+            if unaccounted == 0:
+                target_map.pop(cid, None)
+                continue
+
             elapsed = now_mono - entry["cancelled_at"]
             if pending_fills == 0 and elapsed >= self._pause_exit_settle_seconds:
-                kalshi_id = entry.get("kalshi_id")
                 get_status = getattr(getattr(self, "om", None), "get_order_status", None)
-                if kalshi_id and callable(get_status):
+                query_id = kalshi_id or cid
+                if query_id and callable(get_status):
                     try:
-                        status_info = await get_status(kalshi_id)
+                        status_info = await get_status(query_id)
                     except Exception:
                         status_info = None
                     if isinstance(status_info, dict):
@@ -865,15 +883,12 @@ class AvellanedaStoikovBot:
                                 remote_filled = Decimal(str(raw_filled))
                             except (InvalidOperation, ValueError, TypeError):
                                 remote_filled = entry["qty"]
-                            if remote_filled > 0 and current_fc == entry["fill_count_at_cancel"]:
-                                entry["qty"] = min(entry["qty"], remote_filled)
-                            else:
+                            entry["qty"] = max(Decimal("0"), min(entry["qty"], remote_filled))
+                            unaccounted = max(Decimal("0"), entry["qty"] - delivered_qty)
+                            if unaccounted == 0:
                                 target_map.pop(cid, None)
                                 continue
-                elif not kalshi_id:
-                    target_map.pop(cid, None)
-                    continue
-            total_exposure += entry["qty"]
+            total_exposure += unaccounted
         return total_exposure
 
     async def _verify_pause_exit_inventory(

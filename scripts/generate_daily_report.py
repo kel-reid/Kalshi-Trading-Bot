@@ -92,11 +92,13 @@ def _format_fill_conversion_summary(
     if 0 < filled_orders_total <= orders_total:
         order_conv = filled_orders_total / orders_total * 100.0
         exec_per_order = fills_total / orders_total * 100.0
+        order_word = "order" if orders_total == 1 else "orders"
         return (
-            f"{order_conv:.1f}% order conversion ({filled_orders_total:,}/{orders_total:,} orders), "
+            f"{order_conv:.1f}% order conversion ({filled_orders_total:,}/{orders_total:,} {order_word}), "
             f"{exec_per_order:.1f}% executions per quoted order",
-            f"{fills_total} fills across {filled_orders_total:,} session-quoted orders "
-            f"({order_conv:.1f}% order conversion rate, {exec_per_order:.1f}% executions per quoted order)",
+            f"{fills_total} fills ({order_conv:.1f}% session order conversion across "
+            f"{filled_orders_total:,}/{orders_total:,} quoted {order_word}, "
+            f"{exec_per_order:.1f}% executions per quoted order)",
         )
     exec_per_order = fills_total / orders_total * 100.0
     return (
@@ -413,9 +415,8 @@ def fetch_daily_metrics(
                 """
                 SELECT
                     COALESCE(client_order_id, order_id, fill_id) AS client_order_id,
-                    COALESCE(NULLIF(order_id, ''), NULLIF(client_order_id, '')) AS order_ref,
-                    EXISTS (
-                        SELECT 1
+                    (
+                        SELECT o.client_order_id
                         FROM orders o
                         WHERE o.ticker = %s
                           AND o.created_at >= %s
@@ -424,7 +425,9 @@ def fetch_daily_metrics(
                                 (NULLIF(kalshi_fills.order_id, '') IS NOT NULL AND o.kalshi_order_id = kalshi_fills.order_id)
                                 OR (NULLIF(kalshi_fills.client_order_id, '') IS NOT NULL AND o.client_order_id = kalshi_fills.client_order_id)
                           )
-                    ) AS in_session_order_cohort,
+                        ORDER BY o.created_at ASC
+                        LIMIT 1
+                    ) AS session_order_id,
                     LOWER(action) AS action,
                     LOWER(side) AS side,
                     CASE
@@ -486,9 +489,9 @@ def fetch_daily_metrics(
             sell_orders = ord_agg.get("sell_orders") or 0
             fills = len(ticker_fills)
             filled_orders = len({
-                f.get("order_ref")
+                f.get("session_order_id")
                 for f in ticker_fills
-                if f.get("order_ref") and f.get("in_session_order_cohort") is True
+                if f.get("session_order_id")
             })
             maker_fills = sum(1 for f in ticker_fills if not f.get("is_taker"))
             taker_fills = sum(1 for f in ticker_fills if f.get("is_taker"))

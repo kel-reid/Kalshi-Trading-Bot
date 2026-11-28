@@ -451,8 +451,7 @@ def test_fetch_daily_metrics_resolves_created_time_and_skips_unparseable():
         [    # 4. kalshi_fills rows for KXVALID-CT (created_time-only BUY before ts SELL, plus invalid & out-of-window rows)
             {
                 "client_order_id": "c-sell",
-                "order_ref": "ord-sell-1",
-                "in_session_order_cohort": True,
+                "session_order_id": "ord-sell-1",
                 "action": "sell",
                 "side": "yes",
                 "price": 52.0,
@@ -466,8 +465,7 @@ def test_fetch_daily_metrics_resolves_created_time_and_skips_unparseable():
             },
             {
                 "client_order_id": "c-buy",
-                "order_ref": "ord-buy-1",
-                "in_session_order_cohort": True,
+                "session_order_id": "ord-buy-1",
                 "action": "buy",
                 "side": "yes",
                 "price": 45.0,
@@ -579,7 +577,7 @@ def test_daily_report_separates_partial_fill_executions_from_order_conversion():
 
     obs = " ".join(generate_observations(metrics_with_distinct))
     md = format_markdown_report(metrics_with_distinct)
-    assert "50.0% order conversion" in obs
+    assert "50.0% session order conversion" in obs
     assert "150.0% fill conversion" not in obs
     assert "50.0% order conversion" in md
     assert "150.0% fill conversion" not in md
@@ -599,8 +597,10 @@ def test_daily_report_separates_partial_fill_executions_from_order_conversion():
 
 def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion():
     """
-    Fills during the session referencing pre-session orders (in_session_order_cohort=False)
-    must still count in executions/fees/FIFO, but NOT inflate order conversion above 100%.
+    Fills during the session referencing pre-session orders (session_order_id=None)
+    must still count in executions/fees/FIFO, NOT inflate order conversion above 100%,
+    and fills from the same session order with mixed identifier availability collapse
+    to the single canonical session_order_id.
     """
     mock_conn = MagicMock()
     mock_cur = MagicMock()
@@ -612,11 +612,10 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
         [],
         [],
         [
-            # Pre-session resting order fills during today's session -> excluded from session order_conversion
+            # Pre-session resting order fills during today's session -> session_order_id is None
             {
                 "client_order_id": "old-order",
-                "order_ref": "ord-old-day",
-                "in_session_order_cohort": False,
+                "session_order_id": None,
                 "action": "buy",
                 "side": "yes",
                 "price": 40.0,
@@ -628,11 +627,11 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
                 "raw_created_time": None,
                 "fill_row_id": 1,
             },
-            # Two partial fills on the SAME order created in today's session (total_orders=1)
+            # Two partial fills on the SAME order created in today's session (one matched via order_id,
+            # one matched via client_order_id) both resolve to canonical session_order_id='c-sess-1'
             {
                 "client_order_id": "c-sess-1",
-                "order_ref": "ord-sess-1",
-                "in_session_order_cohort": True,
+                "session_order_id": "c-sess-1",
                 "action": "sell",
                 "side": "yes",
                 "price": 45.0,
@@ -646,8 +645,7 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
             },
             {
                 "client_order_id": "c-sess-1",
-                "order_ref": "ord-sess-1",
-                "in_session_order_cohort": True,
+                "session_order_id": "c-sess-1",
                 "action": "sell",
                 "side": "yes",
                 "price": 46.0,
@@ -666,12 +664,12 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
         None,
         None,
         {
-            "total_orders": 1,
-            "buy_orders": 0,
-            "sell_orders": 1,
+            "total_orders": 4,
+            "buy_orders": 2,
+            "sell_orders": 2,
             "resting_orders": 0,
-            "cancelled_orders": 0,
-            "total_contracts_quoted": 2,
+            "cancelled_orders": 3,
+            "total_contracts_quoted": 8,
             "avg_price_cents": 45.5,
         },
     ]
@@ -679,7 +677,7 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
     metrics = fetch_daily_metrics(mock_conn, target_date=datetime.date(2026, 10, 27))
 
     sqls = [c[0][0] for c in mock_cur.execute.call_args_list]
-    assert any("in_session_order_cohort" in q for q in sqls)
+    assert any("AS session_order_id" in q and "o.kalshi_order_id = kalshi_fills.order_id" in q for q in sqls)
 
     t = metrics["tickers"]["KXCOHORT"]
     assert t["fills"] == 3
@@ -687,7 +685,6 @@ def test_fetch_daily_metrics_excludes_pre_session_orders_from_order_conversion()
     assert metrics["totals"]["total_filled_orders"] == 1
 
     obs = " ".join(generate_observations(metrics))
-    assert "100.0% order conversion rate" in obs
-    assert "300.0% executions per quoted order" in obs
-    assert "200.0% order conversion" not in obs
+    assert "3 fills (25.0% session order conversion across 1/4 quoted orders, 75.0% executions per quoted order)" in obs
+    assert "50.0% order conversion" not in obs
 

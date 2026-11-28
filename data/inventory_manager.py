@@ -91,6 +91,8 @@ class InventoryManager:
         self._pending_fills: int = 0
         self._last_fill_time: float = 0.0
         self._last_fill_times: Dict[str, float] = {}
+        self._delivered_qty_by_order_id: Dict[str, Decimal] = {}
+        self._delivered_qty_by_client_order_id: Dict[str, Decimal] = {}
         self._recorded_fills: List[Dict[str, Any]] = []
         self._initial_seeded_inventory: Dict[str, Tuple[Union[int, float], Optional[float]]] = {}
         if pnl_tracker is not None:
@@ -107,6 +109,21 @@ class InventoryManager:
         if ticker:
             return self._last_fill_times.get(ticker, 0.0)
         return self._last_fill_time
+
+    def get_delivered_fill_qty(
+        self,
+        kalshi_order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Decimal:
+        """Returns cumulative locally delivered contract quantity for an order ID."""
+        with self._fill_lock:
+            by_order = Decimal("0")
+            by_client = Decimal("0")
+            if isinstance(kalshi_order_id, str) and kalshi_order_id.strip():
+                by_order = self._delivered_qty_by_order_id.get(kalshi_order_id.strip(), Decimal("0"))
+            if isinstance(client_order_id, str) and client_order_id.strip():
+                by_client = self._delivered_qty_by_client_order_id.get(client_order_id.strip(), Decimal("0"))
+            return max(by_order, by_client)
 
     def _fetch_balance(self) -> Optional[int]:
         """Fetch cash balance via REST."""
@@ -1157,6 +1174,23 @@ class InventoryManager:
 
         # All preconditions validated; state mutation and counter increment can now safely occur
         self._fill_count += 1
+        try:
+            qty_dec = Decimal(str(raw_count))
+        except Exception:
+            qty_dec = Decimal(str(count_f))
+        if qty_dec.is_finite() and qty_dec > 0:
+            raw_oid = fill_msg.get("order_id")
+            if isinstance(raw_oid, str) and raw_oid.strip():
+                oid_key = raw_oid.strip()
+                self._delivered_qty_by_order_id[oid_key] = (
+                    self._delivered_qty_by_order_id.get(oid_key, Decimal("0")) + qty_dec
+                )
+            raw_cid = fill_msg.get("client_order_id")
+            if isinstance(raw_cid, str) and raw_cid.strip():
+                cid_key = raw_cid.strip()
+                self._delivered_qty_by_client_order_id[cid_key] = (
+                    self._delivered_qty_by_client_order_id.get(cid_key, Decimal("0")) + qty_dec
+                )
         now = time.time()
         self._last_fill_time = now
         self._last_fill_times[ticker] = now
